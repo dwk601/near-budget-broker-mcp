@@ -1,8 +1,10 @@
 import type { DatabaseSync } from 'node:sqlite';
+import { BrokerError } from '../contracts/index.js';
+import { rollbackQuietly } from './sqlite-errors.js';
 
 // Migrations run under the same writer lock as admission. Never rewrite an
 // applied migration: append the next version and increment SCHEMA_VERSION.
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 const V1 = `
 CREATE TABLE agents (id TEXT PRIMARY KEY COLLATE BINARY, data TEXT NOT NULL) STRICT;
 CREATE TABLE credentials (
@@ -77,20 +79,57 @@ CREATE TABLE checkpoints (
 CREATE TABLE owner_nonces (nonce TEXT PRIMARY KEY, expires_at INTEGER NOT NULL) STRICT;
 `;
 
-export function migrate(db: DatabaseSync): void {
+const V2 = `
+CREATE TABLE store_identity (
+  id INTEGER PRIMARY KEY CHECK(id = 1), network TEXT NOT NULL CHECK(network = 'testnet'), account_id TEXT NOT NULL
+) STRICT;
+ALTER TABLE attempts RENAME TO attempts_v1;
+DROP INDEX attempts_request;
+DROP INDEX attempts_outbox;
+CREATE TABLE attempts (
+  id TEXT PRIMARY KEY COLLATE BINARY, request_id TEXT NOT NULL REFERENCES requests(id),
+  network TEXT NOT NULL CHECK(network = 'testnet'), account_id TEXT NOT NULL,
+  status TEXT NOT NULL, public_key TEXT NOT NULL,
+  nonce TEXT NOT NULL CHECK(nonce = '0' OR (nonce NOT GLOB '*[^0-9]*' AND nonce GLOB '[1-9]*')),
+  tx_hash TEXT NOT NULL UNIQUE, data TEXT NOT NULL, UNIQUE(network, account_id, public_key, nonce)
+) STRICT;
+CREATE INDEX attempts_request ON attempts(network, account_id, request_id, id);
+CREATE INDEX attempts_outbox ON attempts(network, account_id, status, id);
+`;
+
+export function migrate(db: DatabaseSync, accountId: string): void {
   db.exec('BEGIN IMMEDIATE');
   try {
     const version = db.prepare('PRAGMA user_version').get()?.['user_version'];
     if (typeof version !== 'number' || version < 0 || version > SCHEMA_VERSION) {
-      throw new Error('Unsupported storage schema version');
+      throw new BrokerError('BROKER_UNAVAILABLE', 'Unsupported storage schema version');
     }
     if (version === 0) {
       db.exec(V1);
       db.exec('PRAGMA user_version = 1');
     }
+    if (version < 2) {
+      // V1 did not bind the file. Refuse ambiguous/mismatched legacy custody
+      // evidence rather than relabelling another wallet's signed bytes.
+      const legacy = db.prepare('SELECT DISTINCT network, account_id FROM nonces').all();
+      const balance = db.prepare('SELECT data FROM balance WHERE id = 1').get();
+      if (legacy.some((row) => row['network'] !== 'testnet' || row['account_id'] !== accountId)
+        || (balance && (JSON.parse(String(balance['data'])) as { accountId: string }).accountId !== accountId)) {
+        throw new BrokerError('FORBIDDEN', 'Database custody identity mismatch');
+      }
+      db.exec(V2);
+      db.prepare("INSERT INTO store_identity(id, network, account_id) VALUES (1, 'testnet', ?)").run(accountId);
+      db.prepare(`INSERT INTO attempts(id, request_id, network, account_id, status, public_key, nonce, tx_hash, data)
+        SELECT id, request_id, 'testnet', ?, status, public_key, nonce, tx_hash, data FROM attempts_v1`).run(accountId);
+      db.exec('DROP TABLE attempts_v1; PRAGMA user_version = 2');
+    }
+    const identity = db.prepare('SELECT network, account_id FROM store_identity WHERE id = 1').get();
+    if (identity?.['network'] !== 'testnet' || identity['account_id'] !== accountId) {
+      throw new BrokerError('FORBIDDEN', 'Database custody identity mismatch');
+    }
     db.exec('COMMIT');
   } catch (error) {
-    db.exec('ROLLBACK');
+    rollbackQuietly(db);
     throw error;
   }
 }

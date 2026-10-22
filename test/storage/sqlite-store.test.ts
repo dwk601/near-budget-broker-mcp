@@ -179,16 +179,16 @@ describe('transactional SQLite Store', () => {
 
   it('allocates exact monotonic nonces across reopen and isolates account/key namespaces', () => {
     const filename = file(); const first = open(filename);
-    expect(first.transaction((tx) => tx.allocateNonce(KEY, MAX_U128))).toBe(MAX_U128 + 1n);
-    expect(first.transaction((tx) => tx.allocateNonce(KEY, 0n))).toBe(MAX_U128 + 2n);
+    const high = (1n << 63n) + 1n;
+    expect(first.transaction((tx) => tx.allocateNonce(KEY, high))).toBe(high + 1n);
+    expect(first.transaction((tx) => tx.allocateNonce(KEY, 0n))).toBe(high + 2n);
     first.close(); const second = open(filename);
-    expect(second.transaction((tx) => tx.allocateNonce(KEY, 7n))).toBe(MAX_U128 + 3n);
-    const other = open(filename, 'another.testnet');
-    expect(other.transaction((tx) => tx.allocateNonce(KEY, 0n))).toBe(1n);
-    expect(second.read((v) => v.getLocalNonce(KEY))).toBe(MAX_U128 + 3n);
+    expect(second.transaction((tx) => tx.allocateNonce(KEY, 7n))).toBe(high + 3n);
+    code(() => open(filename, 'another.testnet'), 'FORBIDDEN');
+    expect(second.read((v) => v.getLocalNonce(KEY))).toBe(high + 3n);
     expect(second.transaction((tx) => tx.allocateNonce(`ed25519:${'2'.repeat(32)}`, 10n))).toBe(11n);
-    expect(() => second.transaction((tx) => { tx.allocateNonce(KEY, MAX_U128 + 100n); throw new Error('rollback'); })).toThrow();
-    expect(second.read((v) => v.getLocalNonce(KEY))).toBe(MAX_U128 + 3n);
+    expect(() => second.transaction((tx) => { tx.allocateNonce(KEY, high + 100n); throw new Error('rollback'); })).toThrow();
+    expect(second.read((v) => v.getLocalNonce(KEY))).toBe(high + 3n);
   });
 
   it('persists u128 max exactly as decimal TEXT, and fails closed on sum overflow', () => {
@@ -259,6 +259,7 @@ describe('transactional SQLite Store', () => {
     store.transaction((tx) => {
       hold(tx, r); tx.allocateNonce(KEY, 0n); tx.putAttempt(attempt());
       tx.updateRequest({ ...r, state: 'signed', txHash: HASH }, 'queued');
+      tx.putAttempt({ ...attempt(), status: 'failed', tokensBurnt: 20n, gasBurnt: 500n });
       tx.updateRequest({ ...r, state: 'failed', txHash: HASH, tokensBurnt: 20n, gasBurnt: 500n }, 'signed');
       tx.putHold({ requestId: 'r', agentId: 'a', principal: 10n, feeReserve: 2n, status: 'committed' });
       tx.appendAccounting(entry('gas', 'r', 'a', 'gas_charged', 20n));

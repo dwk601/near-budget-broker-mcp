@@ -5,9 +5,9 @@ import {
   AccountBalanceSchema, AccountIdSchema, AccountingEntrySchema, AgentCredentialSchema,
   AgentPolicySchema, AgentSchema, BrokerError, CheckpointSchema, CountSchema,
   Ed25519PublicKeySchema, FreezeSchema, GENESIS_PREV_HASH, HoldSchema, MAX_U128,
-  NonceSchema, OUTBOX_STATUSES, PageQuerySchema, ReceiptEventSchema,
+  OUTBOX_STATUSES, PageQuerySchema, ReceiptEventSchema,
   RequestApprovalSchema, StandingApprovalSchema, TimestampSchema, TransferRequestSchema,
-  TxAttemptSchema, WalletPolicySchema, fromDecimalText, isAllowedTransition, toDecimalText,
+  TxAttemptSchema, WalletPolicySchema, fromDecimalText, isAllowedTransition, requestDigest, toDecimalText,
 } from '../contracts/index.js';
 import type {
   AccountBalance, AccountingEntry, AccountingFilter, Agent, AgentCredential, AgentPolicy,
@@ -16,6 +16,7 @@ import type {
   TransferState, TxAttempt, UsageSnapshot, WalletPolicy, WalletStatus,
 } from '../contracts/index.js';
 import { migrate } from './migrations.js';
+import { rollbackQuietly, storageError } from './sqlite-errors.js';
 
 export interface SqliteStoreOptions {
   /** Nonces are namespaced by (testnet, custody account, public key). */
@@ -60,6 +61,7 @@ function add(a: bigint, b: bigint): bigint {
   return result;
 }
 function same(a: unknown, b: unknown): boolean { return encode(a) === encode(b); }
+const MAX_NONCE = (1n << 64n) - 1n;
 const terminal = new Set<TransferState>(['denied', 'rejected', 'expired', 'cancelled', 'succeeded', 'failed']);
 
 /** One connection per Store. Handles cannot escape their synchronous callback. */
@@ -75,11 +77,14 @@ export class SqliteStore implements Store {
     const timeout = options.busyTimeoutMs ?? 5_000;
     requireThat(Number.isSafeInteger(timeout) && timeout >= 0 && timeout <= 2_147_483_647);
     this.options = { ...options, network: 'testnet' };
-    this.db = new DatabaseSync(filename);
+    try { this.db = new DatabaseSync(filename); } catch (error) { throw storageError(error); }
     try {
       this.db.exec(`PRAGMA busy_timeout = ${timeout}; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;`);
-      migrate(this.db);
-    } catch (error) { this.db.close(); throw error; }
+      migrate(this.db, options.accountId);
+    } catch (error) {
+      try { this.db.close(); } catch { /* preserve initialization failure */ }
+      throw storageError(error);
+    }
   }
 
   read<T>(operation: (view: StoreReader) => T): T {
@@ -97,7 +102,7 @@ export class SqliteStore implements Store {
     // Reject native async callbacks before their first side effect. Thenables
     // returned by ordinary callbacks are also rejected and rolled back below.
     requireThat(operation.constructor.name !== 'AsyncFunction');
-    this.db.exec(write ? 'BEGIN IMMEDIATE' : 'BEGIN');
+    try { this.db.exec(write ? 'BEGIN IMMEDIATE' : 'BEGIN'); } catch (error) { throw storageError(error); }
     this.inCallback = true;
     const view = new Transaction(this.db, this.options, write);
     try {
@@ -110,8 +115,8 @@ export class SqliteStore implements Store {
       this.db.exec('COMMIT');
       return result;
     } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
+      rollbackQuietly(this.db);
+      throw storageError(error);
     } finally { view.finish(); this.inCallback = false; }
   }
   close(): void {
@@ -127,16 +132,16 @@ class Transaction implements StoreTransaction {
   private check(write = false): void { requireThat(this.active && (!write || this.writable)); }
   private rows(sql: string, ...args: SQLInputValue[]): Row[] {
     this.check();
-    return this.db.prepare(sql).all(...args);
+    try { return this.db.prepare(sql).all(...args); } catch (error) { throw storageError(error); }
   }
   private row(sql: string, ...args: SQLInputValue[]): Row | undefined {
     this.check();
-    return this.db.prepare(sql).get(...args);
+    try { return this.db.prepare(sql).get(...args); } catch (error) { throw storageError(error); }
   }
   private exec(sql: string, ...args: SQLInputValue[]): void {
     this.check(true);
     try { this.db.prepare(sql).run(...args); }
-    catch { throw new BrokerError('FORBIDDEN', 'Storage constraint rejected mutation'); }
+    catch (error) { throw storageError(error); }
   }
   private one<T>(sql: string, args: SQLInputValue[], schema: z.ZodType<T>, bigints: readonly string[] = []): T | null {
     const row = this.row(sql, ...args);
@@ -185,11 +190,13 @@ class Transaction implements StoreTransaction {
     requireThat(scope === 'global' || (scope === 'agent' && typeof agentId === 'string'));
     return this.one('SELECT data FROM freezes WHERE id = ?', [scope === 'global' ? 'global' : `agent:${agentId}`], FreezeSchema);
   }
-  listAttempts(id: string): TxAttempt[] { return this.rows('SELECT data FROM attempts WHERE request_id = ? ORDER BY id COLLATE BINARY', id).map((r) => decode(r, TxAttemptSchema, fields.attempt)); }
-  listOutbox(q: PageQuery): Page<TxAttempt> { return this.page('attempts', [`status IN (${OUTBOX_STATUSES.map(() => '?').join(',')})`], [...OUTBOX_STATUSES], q, TxAttemptSchema, fields.attempt); }
+  listAttempts(id: string): TxAttempt[] { return this.rows('SELECT data FROM attempts WHERE network = ? AND account_id = ? AND request_id = ? ORDER BY id COLLATE BINARY', 'testnet', this.options.accountId, id).map((r) => decode(r, TxAttemptSchema, fields.attempt)); }
+  listOutbox(q: PageQuery): Page<TxAttempt> { return this.page('attempts', ['network = ?', 'account_id = ?', `status IN (${OUTBOX_STATUSES.map(() => '?').join(',')})`], ['testnet', this.options.accountId, ...OUTBOX_STATUSES], q, TxAttemptSchema, fields.attempt); }
   getLocalNonce(publicKey: string): bigint {
     const row = this.row('SELECT nonce FROM nonces WHERE network = ? AND account_id = ? AND public_key = ?', 'testnet', this.options.accountId, publicKey);
-    return row ? unsignedFromText(row['nonce']) : 0n;
+    const nonce = row ? unsignedFromText(row['nonce']) : 0n;
+    requireThat(nonce <= MAX_NONCE, 'NONCE_CONFLICT');
+    return nonce;
   }
   getReceiptHead(chainId: ChainId): ReceiptEvent | null { return this.one('SELECT data FROM receipts WHERE chain_id = ? ORDER BY seq DESC LIMIT 1', [chainId], ReceiptEventSchema); }
   listReceipts(chainId: ChainId, afterSeq: number, limit: number): ReceiptEvent[] {
@@ -296,10 +303,10 @@ class Transaction implements StoreTransaction {
   insertRequest(input: TransferRequest): void {
     const request = TransferRequestSchema.parse(input);
     const existing = this.findRequestByIdempotency(request.agentId, request.idempotencyKey);
-    if (existing) {
-      if (existing.requestDigest !== request.requestDigest) throw new BrokerError('IDEMPOTENCY_CONFLICT');
-      return; // No mutation, even if the caller proposes a new ID/state.
-    }
+    if (existing && existing.requestDigest !== request.requestDigest) throw new BrokerError('IDEMPOTENCY_CONFLICT');
+    requireThat(request.requestDigest === requestDigest({ agentId: request.agentId, receiverId: request.receiverId, amount: toDecimalText(request.amount), memo: request.memo ?? null }));
+    if (existing) return; // Valid replay: no new admission or metadata writes.
+    requireThat(this.getAgent(request.agentId)?.status === 'active');
     requireThat(['denied', 'pending_approval', 'queued'].includes(request.state));
     this.exec('INSERT INTO requests(id, agent_id, idempotency_key, digest, state, created_at, data) VALUES (?, ?, ?, ?, ?, ?, ?)', request.id, request.agentId, request.idempotencyKey, request.requestDigest, request.state, request.createdAt, encode(request));
     if (request.state !== 'denied') this.exec('INSERT INTO admissions(request_id) VALUES (?)', request.id);
@@ -312,13 +319,18 @@ class Transaction implements StoreTransaction {
     requireThat(immutable.every((key) => old[key] === request[key]));
     // Once a signed hash exists only the proven-unexecuted seam may change it.
     requireThat(old.txHash === null || old.txHash === request.txHash);
-    if (request.txHash !== null) requireThat(this.listAttempts(request.id).some((a) => a.txHash === request.txHash));
+    const attempts = this.listAttempts(request.id);
+    if (['signed', 'submitted', 'outcome_unknown'].includes(request.state)) requireThat(request.txHash !== null);
+    if (request.txHash !== null) requireThat(attempts.some((a) => a.txHash === request.txHash));
+    if (terminal.has(request.state)) requireThat(!attempts.some((a) => (OUTBOX_STATUSES as readonly string[]).includes(a.status)));
     this.exec('UPDATE requests SET state = ?, data = ? WHERE id = ? AND state = ?', request.state, encode(request), request.id, expectedState);
   }
   putHold(input: Hold): void {
     const hold = HoldSchema.parse(input); const old = this.getHold(hold.requestId);
     const request = this.getRequest(hold.requestId);
     requireThat(request && request.agentId === hold.agentId && request.amount === hold.principal);
+    // Revocation blocks reservations, not settlement/release of ambiguous work.
+    if (hold.status === 'active') requireThat(this.getAgent(hold.agentId)?.status === 'active');
     requireThat(!old || (old.agentId === hold.agentId && old.principal === hold.principal && old.feeReserve === hold.feeReserve && (old.status === 'active' || old.status === hold.status)));
     this.exec('INSERT INTO holds(request_id, agent_id, principal, fee_reserve, status) VALUES (?, ?, ?, ?, ?) ON CONFLICT(request_id) DO UPDATE SET status = excluded.status', hold.requestId, hold.agentId, toDecimalText(hold.principal), toDecimalText(hold.feeReserve), hold.status);
   }
@@ -344,10 +356,14 @@ class Transaction implements StoreTransaction {
     if (freeze.scope === 'agent') requireThat(this.getAgent(freeze.agentId));
     this.exec('INSERT INTO freezes(id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data', freeze.scope === 'global' ? 'global' : `agent:${freeze.agentId}`, encode(freeze));
   }
+  private getAttempt(id: string): TxAttempt | null {
+    return this.one('SELECT data FROM attempts WHERE network = ? AND account_id = ? AND id = ?', ['testnet', this.options.accountId, id], TxAttemptSchema, fields.attempt);
+  }
   putAttempt(input: TxAttempt): void { this.saveAttempt(TxAttemptSchema.parse(input), false); }
   private saveAttempt(attempt: TxAttempt, replacement: boolean): void {
     const request = this.getRequest(attempt.requestId); requireThat(request, 'NOT_FOUND');
-    const old = this.one('SELECT data FROM attempts WHERE id = ?', [attempt.id], TxAttemptSchema, fields.attempt);
+    requireThat(attempt.nonce <= MAX_NONCE, 'NONCE_CONFLICT');
+    const old = this.getAttempt(attempt.id);
     if (old) {
       const immutable = ['id', 'requestId', 'nonce', 'publicKey', 'blockHash', 'signedTxBase64', 'txHash', 'createdAt'] as const;
       requireThat(immutable.every((key) => old[key] === attempt[key]));
@@ -358,11 +374,11 @@ class Transaction implements StoreTransaction {
       requireThat(attempt.status === 'signed' && attempt.nonce > 0n && attempt.nonce <= this.getLocalNonce(attempt.publicKey), 'NONCE_CONFLICT');
       requireThat(replacement || (request.state === 'queued' && request.txHash === null && this.listAttempts(request.id).length === 0));
     }
-    this.exec('INSERT INTO attempts(id, request_id, status, public_key, nonce, tx_hash, data) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET status = excluded.status, data = excluded.data', attempt.id, attempt.requestId, attempt.status, attempt.publicKey, attempt.nonce.toString(), attempt.txHash, encode(attempt));
+    this.exec('INSERT INTO attempts(id, request_id, network, account_id, status, public_key, nonce, tx_hash, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET status = excluded.status, data = excluded.data', attempt.id, attempt.requestId, 'testnet', this.options.accountId, attempt.status, attempt.publicKey, attempt.nonce.toString(), attempt.txHash, encode(attempt));
   }
   replaceUnexecutedAttempt(requestId: string, previousAttemptId: string, input: TxAttempt): void {
     const replacement = TxAttemptSchema.parse(input); const request = this.getRequest(requestId);
-    const prior = this.one('SELECT data FROM attempts WHERE id = ?', [previousAttemptId], TxAttemptSchema, fields.attempt);
+    const prior = this.getAttempt(previousAttemptId);
     requireThat(request && prior && prior.requestId === requestId && prior.txHash === request.txHash && prior.status === 'proven_not_executed' && prior.nonExecutionEvidence !== null);
     requireThat(request.state === 'signed' || request.state === 'outcome_unknown');
     requireThat(replacement.requestId === requestId && replacement.id !== prior.id && replacement.publicKey === prior.publicKey && replacement.nonce > prior.nonce && replacement.nonce === this.getLocalNonce(replacement.publicKey), 'NONCE_CONFLICT');
@@ -371,14 +387,18 @@ class Transaction implements StoreTransaction {
     this.exec('UPDATE requests SET data = ? WHERE id = ?', encode({ ...request, txHash: replacement.txHash, updatedAt: replacement.updatedAt }), requestId);
   }
   allocateNonce(publicKey: string, chainNonce: bigint): bigint {
-    Ed25519PublicKeySchema.parse(publicKey); NonceSchema.parse(chainNonce);
+    Ed25519PublicKeySchema.parse(publicKey);
+    requireThat(typeof chainNonce === 'bigint' && chainNonce >= 0n && chainNonce <= MAX_NONCE, 'NONCE_CONFLICT');
     const local = this.getLocalNonce(publicKey); const next = (local > chainNonce ? local : chainNonce) + 1n;
+    requireThat(next <= MAX_NONCE, 'NONCE_CONFLICT');
     this.exec('INSERT INTO nonces(network, account_id, public_key, nonce) VALUES (?, ?, ?, ?) ON CONFLICT(network, account_id, public_key) DO UPDATE SET nonce = excluded.nonce', 'testnet', this.options.accountId, publicKey, next.toString());
     return next;
   }
   putBalance(input: AccountBalance, validUntil: number): void {
     const balance = AccountBalanceSchema.parse(input); TimestampSchema.parse(validUntil);
     requireThat(balance.accountId === this.options.accountId && validUntil >= balance.observedAt);
+    const old = this.balance();
+    requireThat(!old || balance.observedAt >= old.balance.observedAt);
     this.exec('INSERT INTO balance(id, valid_until, data) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET valid_until = excluded.valid_until, data = excluded.data', validUntil, encode(balance));
   }
   insertReceipt(input: ReceiptEvent): void {
