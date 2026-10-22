@@ -1,8 +1,48 @@
 {
   "name": "near-budget-broker-mcp",
   "version": "0.1.0",
-  "description": "Budget Broker MCP server for NEAR Protocol",
+  "description": "Budget Broker MCP server for NEAR Protocol testnet",
   "private": true,
   "type": "module",
-  "license": "MIT"
+  "license": "MIT",
+  "engines": { "node": ">=24" },
+  "bin": { "budget-broker": "dist/main.js" },
+  "files": ["dist", "README.md", "LICENSE", "skills", "examples", "docker"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "vitest run --exclude 'test/live/**'",
+    "test:contracts": "vitest run test/contracts",
+    "test:storage": "vitest run test/storage",
+    "test:policy": "vitest run test/policy",
+    "test:auth": "vitest run test/auth",
+    "test:audit": "vitest run test/audit/core",
+    "test:near": "vitest run test/near",
+    "test:custody": "vitest run test/custody",
+    "test:broker": "vitest run test/broker",
+    "test:mcp": "vitest run test/mcp/local",
+    "test:http": "vitest run test/mcp/http",
+    "test:cli": "vitest run test/cli",
+    "test:isolation": "vitest run test/isolation",
+    "test:approvals": "vitest run test/approvals",
+    "test:checkpoints": "vitest run test/audit/checkpoints",
+    "test:package": "vitest run test/package",
+    "test:e2e": "vitest run test/e2e",
+    "test:perf": "vitest run test/perf",
+    "test:live:native": "vitest run test/live/native",
+    "fixtures:native": "tsx scripts/fixtures/native/index.ts",
+    "demo:testnet": "tsx scripts/demo/index.ts",
+    "check:all": "npm run typecheck && npm run build && npm test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "near-api-js": "7.3.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12"
+  }
 }
