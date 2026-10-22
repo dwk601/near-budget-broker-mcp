@@ -4,13 +4,27 @@ import { AccountIdSchema, Base64Schema, Ed25519PublicKeySchema, IdSchema, Timest
 
 export const NonceSchema = z.bigint().nonnegative();
 export const ChainHashSchema = z.string().regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
+export type ChainHash = z.infer<typeof ChainHashSchema>;
+export const OUTBOX_STATUSES = ['signed', 'submitted', 'outcome_unknown'] as const;
+/** Expected RPC/transport failures are values, not untyped thrown errors.
+ * A rejection applies to THIS send only, not proof an earlier send didn't execute. */
+export const BroadcastResultSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ kind: z.literal('accepted'), txHash: ChainHashSchema }),
+  z.strictObject({ kind: z.literal('rejected'), txHash: ChainHashSchema,
+    code: z.enum(['INVALID_NONCE', 'EXPIRED_BLOCK_HASH', 'RPC_REJECTED']), reason: z.string().min(1) }),
+  z.strictObject({ kind: z.literal('outcome_unknown'), txHash: ChainHashSchema, reason: z.string().min(1) }),
+]);
+export type BroadcastResult = z.infer<typeof BroadcastResultSchema>;
 export const TxAttemptSchema = z.strictObject({
   id: IdSchema, requestId: IdSchema, nonce: NonceSchema, publicKey: Ed25519PublicKeySchema,
   blockHash: ChainHashSchema, signedTxBase64: Base64Schema.min(1), txHash: ChainHashSchema,
   status: z.enum(['signed', 'submitted', 'succeeded', 'failed', 'outcome_unknown', 'proven_not_executed']),
   receiptIds: z.array(ChainHashSchema), gasBurnt: z.bigint().nonnegative().nullable(),
   tokensBurnt: YoctoNearSchema.nullable(), createdAt: TimestampSchema, updatedAt: TimestampSchema,
-});
+  /** Positive chain-adapter evidence retained before any replacement is eligible. */
+  nonExecutionEvidence: z.string().min(1).nullable(),
+}).refine((attempt) => attempt.status !== 'proven_not_executed' || attempt.nonExecutionEvidence !== null,
+  'proven_not_executed requires persisted positive evidence');
 export type TxAttempt = z.infer<typeof TxAttemptSchema>;
 export type OutboxEntry = TxAttempt;
 export const AccountBalanceSchema = z.strictObject({

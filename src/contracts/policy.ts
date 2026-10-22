@@ -44,7 +44,7 @@ export const UsageSnapshotSchema = z.strictObject({
   outstandingHolds: YoctoNearSchema,
   balance: z.strictObject({ spendable: YoctoNearSchema, observedAt: TimestampSchema, validUntil: TimestampSchema }).nullable(),
   standingReserved: z.record(z.string(), YoctoNearSchema),
-  globalFrozen: z.boolean(),
+  agentFrozen: z.boolean(), globalFrozen: z.boolean(),
 });
 export type UsageSnapshot = z.infer<typeof UsageSnapshotSchema>;
 export const PolicyRequestSchema = z.strictObject({

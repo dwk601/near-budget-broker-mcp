@@ -13,7 +13,7 @@ import { actions, createTransaction, decodeSignedTransaction, encodeTransaction,
 
 const config = {
   network: 'testnet', rpcUrl: 'https://rpc.testnet.near.org', accountId: 'broker.testnet',
-  dataDir: '/data', ownerPublicKey: `ed25519:${'1'.repeat(32)}`, safetyReserve: 0n,
+  dataDir: '/data', auditKeyPath: '/data/audit.key', ownerPublicKey: `ed25519:${'1'.repeat(32)}`, safetyReserve: 0n,
 };
 const policy = {
   agentId: 'a', revision: 1, perTxMax: 0n, rolling24hMax: 0n, lifetimeMax: 0n,
@@ -25,7 +25,7 @@ describe('exact amounts (no floating point)', () => {
   it.each([
     ['0', 0n], ['1', 10n ** 24n], ['0.001', 10n ** 21n],
     ['0.000000000000000000000001', 1n], ['1.000000000000000000000001', 10n ** 24n + 1n],
-    ['123456789012345678901234567890.123456789012345678901234', 123456789012345678901234567890123456789012345678901234n],
+    ['340282366920938.463463374607431768211455', 340282366920938463463374607431768211455n],
   ])('round trips %s', (text, expected) => {
     expect(parseNear(text)).toBe(expected);
     expect(formatNear(expected)).toBe(text);
@@ -101,7 +101,10 @@ describe('state machine', () => {
     }
     expect(transitions.outcome_unknown).toEqual(['submitted', 'succeeded', 'failed']);
     expect(transitions.queued).toContain('signed');
+    expect(transitions.queued).toContain('cancelled');
     expect(transitions.pending_approval).toContain('approved');
+    expect(transitions.pending_approval).toContain('expired');
+    expect(transitions.signed).toContain('outcome_unknown');
   });
 });
 
@@ -159,7 +162,9 @@ describe('policy, audit, and owner request shapes', () => {
   it('validates signed chain events without permitting bigint payloads', () => {
     const event = {
       chainId: 'agent:a', seq: 1, prevHash: '0'.repeat(64), type: 'decision_allowed', at: 1,
-      payload: { amount: '1' }, hash: 'a'.repeat(64), signature: Buffer.alloc(64).toString('base64'),
+      payload: { agentId: 'a', requestId: 'r', receiverId: 'bob.testnet', amount: '1',
+        requestDigest: 'b'.repeat(64), policyRevision: 1, approvalRef: null, reasons: [] },
+      hash: 'a'.repeat(64), signature: Buffer.alloc(64).toString('base64'),
     };
     expect(ReceiptEventSchema.safeParse(event).success).toBe(true);
     expect(ReceiptEventSchema.safeParse({ ...event, seq: 0 }).success).toBe(false);

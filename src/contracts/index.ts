@@ -10,4 +10,8 @@ export * from './audit.js';
 export * from './auth.js';
 export * from './chain.js';
 export * from './mcp.js';
+export * from './canonical.js';
+export * from './approvals.js';
+export * from './checkpoints.js';
+export * from './status.js';
 export type * from './ports.js';

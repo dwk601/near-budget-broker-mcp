@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import { IdSchema, Sha256Schema, TimestampSchema } from './primitives.js';
 
-export const AgentStatusSchema = z.enum(['active', 'frozen', 'revoked']);
+/** Revocation is permanent; freeze state exists ONLY in Freeze records. */
+export const AgentStatusSchema = z.enum(['active', 'revoked']);
 export const AgentSchema = z.strictObject({
   id: IdSchema, name: z.string().min(1).max(256), status: AgentStatusSchema, createdAt: TimestampSchema,
 });

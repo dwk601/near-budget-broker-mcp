@@ -20,6 +20,10 @@ export const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() => z.union([
 ]));
 export const JsonObjectSchema = z.record(z.string(), JsonValueSchema);
 export type JsonObject = z.infer<typeof JsonObjectSchema>;
+/** Keyset paging: ascending immutable ID using SQLite COLLATE BINARY (UTF-8 byte
+ * order). `after` is the exclusive last ID, not an offset or authorization token.
+ * Apply scope/filters on EVERY page. nextCursor is last returned ID iff more
+ * matching rows exist, otherwise null. Separate pages are not one snapshot. */
 export const PageQuerySchema = z.strictObject({
   after: IdSchema.optional(), limit: z.number().int().min(1).max(1000).default(100),
 });

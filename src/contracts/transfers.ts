@@ -2,6 +2,9 @@ import { z } from 'zod';
 import { DecimalTextSchema, YoctoNearSchema } from './amounts.js';
 import { AccountIdSchema, IdSchema, CountSchema, TimestampSchema, Sha256Schema } from './primitives.js';
 import { ReasonCodeSchema } from './errors.js';
+import { ChainHashSchema } from './chain.js';
+import { EXPLORER_BASE } from './config.js';
+import type { ChainHash } from './chain.js';
 
 export const TRANSFER_STATES = [
   'denied', 'pending_approval', 'approved', 'rejected', 'expired', 'cancelled', 'queued',
@@ -47,8 +50,21 @@ export const TransferRequestSchema = z.strictObject({
   createdAt: TimestampSchema, updatedAt: TimestampSchema,
   expiresAt: TimestampSchema.nullable(), signedAt: TimestampSchema.nullable(),
   submittedAt: TimestampSchema.nullable(), completedAt: TimestampSchema.nullable(),
+  txHash: ChainHashSchema.nullable(), gasBurnt: z.bigint().nonnegative().nullable(),
+  tokensBurnt: YoctoNearSchema.nullable(),
 });
 export type TransferRequest = z.infer<typeof TransferRequestSchema>;
+export function transferExplorerUrl(txHash: ChainHash | null): string | null {
+  return txHash === null ? null : `${EXPLORER_BASE}${ChainHashSchema.parse(txHash)}`;
+}
+export const TransferViewSchema = TransferRequestSchema.extend({ explorerUrl: z.url().nullable() })
+  .refine((view) => view.explorerUrl === transferExplorerUrl(view.txHash), 'Explorer URL must match txHash');
+export type TransferView = z.infer<typeof TransferViewSchema>;
+/** No same-state changes; replacement of proven-unexecuted attempts has a separate Store method. */
+export function isAllowedTransition(from: TransferState, to: TransferState): boolean {
+  const targets: readonly TransferState[] = ALLOWED_TRANSITIONS[from];
+  return targets.includes(to);
+}
 export const HoldSchema = z.strictObject({
   requestId: IdSchema, agentId: IdSchema, principal: YoctoNearSchema, feeReserve: YoctoNearSchema,
   status: z.enum(['active', 'committed', 'released']),

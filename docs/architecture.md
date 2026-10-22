@@ -5,6 +5,9 @@ public TypeScript barrel; adjacent Zod schemas validate shared data. These files
 package metadata/lockfile and compiler/test configs are B00-owned. Later tasks
 must request a B00 amendment rather than silently change their signatures.
 There is deliberately no daemon, storage, policy or chain implementation yet.
+The post-review B00 amendment below is authoritative over the initial commit:
+shared canonical byte helpers, scoped status, explicit approval/checkpoint seams,
+per-type receipts, single-source freeze state and bounded u128 monetary inputs.
 
 ## Product and trust boundary
 
@@ -100,7 +103,12 @@ whitespace, exponents, grouping, leading integer zeros or coercion. Zero is a
 valid amount value but not a transfer. `formatNear` emits canonical decimals
 without insignificant fractional zeros. One yocto is exactly
 `0.000000000000000000000001`. Never use floats, `parseFloat`, `Number(bigint)`
-or SQL REAL for amounts. Chain adapters additionally enforce native u128 limits.
+or SQL REAL for amounts. ALL monetary domain/wire schemas and conversion helpers
+enforce **0..2^128-1** (positive for transfers). Decimal TEXT is at most 39 digits;
+human NEAR input is at most 40 characters/15 integer digits. Validation bounds
+length before BigInt conversion, so million-digit hostile inputs never reach
+BigInt parsing. Intermediate accounting arithmetic must also fail closed on
+u128 overflow, never truncate/wrap. Chain adapters revalidate before encoding.
 
 All amounts, nonces and gas-unit bigints persist as canonical unsigned decimal
 **SQLite TEXT** (`0` or `[1-9][0-9]*`) and cross HTTP/MCP/JSON as the same text.
@@ -121,14 +129,54 @@ Reject undefined, non-finite/unsafe/fractional numbers, duplicate JSON keys and
 non-JSON objects at boundaries. Hash UTF-8 canonical bytes with SHA-256, lowercase
 64-character hex. No platform-specific serialization or implicit string coercion.
 
+`src/contracts/canonical.ts` is the ONLY shared byte-format authority; import its
+pure helpers rather than reimplementing signing/digests in each task:
+
+| Helper | Exact result |
+| --- | --- |
+| `canonicalJson(value)` | canonical JSON string; UTF-16 code-unit key ordering, not UTF-8/codepoint order; arrays ordered; -0 -> 0 |
+| `sha256Hex(textOrBytes)` | lowercase SHA-256 hex of UTF-8 string or exact bytes; no JSON quoting/hex decoding |
+| `requestDigest(preimage)` | SHA-256 of canonical agentId/receiverId/yocto-TEXT amount/memo; missing or null memo -> null |
+| `hashAgentToken(token)` | validate syntax then hash exact full UTF-8 token, including bb_agent_ prefix |
+| `ownerSigningBytes(payload)` | validated canonical signing payload as UTF-8 Uint8Array, NOT a hash |
+| `receiptHashInput(preimage)` | validated canonical receipt preimage bytes, excludes hash/signature |
+| `checkpointHashInput(preimage)` | validated canonical checkpoint preimage bytes, excludes hash/signature |
+
+No Unicode normalization; lone surrogates, sparse/extended arrays, cycles,
+accessors, non-enumerable properties, symbols, toJSON/classes and depths >128
+are rejected. Objects must be plain or null-prototype. Numeric-looking object
+keys are sorted lexically (not JS enumeration order). A parsed object has already
+lost duplicate keys: HTTP parsers MUST reject duplicate raw JSON keys before
+these helpers; canonicalJson cannot recover them. Fixed cross-module golden byte,
+hash and Ed25519 signature vectors live in `test/contracts/canonical.test.ts`.
+
 ### Config
 
-`ConfigSchema` is strict: network literal `testnet`; rpcUrl (HTTP/S, no URL
-credentials or obvious mainnet hostname); custody `accountId`; fixed explorer
-base `https://testnet.nearblocks.io/txns/`; separate agent/admin ports; dataDir;
-ownerPublicKey `ed25519:<base58>`; `feeReservePerTx` defaults to 0.001 NEAR;
-`safetyReserve` is required. `parseConfig` rejects mainnet with code
-`MAINNET_REFUSED`. A testnet label is not proof of RPC identity: NearChain must
+`ConfigSchema` is strict: ONLY exact network literal `testnet` (no normalization:
+MAINNET/Mainnet/TESTNET/localnet all rejected); rpcUrl (HTTP/S, no credentials,
+mainnet URL marker or known mainnet alias `free.rpc.fastnear.com`); custody
+`accountId`; fixed explorer base `https://testnet.nearblocks.io/txns/`; separate
+agent/admin ports; required dataDir and auditKeyPath; ownerPublicKey
+`ed25519:<base58>`; `feeReservePerTx` defaults to 0.001 NEAR; required safetyReserve.
+`parseConfig` wraps ALL network/RPC validation failures as
+`BrokerError('MAINNET_REFUSED')`; other config failures remain ZodErrors. A schema
+safeParse failure is still a Zod validation result, not a BrokerError.
+
+bindHost defaults to `127.0.0.1`; `0.0.0.0` is allowed ONLY inside the isolated
+container with host ports published on 127.0.0.1. allowedHosts defaults to
+`['127.0.0.1','localhost']`: exact lowercase hostnames, no ports/wildcards or
+trailing dot. B07/B08 must parse exactly one valid Host authority, validate its
+port against the listener/published port, and compare the hostname exactly, not
+by suffix or trusted forwarded headers. allowedOrigins defaults to `[]`: reject
+all present browser Origins unless exactly allowlisted; absent Origin is allowed
+for authenticated CLI/bridge. Entries must be serialized HTTP(S) origins, no
+userinfo/path/query/fragment/opaque `null`. Reject malformed/multiple Origin/Host
+headers before matching. `balanceMaxAgeMs` defaults to 10,000 (allowed 1..60,000);
+B06 derives snapshot validUntil = observedAt + balanceMaxAgeMs. auditKeyPath is
+container-internal audit key material, never an owner private key or agent file.
+
+URL heuristics are only an early rejection: arbitrary RPC aliases cannot be
+classified by a static hostname list. A testnet label is not proof: NearChain must
 verify the RPC node's `chain_id=testnet` before signing/broadcast and fail closed
 on a mismatch/unknown identity. No `.near` suffix heuristic substitutes for this.
 Public-key schemas validate shape; crypto adapters must decode exact 32-byte
@@ -137,7 +185,16 @@ safety reserve, but absence of a persisted wallet policy still denies admission.
 
 ### Agents, credentials and owner auth
 
-Agent: `{id,name,status:active|frozen|revoked,createdAt}`. Credentials have their
+Agent: `{id,name,status:active|revoked,createdAt}`. **No frozen lifecycle state.**
+Freeze lives ONLY in Freeze records. Store snapshots derive mandatory
+`agentFrozen` and `globalFrozen` from those records; evaluator checks both before
+caps/approvals. Missing freeze records mean false, not missing policy. Unfreeze
+changes a Freeze record, never Agent.status.
+`revokeAgent` permanently sets revoked, atomically revokes all its credentials
+and writes agent_revoked plus credential_revoked events; token issuance for a
+revoked agent is forbidden. Revocation stops new admission/dispatch, never
+releases already-ambiguous holds. `putAgent` cannot reactivate a revoked agent.
+Credentials have their
 own ID, agentId, createdAt, nullable revokedAt and **tokenHash only** (SHA-256 of
 the exact UTF-8 token). Tokens are `bb_agent_` + 32 cryptographically random bytes
 in canonical unpadded base64url (43 chars). Never persist, audit or log plaintext
@@ -154,6 +211,15 @@ verification/export-like tools; do not leak existence of another agent's IDs.
 Owner operations require OwnerPrincipal produced by the signed-request verifier,
 not an unchecked JSON `{kind:'owner'}`. Ports are trusted in-process interfaces,
 not authentication mechanisms by themselves.
+
+`budget_status` returns strict `BudgetStatusSchema`: own agent/policy,
+agentFrozen, own usage, own remaining quotas, at. No walletPolicy, custody
+balance, walletRolling24h, outstandingHolds, globalFreeze/globalFrozen or other
+agent/standing usage. Remaining is max(0, own cap - own reserved+settled usage);
+perTx is own perTxMax, all zero if policy missing/expired or agent revoked/frozen.
+This is not a wallet-capacity/approval promise. The internal `UsageSnapshot` is
+NEVER serialized as an agent response. `WalletStatus` is owner-only. Global
+freeze and wallet-policy receipt events also stay exclusively on the owner chain.
 
 Owner signs canonical `{method,path,bodySha256,nonce,issuedAt}` using Ed25519:
 uppercase HTTP method, exact encoded request path including query (no origin or
@@ -207,12 +273,33 @@ at admission AND dispatch. `usedTotal` is finalized successful principal;
 approval consumption atomically with holds. Receipts name the exact approval;
 revocation before dispatch blocks use. No mutation in preview/evaluator.
 
+B12 implements `ApprovalService`, not duplicate BrokerService endpoints. B06
+owns owner authentication, dispatch and hard-cap orchestration and calls B12
+inside its existing StoreTransaction. B12 synchronously approve/rejects requests
+and grants/revokes standing approvals, including state/hold/receipt writes; never
+starts a nested transaction. Per-request approval IDs/digest/revision/expiry bind
+the persisted immutable request. `matchStandingApproval` is a pure bounded grant
+matcher, injected into policy/broker (never a hard-cap bypass). `consumeStandingApproval`
+is a pure successful-settlement debit, requires amount <= reservedAmount and
+usedTotal+amount <= totalMax, returns a new approval without input mutation. It
+must debit already-executed transfers even if the grant has since expired or been
+revoked. The broker persists it and releases the standing reservation atomically
+with final accounting; failed/cancelled work releases reservations without a debit.
+Reservations derive from active holds plus request.approvalRef, avoiding a second
+unsynchronized usage counter. List all relevant standing grants inside the same
+read/transaction snapshot when evaluating (not just the first page).
+
 ## Transfers, holds, outbox and settlement
 
 TransferInput requires idempotencyKey, receiverId, positive amount, optional memo.
 Memo is off-chain metadata, never a contract call. TransferRequest adds id,
 agentId, requestDigest, state, reasons, nullable policyRevision/approvalRef and
-created/updated/expiry/signed/submitted/completed timestamps. The digest preimage
+created/updated/expiry/signed/submitted/completed timestamps, nullable txHash,
+gasBurnt and tokensBurnt. Hash is the current persisted signed attempt's hash;
+fees are actual aggregate burnt values when known, never estimates (null is
+unknown, 0 is known zero). The agent requestTransfer/getRequest/cancelRequest
+return `TransferView`, which also guarantees explorerUrl is null iff txHash is
+null, otherwise exactly EXPLORER_BASE+txHash. Never link mainnet. The digest preimage
 is canonical `{agentId,receiverId,amount,memo}` with amount yocto TEXT and absent
 memo normalized to **null** (empty string stays distinct). Scope idempotency by
 `UNIQUE(agentId,idempotencyKey)`. Same key+digest returns the original request;
@@ -229,9 +316,20 @@ after re-evaluation. Queued work can be cancelled/expired/denied or sent back to
 approval before signing. Once signed, never cancel or return to a fresh queue.
 `outcome_unknown` may become submitted/succeeded/failed on evidence, not cancelled.
 A signing event does not prove execution; a timeout does not prove failure.
+`StoreTransaction.updateRequest` enforces ALLOWED_TRANSITIONS and CAS on
+expectedState; immutable request/digest/idempotency fields cannot change and
+same-state updates are rejected. Re-signing a positively proven-unexecuted
+attempt uses ONLY `replaceUnexecutedAttempt`: the prior attempt must match
+request.txHash and status proven_not_executed, request state signed or
+outcome_unknown, and replacement nonce strictly higher. It atomically persists
+replacement signed bytes+current txHash without changing request state or
+releasing holds; retains old evidence. `putAttempt` alone cannot switch request
+identity. `proven_not_executed` attempt status requires persisted nonempty
+nonExecutionEvidence from positive chain-adapter observations, never a timeout
+or InvalidNonce alone. No generic same-state metadata write bypasses these requirements.
 
 Hold `{requestId,agentId,principal,feeReserve,status}` uses active/committed/released.
-AccountingEntry is an immutable positive amount plus explicit kind (principal/
+AccountingEntry is an immutable **nonnegative u128** amount plus explicit kind (principal/
 fee reserved/released, principal committed, gas charged), never floating deltas.
 Hold active means fully reserved; committed means final chain settlement, with
 unused principal/fees released in accounting; released means no possible execution
@@ -253,13 +351,16 @@ Wallet admission equation (all exact bigint):
 Spendable excludes locked funds and storage staking reserve. Negative RHS denies.
 Stale/unknown balance (null, invalid/future observation or now>validUntil) fails
 closed with WALLET_CAPACITY. Obtain/refresh RPC balance outside SQLite callbacks;
-B06 must configure/document freshness conservatively. Never trust caller balance.
+Reject also when now-observedAt > config.balanceMaxAgeMs regardless of a stored
+validUntil; B06 must not extend freshness by re-reading cached data. Never trust
+caller balance. Owner `walletStatus` has balanceValidUntil; agent status has no balance.
 
 Exactly one dispatch lane per custody public key. Persist a monotonic nonce:
 `max(localNonce, chainNonce)+1`, under serialization, as decimal TEXT. Build and
 sign only the native transfer with that explicit nonce and recent block hash.
 Persist TxAttempt/outbox (id, requestId, nonce, publicKey, blockHash, **signed bytes**,
-txHash, status, receiptIds, nullable gasBurnt/tokensBurnt, timestamps) **before**
+txHash, status, receiptIds, nullable gasBurnt/tokensBurnt, timestamps and nullable
+nonExecutionEvidence) **before**
 network broadcast. Replaying persisted bytes is not re-signing. A restart must
 recover outstanding attempts and reconcile them, not allocate replacement nonces
 blindly. A new attempt requires positive proof the prior one did not execute;
@@ -267,6 +368,20 @@ InvalidNonce alone, RPC timeout, missing transaction/indexer row, or a stale blo
 hash is insufficient. InvalidNonce re-signing is allowed only when the prior
 attempt is proven not executed; retain that attempt/evidence and allocate a new
 monotonic nonce without returning the request to queued. No nonce decrement.
+
+`listOutbox` returns ONLY unresolved signed/submitted/outcome_unknown attempts
+(`OUTBOX_STATUSES`); terminal succeeded/failed/proven_not_executed history is
+available via listAttempts(requestId). Recovery paging is ID order, NOT dispatch
+nonce order; the single lane still dispatches/reconciles in nonce-safe order.
+All PageQuery lists (agents, credentials, requests, standing grants, accounting,
+outbox) use ascending immutable ID with SQLite COLLATE BINARY (UTF-8 byte order).
+`after` is an exclusive last ID, not an offset/authorization token; nextCursor
+is last returned ID only when more matching rows exist, otherwise null. Apply
+scope/filters on EVERY page, including invented/cross-agent cursors. Separate
+pages have no shared-snapshot guarantee; invariant-sensitive scans stay inside
+one Store read/transaction. Receipts/checkpoints page by ascending seq with
+exclusive afterSeq=0 for start; limit 1..1000. `listAccounting` supports agentId
+and/or requestId filters for auditable owner reconciliation, not agent-wide leaks.
 
 Freeze is checked at admission and **immediately before dispatch under the same
 serialization as freeze mutations**. Signing and RPC calls are outside synchronous
@@ -277,6 +392,14 @@ receipt (`submitted` with payload phase `intent`) atomically before invoking the
 network; audit failure blocks the invocation. A freeze pauses unsent signed work;
 it cannot undo an already broadcast transfer. Do not release ambiguous holds on
 freeze. Owner unfreeze doesn't reactivate revoked agents/credentials.
+
+`broadcast` returns typed BroadcastResult: accepted{txHash},
+rejected{txHash,code:INVALID_NONCE|EXPIRED_BLOCK_HASH|RPC_REJECTED,reason}, or
+outcome_unknown{txHash,reason}. These are adapter results, NOT new broker error
+codes. Expected network/RPC failures do not use untyped exception semantics;
+unexpected exceptions must conservatively become outcome_unknown in the broker.
+A rejected send is NOT proof that an earlier broadcast didn't execute. Only
+positive ChainOutcome.not_executed evidence unlocks a replacement attempt.
 
 Broadcast acknowledgment -> submitted; final chain execution evidence -> succeeded
 or failed. Timeout/unclassified response -> **outcome_unknown**, keeps the hold,
@@ -296,16 +419,56 @@ only, not hash/signature; sign the 32 decoded SHA-256 bytes with the daemon's
 **Ed25519 audit key**, distinct from owner and custody keys. Verification checks
 sequence, genesis/previous hash, canonical payload hash and signature with a
 trusted audit public key. Hash/signature fields alone do not establish trust or
-prove history completeness. B13 checkpoints address truncation/rollback evidence.
+prove history completeness. Use shared receiptHashInput/sha256Hex. B04 provides
+synchronous `AuditSigner` to ReceiptLog and B13 CheckpointLog; signHash rejects
+anything but exactly 32 hash bytes. ReceiptLog.auditPublicKey and the owner
+BrokerService.auditPublicKey expose the trusted public verification key for
+independent exports; never derive trust from an arbitrary event's supplied key.
 
-Types: decision_allowed, decision_denied, approval_required, approved, rejected,
-standing_approval_used, queued, submitted, succeeded, failed, outcome_unknown,
-cancelled, freeze, unfreeze, policy_updated, credential_issued, credential_revoked.
-Agent events belong to their agent chain; owner administrative operations append
-an owner event and affected-agent event in the same transaction when applicable.
-Payloads contain request IDs, policy revision, reasons and approval references,
-not plaintext tokens, unlock secrets or signed owner credentials. `ReceiptLog`
-append accepts the caller's StoreTransaction to avoid a second non-atomic DB write.
+`RECEIPT_PAYLOAD_SCHEMAS` defines strict, per-type payloads, correlated with type
+in ReceiptPreimage/ReceiptEvent/AppendReceipt; no arbitrary payload object:
+
+| Types | Required payload content (exact fields in schemas) |
+| --- | --- |
+| decision_allowed, decision_denied, approval_required | request/agent/receiver, amount TEXT, requestDigest, nullable policyRevision/approvalRef, reasons (empty/nonempty/APPROVAL_REQUIRED respectively) |
+| approved | requestId, agentId, approvalId, digest, revision, expiresAt |
+| rejected, expired, cancelled | requestId, agentId, reason |
+| standing_approval_granted | agentId, full bounded approval with TEXT amounts |
+| standing_approval_revoked | agentId, approvalId, revokedAt |
+| standing_approval_used | requestId, agentId, approvalId, amount TEXT |
+| queued | requestId, agentId |
+| submitted | requestId, agentId, attemptId, txHash, phase **intent or acknowledged** (mandatory) |
+| succeeded, failed | requestId, agentId, txHash, receiptIds, actual gasBurnt/tokensBurnt TEXT; failed also reason |
+| outcome_unknown | requestId, agentId, attemptId, txHash, reason |
+| freeze, unfreeze | exact Freeze record with frozen true/false respectively |
+| policy_updated | scope agent or wallet, full corresponding policy with TEXT amounts |
+| agent_created | full Agent record |
+| agent_revoked | agentId, reason |
+| credential_issued, credential_revoked | agentId, credentialId (never token/secret) |
+
+Agent events bind payload identity to chainId. Owner administrative operations
+append owner and affected-agent events in the same transaction where applicable;
+wallet policy/global freeze stay owner-only. ReceiptLog append uses the caller's
+StoreTransaction: signature or write failure rolls back state/holds/approval.
+Schema checks prevent mismatched agent payloads and cross-scope receipt leakage.
+
+### B13 checkpoints
+
+CheckpointPreimage is `{version:1,chainId,seq,headHash,previousCheckpointHash,at,
+auditPublicKey}`. seq/headHash pin an existing nonempty receipt chain head;
+previousCheckpointHash is null for first checkpoint, otherwise the previous
+checkpoint hash for that chain. Checkpoint adds hash (sha256Hex of
+checkpointHashInput(preimage)) and signature (audit Ed25519 signature on decoded
+32-byte hash). Store.insertCheckpoint atomically CAS-checks the prior checkpoint,
+requires strictly increasing seq and the stored receipt hash at seq, UNIQUE
+(chainId,seq). No empty-chain or duplicate-head checkpoint. CheckpointLog.create
+accepts the existing StoreTransaction and Clock-supplied at; signing/storage
+failures roll back. list uses seq paging; verify requires an explicitly trusted
+audit public key, verifies hash/signature/linkage/monotonicity, returns structured
+CheckpointVerification. Embedded keys are metadata, not trust roots. External
+pinning/export of checkpoints is required to detect rollback/truncation; a local
+DB alone cannot prove absence of a removed suffix. B13 owns implementations,
+not duplicate canonical or audit signer logic.
 
 Frozen error/reason vocabulary (`ErrorCodeSchema`): UNAUTHENTICATED, FORBIDDEN,
 AGENT_FROZEN, GLOBAL_FROZEN, NO_POLICY, PER_TX_EXCEEDED, ROLLING_24H_EXCEEDED,
@@ -324,11 +487,18 @@ parallel code vocabulary. Return stable codes, not raw RPC/SQL/stack/secret data
 - Store + StoreReader/StoreTransaction: synchronous read snapshots and atomic
   immediate transactions; no awaited callbacks/thenables, no network within SQL.
   Explicit CAS policies/states, idempotency, holds/accounting, nonce, outbox,
-  approval reservations, balance snapshots, receipt heads and durable owner replay.
+  approval reservations, balance snapshots, receipt/checkpoint heads and durable
+  owner replay. Accounting has a paged read. getWalletStatus is owner/internal;
+  no arbitrary asynchronous transactions or generic request-state patch.
 - PolicyEvaluator: pure decision from explicit snapshot/time.
 - Authenticator: token -> AgentPrincipal; owner actual-request verification,
   replay consumption -> OwnerPrincipal.
-- ReceiptLog: sync transactional append; list/verify chain and single receipt.
+- AuditSigner (B04): sync hash signer shared by ReceiptLog and CheckpointLog.
+- ReceiptLog: sync transactional append; list/verify chain and single receipt;
+  expose auditPublicKey for independently verified exports.
+- CheckpointLog (B13): transaction-bound create, seq list and trusted-key verify.
+- ApprovalService (B12): transaction-bound approve/reject/standing grant/revoke;
+  pure match/consume helpers, injected into broker/policy as above.
 - NearChain: attest testnet; account/access-key views; block hash; explicit-nonce
   native build+sign; encode/decode signed bytes; broadcast exact bytes; txStatus
   and classifyOutcome including final receipt IDs, gasBurnt and tokensBurnt.
@@ -337,9 +507,14 @@ parallel code vocabulary. Return stable codes, not raw RPC/SQL/stack/secret data
   parameters and validate decoded lengths; unlock material isn't in config or DB.
 - BrokerService (AgentBrokerService + OwnerBrokerService): agent request/preview,
   request read/cancel, budgetStatus, receipt list/verify, freezeSelf; owner agent
-  creation, token issue/rotate/revoke, agent/wallet policy CAS, approve/reject,
-  standing grant/revoke, global/agent freeze/unfreeze, reconcile, receipt export,
-  request list. Broker, not tools/CLI, orchestrates all atomic invariants.
+  creation/permanent revocation, token issue/rotate/revoke, agent/wallet policy
+  CAS, approve/reject delegated to ApprovalService, standing grant/revoke,
+  global/agent freeze/unfreeze, reconcile, receipt export and request list. Owner
+  reads listAgents/getPolicy/listStandingApprovals/walletStatus/getFreeze/
+  getRequest/auditPublicKey permit restart/discovery/offline verification without
+  internal-module imports. BrokerService.getRequest accepts a trusted agent OR
+  owner principal; agent ownership filtering is mandatory. Broker, not tools/CLI,
+  orchestrates all atomic invariants and invokes injected B12/B13 ports.
 - Clock: injected `now()` epoch milliseconds.
 
 Exact agent tool names: budget_status, preview_transfer, request_transfer,
@@ -369,7 +544,9 @@ createTransaction(signerId: string, publicKey: PublicKey, receiverId: string,
   nonce: bigint | string | number, actions: Action[], blockHash: Uint8Array): Transaction
 ```
 
-Use **bigint nonce only** in our adapter. `actions.transfer(amount: bigint)`
+Use **bigint nonce only** in our adapter. The installed signature is
+`actions.transfer(deposit?: bigint)`; this broker MUST pass an explicit validated
+positive u128 yoctoNEAR deposit (never rely on the optional default). It
 constructs the sole allowed action. Root exports re-export declarations from
 `lib/account-V-f7tl72.d.ts` (generated internal name, not an import path):
 `SignedTransaction.encode(): Uint8Array`, static
@@ -378,7 +555,10 @@ constructs the sole allowed action. Root exports re-export declarations from
 `decodeSignedTransaction(Uint8Array)`. `Signature` takes `{keyType,data}`.
 No `near-api-js/transactions` export is assumed. Do not deep-import generated
 internal filenames. KeyPairSigner.signTransaction can sign a prebuilt transaction;
-it must not select a nonce implicitly for this broker.
+it must not select a nonce implicitly for this broker. The package also exports
+`near-api-js/rpc-errors` (public `./rpc-errors` export); B05 may import typed RPC
+errors there to map them into BroadcastResult/ChainOutcome. It is not a license
+to blindly retry InvalidNonce or leak provider errors through the broker API.
 
 The NEAR skill and references (`api_patterns.md`, `key_management.md`) were read;
 the low-level installed declarations, not high-level Account examples, govern
