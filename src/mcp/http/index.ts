@@ -27,7 +27,7 @@ export interface AgentHttpOptions {
 }
 interface Session {
   server: Server; transport: StreamableHTTPServerTransport; principal: AgentPrincipal;
-  token: string; lastUsed: number;
+  token: string; lastUsed: number; active: number; retired: boolean;
 }
 
 /** Reject duplicate raw headers before Node's header coalescing can hide them. */
@@ -67,29 +67,66 @@ export function createAgentHttpServer(options: AgentHttpOptions) {
   });
   server.requestTimeout = 15_000;
   server.headersTimeout = 10_000;
-  async function evictToken(token: string): Promise<void> {
-    await Promise.all([...allSessions].filter((s) => s.token === token).map((s) => s.server.close()));
+  const disposing = new Set<Promise<void>>();
+  function removeSession(session: Session): void {
+    // Detach synchronously: admission must reserve capacity without an await race.
+    allSessions.delete(session);
+    if (session.transport.sessionId) sessions.delete(session.transport.sessionId);
+    const disposal = session.server.close().catch(() => undefined);
+    disposing.add(disposal);
+    void disposal.finally(() => disposing.delete(disposal));
   }
-  // Reclaim revoked credentials even when clients cannot send an authenticated DELETE.
-  // A session id from a failed request alone is never grounds to evict somebody else.
+  function retire(session: Session): void {
+    session.retired = true;
+    if (session.active === 0) removeSession(session);
+  }
+  function evictToken(token: string): void {
+    for (const session of allSessions) if (session.token === token) retire(session);
+  }
+  function reapIdle(): void {
+    for (const session of allSessions) {
+      if (session.active === 0 && now() - session.lastUsed >= ttl) removeSession(session);
+    }
+  }
+  // Recheck other credentials only on the bounded background cadence, never on
+  // another agent's request path. Outages preserve sessions, definitive revocation
+  // retires them after any in-flight responses have finished.
   let sweeping: Promise<void> | undefined;
   function sweep(): Promise<void> {
     sweeping ??= (async () => {
-      await Promise.all([...allSessions].filter((s) => now() - s.lastUsed >= ttl).map((s) => s.server.close()));
+      reapIdle();
       await Promise.all([...new Set([...allSessions].map((s) => s.token))].map(async (token) => {
         try {
           const live = await authenticatePrincipal(authenticator, token);
-          if ([...allSessions].some((s) => s.token === token && !samePrincipal(live, s.principal))) await evictToken(token);
-        } catch { await evictToken(token); }
+          if ([...allSessions].some((s) => s.token === token && !samePrincipal(live, s.principal))) evictToken(token);
+        } catch (error) {
+          if (error instanceof BrokerError && error.code === 'UNAUTHENTICATED') evictToken(token);
+        }
       }));
     })().finally(() => { sweeping = undefined; });
     return sweeping;
   }
   const reaper = setInterval(() => { if (!closing) void sweep(); }, Math.min(ttl, 30_000));
   reaper.unref();
-  async function authenticationFailure(res: ServerResponse, error: unknown, token?: string) {
-    if (token) await evictToken(token);
+  function lease(current: Session, req: IncomingMessage, res: ServerResponse): void {
+    // GET event streams do not pin sessions. POST leases protect body reads and
+    // live tool responses until flush/disconnect, including auth-error responses.
+    if (req.method !== 'POST') return;
+    current.active++;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      res.off('finish', release); res.off('close', release);
+      current.active--;
+      current.lastUsed = now();
+      if (current.retired && current.active === 0) removeSession(current);
+    };
+    res.once('finish', release); res.once('close', release);
+  }
+  function authenticationFailure(res: ServerResponse, error: unknown, token?: string) {
     const unauthenticated = error instanceof BrokerError && error.code === 'UNAUTHENTICATED';
+    if (unauthenticated && token) evictToken(token);
     deny(res, unauthenticated ? 401 : 503, unauthenticated ? 'UNAUTHENTICATED' : 'BROKER_UNAVAILABLE');
   }
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -124,15 +161,16 @@ export function createAgentHttpServer(options: AgentHttpOptions) {
     if (closing) { deny(res, 503, 'BROKER_UNAVAILABLE'); return; }
     if (req.url !== MCP_HTTP_PATH) { deny(res, 404, 'NOT_FOUND'); return; }
     if (!['GET', 'POST', 'DELETE'].includes(req.method ?? '')) { deny(res, 405, 'FORBIDDEN'); return; }
-    await sweep();
     let sessionId: string | undefined;
     try { sessionId = singleHeader(req, 'mcp-session-id'); }
     catch { deny(res, 400, 'FORBIDDEN'); return; }
     let session = sessionId === undefined ? undefined : sessions.get(sessionId);
     if (sessionId !== undefined) {
-      if (!session) { deny(res, 404, 'NOT_FOUND'); return; }
+      if (session && session.active === 0 && now() - session.lastUsed >= ttl) { removeSession(session); session = undefined; }
+      if (!session || session.retired) { deny(res, 404, 'NOT_FOUND'); return; }
       if (!samePrincipal(principal, session.principal)) { deny(res, 403, 'FORBIDDEN'); return; }
       session.lastUsed = now();
+      lease(session, req, res);
     }
     const length = req.headers['content-length'];
     if (length !== undefined && Number(length) > maxBody) { deny(res, 413, 'FORBIDDEN'); return; }
@@ -155,24 +193,33 @@ export function createAgentHttpServer(options: AgentHttpOptions) {
     }
     if (!session) {
       if (req.method !== 'POST' || !isInitializeRequest(body)) { deny(res, 400, 'FORBIDDEN'); return; }
-      const principals = [...allSessions].map((s) => s.principal).concat([...pending.values()]);
-      if (principals.length >= maxSessions
-        || principals.filter((p) => p.credentialId === principal.credentialId).length >= perCredential
-        || principals.filter((p) => p.agentId === principal.agentId).length >= perAgent) {
-        deny(res, 429, 'RATE_LIMITED'); return;
+      reapIdle();
+      function atCapacity(): boolean {
+        const principals = [...allSessions].map((s) => s.principal).concat([...pending.values()]);
+        return principals.length >= maxSessions
+          || principals.filter((p) => p.credentialId === principal.credentialId).length >= perCredential
+          || principals.filter((p) => p.agentId === principal.agentId).length >= perAgent;
+      }
+      while (atCapacity()) {
+        // Recover from abrupt client death without letting one credential evict
+        // another's sessions or interrupt any active HTTP tool response.
+        const idle = [...allSessions].filter((s) => samePrincipal(s.principal, principal) && s.active === 0)
+          .sort((a, b) => a.lastUsed - b.lastUsed)[0];
+        if (!idle) { deny(res, 429, 'RATE_LIMITED'); return; }
+        removeSession(idle);
       }
       const reservation = randomUUID();
       pending.set(reservation, principal);
       try {
         const mcp = await createAgentMcpServer({ broker, authenticator, token,
-          onAuthenticationFailure: () => { void evictToken(token); },
+          onAuthenticationFailure: () => { evictToken(token); },
         });
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: randomUUID, enableJsonResponse: true,
           onsessioninitialized: (id) => { sessions.set(id, created); },
           onsessionclosed: (id) => { sessions.delete(id); void mcp.close(); },
         });
-        const created: Session = { server: mcp, transport, principal: Object.freeze({ ...principal }), token, lastUsed: now() };
+        const created: Session = { server: mcp, transport, principal: Object.freeze({ ...principal }), token, lastUsed: now(), active: 0, retired: false };
         if (!samePrincipal(principal, await authenticatePrincipal(authenticator, token))) {
           await mcp.close(); throw new BrokerError('UNAUTHENTICATED');
         }
@@ -185,17 +232,20 @@ export function createAgentHttpServer(options: AgentHttpOptions) {
           if (transport.sessionId) sessions.delete(transport.sessionId);
         };
         session = created;
+        lease(created, req, res);
       } catch (error) { await authenticationFailure(res, error, token); return; }
       finally { pending.delete(reservation); }
     }
-    try { await session.transport.handleRequest(req, res, body); }
-    finally { if (!session.transport.sessionId) await session.server.close(); }
+    const current = session;
+    try { await current.transport.handleRequest(req, res, body); }
+    finally { if (!current.transport.sessionId) removeSession(current); }
   }
   async function close(): Promise<void> {
     closing = true;
     clearInterval(reaper);
     await sweeping;
-    await Promise.all([...allSessions].map((session) => session.server.close()));
+    for (const session of allSessions) removeSession(session);
+    await Promise.all(disposing);
     if (server.listening) {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => error ? reject(error) : resolve());

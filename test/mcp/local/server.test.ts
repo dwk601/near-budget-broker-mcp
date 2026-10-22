@@ -7,8 +7,8 @@ import { fakes, principalA, principalB, receipt, TOKEN_A, TOKEN_B, transferArgs 
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { await Promise.all(cleanup.splice(0).map((close) => close())); });
-async function setup(token = TOKEN_A, deps = fakes()) {
-  const server = await createAgentMcpServer({ ...deps, token });
+async function setup(token = TOKEN_A, deps = fakes(), onAuthenticationFailure?: () => void) {
+  const server = await createAgentMcpServer({ ...deps, token, ...(onAuthenticationFailure ? { onAuthenticationFailure } : {}) });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'real-test-client', version: '1' });
   await server.connect(serverTransport);
@@ -133,6 +133,24 @@ describe('session-bound agent MCP factory', () => {
     await expect(client.listTools()).rejects.toThrow('BROKER_UNAVAILABLE');
     vi.mocked(authenticator.authenticateAgent).mockRejectedValueOnce(new Error('secret'));
     await expect(createAgentMcpServer({ broker, authenticator, token: TOKEN_A })).rejects.toMatchObject({ code: 'BROKER_UNAVAILABLE' });
+  });
+
+  it('notifies session owners only for definitive auth failures, after delivering the tool error', async () => {
+    const failed = vi.fn();
+    const { client, authenticator } = await setup(TOKEN_A, fakes(), failed);
+    vi.mocked(authenticator.authenticateAgent).mockRejectedValueOnce(new Error('SQLITE_BUSY'));
+    expect(text(await call(client, 'budget_status'))).toMatchObject({ code: 'BROKER_UNAVAILABLE' });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(failed).not.toHaveBeenCalled();
+    vi.mocked(authenticator.authenticateAgent).mockRejectedValueOnce(new BrokerError('UNAUTHENTICATED'));
+    expect(text(await call(client, 'budget_status'))).toMatchObject({ code: 'UNAUTHENTICATED' });
+    expect(failed).not.toHaveBeenCalled();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(failed).toHaveBeenCalledTimes(1);
+    vi.mocked(authenticator.authenticateAgent).mockResolvedValue(principalB);
+    await expect(client.listTools()).rejects.toThrow('UNAUTHENTICATED');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(failed).toHaveBeenCalledTimes(2);
   });
 
   it('sanitizes both BrokerErrors and unexpected exceptions', async () => {

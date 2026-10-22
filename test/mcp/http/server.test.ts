@@ -26,11 +26,18 @@ async function setup(options: { allowedOrigins?: string[]; maxBodyBytes?: number
     });
     const sdk = new Client({ name: 'real-http-client', version: '1' });
     cleanup.push(() => sdk.close());
-    await sdk.connect(transport as Transport);
+    let received!: () => void;
+    const started = new Promise<void>((resolve) => { received = resolve; });
+    const onGet = (req: import('node:http').IncomingMessage) => {
+      if (req.method === 'GET' && req.headers['mcp-session-id'] === transport.sessionId) { listener.server.off('request', onGet); received(); }
+    };
+    listener.server.on('request', onGet);
+    try { await sdk.connect(transport as Transport); await started; await new Promise((resolve) => setImmediate(resolve)); }
+    finally { listener.server.off('request', onGet); }
     return { sdk, transport };
   }
   function raw(options: { headers?: string[]; body?: string | Buffer; method?: string; chunked?: boolean; path?: string; accept?: string } = {}) {
-    return new Promise<{ status: number; body: string }>((resolve, reject) => {
+    return new Promise<{ status: number; body: string; headers: import('node:http').IncomingHttpHeaders }>((resolve, reject) => {
       const body = options.body ?? JSON.stringify(initialize);
       const headers = options.headers ?? ['Host', `127.0.0.1:${port}`, 'Authorization', `Bearer ${TOKEN_A}`];
       const req = request({ hostname: '127.0.0.1', port, path: options.path ?? '/mcp', method: options.method ?? 'POST', headers: [
@@ -38,9 +45,10 @@ async function setup(options: { allowedOrigins?: string[]; maxBodyBytes?: number
         ...(options.chunked ? ['Transfer-Encoding', 'chunked'] : ['Content-Length', String(Buffer.byteLength(body))]),
       ] }, (res) => {
         let text = ''; res.setEncoding('utf8'); res.on('data', (data: string) => { text += data; });
-        res.on('end', () => resolve({ status: res.statusCode!, body: text }));
+        res.on('end', () => resolve({ status: res.statusCode!, body: text, headers: res.headers }));
       });
       req.on('error', reject);
+      req.setTimeout(1500, () => req.destroy(new Error('HTTP response timed out')));
       req.end(body);
     });
   }
@@ -134,16 +142,17 @@ describe('guarded Streamable HTTP', () => {
 
   it('bounds sessions per credential and agent so A cannot lock B out; revocation reclaims slots', async () => {
     const { raw, port, client, revoked } = await setup({ maxSessions: 3 });
-    await client(TOKEN_A);
-    expect((await raw()).status).toBe(429);
+    const first = await client(TOKEN_A);
+    expect((await raw()).status).toBe(200);
+    await expect(first.sdk.listTools()).rejects.toMatchObject({ code: 404 });
     const b = await client(TOKEN_B);
     expect((await b.sdk.callTool({ name: 'freeze_self', arguments: { reason: 'stop' } })).isError).not.toBe(true);
     revoked.add(TOKEN_A);
-    // B triggers a revocation sweep without relying on A's forbidden DELETE.
-    await b.sdk.listTools();
+    // A's definitive failure reclaims A only; unauthenticated DELETE is unnecessary.
+    expect((await raw()).status).toBe(401);
     revoked.clear();
     expect((await raw()).status).toBe(200);
-    expect((await raw()).status).toBe(429);
+    expect((await raw()).status).toBe(200);
     // An unauthenticated attacker cannot evict B using B's session id.
     expect((await raw({ headers: ['Host', `127.0.0.1:${port}`, 'Mcp-Session-Id', b.transport.sessionId!, 'Authorization', 'Bearer invalid'] })).status).toBe(401);
     expect((await b.sdk.listTools()).tools).toHaveLength(8);
@@ -151,8 +160,9 @@ describe('guarded Streamable HTTP', () => {
 
   it('enforces credential and agent caps independently, including multiple credentials for one hostile agent', async () => {
     const credential = await setup({ maxSessions: 3, maxSessionsPerCredential: 1, maxSessionsPerAgent: 10 });
+    const first = await credential.client(TOKEN_A);
     expect((await credential.raw()).status).toBe(200);
-    expect((await credential.raw()).status).toBe(429);
+    await expect(first.sdk.listTools()).rejects.toMatchObject({ code: 404 });
     const agent = await setup({ maxSessions: 3, maxSessionsPerCredential: 10, maxSessionsPerAgent: 1 });
     const original = agent.authenticator.authenticateAgent;
     vi.mocked(agent.authenticator.authenticateAgent).mockImplementation(async (token) => token === TOKEN_B
@@ -162,16 +172,49 @@ describe('guarded Streamable HTTP', () => {
     expect(original).toHaveBeenCalled();
   });
 
+  it('evicts only the oldest own idle session, never an active response or another credential', async () => {
+    let time = 100;
+    const deps = await setup({ maxSessions: 3, maxSessionsPerCredential: 2, maxSessionsPerAgent: 10, clock: { now: () => time } });
+    const first = await deps.client(TOKEN_A);
+    time = 200;
+    const second = await deps.client(TOKEN_A);
+    time = 300;
+    await first.sdk.listTools();
+    time = 400;
+    expect((await deps.raw()).status).toBe(200);
+    await expect(second.sdk.listTools()).rejects.toMatchObject({ code: 404 });
+    expect((await first.sdk.listTools()).tools).toHaveLength(8);
+    const active = await setup({ maxSessions: 1, maxSessionsPerCredential: 1 });
+    const { sdk } = await active.client(TOKEN_A);
+    let enter!: () => void; let release!: () => void;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const original = active.broker.budgetStatus.getMockImplementation()!;
+    active.broker.budgetStatus.mockImplementationOnce(async (p) => { enter(); await gate; return original(p); });
+    const call = sdk.callTool({ name: 'budget_status', arguments: {} }, undefined, { timeout: 1500 });
+    try {
+      await entered;
+      expect((await active.raw()).status).toBe(429);
+    } finally { release(); }
+    expect((await call).isError).not.toBe(true);
+    expect((await active.raw()).status).toBe(200);
+  });
+
   it('enforces the global cap, cleans failed initialization, and reaps idle sessions', async () => {
     let time = 100;
-    const { raw } = await setup({ maxSessions: 2, maxSessionsPerCredential: 10, maxSessionsPerAgent: 10, sessionIdleTtlMs: 50, clock: { now: () => time } });
+    const { raw, port, authenticator } = await setup({ maxSessions: 2, maxSessionsPerCredential: 10, maxSessionsPerAgent: 10, sessionIdleTtlMs: 50, clock: { now: () => time } });
+    const authenticate = vi.mocked(authenticator.authenticateAgent).getMockImplementation()!;
+    const third = `bb_agent_${Buffer.alloc(32, 3).toString('base64url')}`;
+    vi.mocked(authenticator.authenticateAgent).mockImplementation(async (token) => token === third
+      ? { kind: 'agent', agentId: 'C', credentialId: 'cred-C' } : authenticate(token));
+    const headers = (token: string) => ['Host', `127.0.0.1:${port}`, 'Authorization', `Bearer ${token}`];
     // SDK rejects Accept before assigning a session. No failed-init slot may remain.
     for (let i = 0; i < 3; i++) expect((await raw({ accept: 'application/json' })).status).toBe(406);
     expect((await raw()).status).toBe(200);
-    expect((await raw()).status).toBe(200);
-    expect((await raw()).status).toBe(429);
+    expect((await raw({ headers: headers(TOKEN_B) })).status).toBe(200);
+    expect((await raw({ headers: headers(third) })).status).toBe(429);
     time += 50;
-    expect((await raw()).status).toBe(200);
+    expect((await raw({ headers: headers(third) })).status).toBe(200);
   });
 
   it('reaps credentials on failed authentication, classifies dependency outages, and accepts case-insensitive Bearer', async () => {
@@ -189,6 +232,145 @@ describe('guarded Streamable HTTP', () => {
     expect((await raw({ headers })).status).toBe(200);
     vi.mocked(authenticator.authenticateAgent).mockRejectedValueOnce(new BrokerError('AUDIT_UNAVAILABLE', 'secret'));
     expect((await raw({ headers })).status).toBe(503);
+  });
+
+  it('returns an authentication challenge and cleans timers when listen fails', async () => {
+    const { raw, port } = await setup();
+    const denied = await raw({ headers: ['Host', `127.0.0.1:${port}`] });
+    expect(denied.status).toBe(401);
+    expect(denied.headers['www-authenticate']).toBe('Bearer');
+    const timers = vi.spyOn(globalThis, 'setInterval');
+    const clears = vi.spyOn(globalThis, 'clearInterval');
+    try {
+      await expect(startAgentHttpServer({ ...fakes(), config: { bindHost: '127.0.0.1', agentPort: port, allowedHosts: ['127.0.0.1'], allowedOrigins: [] } })).rejects.toMatchObject({ code: 'EADDRINUSE' });
+      expect(clears).toHaveBeenCalledWith(timers.mock.results[0]!.value);
+    } finally {
+      for (const result of timers.mock.results) if (result.type === 'return') clearInterval(result.value as NodeJS.Timeout);
+      timers.mockRestore(); clears.mockRestore();
+    }
+  });
+
+  it('counts pending concurrent initializations against every cap before awaiting authentication', async () => {
+    for (const scope of ['global', 'credential', 'agent']) {
+      const deps = await setup({ maxSessions: scope === 'global' ? 1 : 3, maxSessionsPerCredential: scope === 'credential' ? 1 : 10, maxSessionsPerAgent: scope === 'agent' ? 1 : 10 });
+      const authenticate = vi.mocked(deps.authenticator.authenticateAgent).getMockImplementation()!;
+      let enter!: () => void; let release!: () => void;
+      const entered = new Promise<void>((resolve) => { enter = resolve; });
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      let calls = 0;
+      vi.mocked(deps.authenticator.authenticateAgent).mockImplementation(async (token) => {
+        if (++calls === 2) { enter(); await gate; }
+        if (scope === 'agent' && token === TOKEN_B) return { ...principalA, credentialId: 'second' };
+        return authenticate(token);
+      });
+      const first = deps.raw();
+      try {
+        await entered;
+        const second = await deps.raw({ headers: ['Host', `127.0.0.1:${deps.port}`, 'Authorization', `Bearer ${scope === 'credential' ? TOKEN_A : TOKEN_B}`] });
+        expect(second.status, scope).toBe(429);
+      } finally { release(); await first; }
+    }
+  });
+
+  it('delivers second-layer auth errors before eviction and preserves sessions on transient errors', async () => {
+    for (const code of ['UNAUTHENTICATED', 'BROKER_UNAVAILABLE'] as const) {
+      const { client, raw, port, authenticator, broker } = await setup();
+      const { sdk, transport } = await client(TOKEN_A);
+      const live = vi.mocked(authenticator.authenticateAgent).getMockImplementation()!;
+      let calls = 0;
+      vi.mocked(authenticator.authenticateAgent).mockImplementation(async (token) => {
+        if (++calls === 2) throw code === 'UNAUTHENTICATED' ? new BrokerError(code) : new Error('SQLITE_BUSY secret');
+        return live(token);
+      });
+      const response = await raw({ headers: ['Host', `127.0.0.1:${port}`, 'Authorization', `Bearer ${TOKEN_A}`, 'Mcp-Session-Id', transport.sessionId!],
+        body: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'budget_status', arguments: {} } }) });
+      expect(response.status).toBe(200);
+      expect(JSON.parse(response.body)).toMatchObject({ id: 9, result: { isError: true, structuredContent: { error: { code, message: code } } } });
+      expect(broker.budgetStatus).not.toHaveBeenCalled();
+      await new Promise((resolve) => setImmediate(resolve));
+      if (code === 'UNAUTHENTICATED') await expect(sdk.listTools()).rejects.toMatchObject({ code: 404 });
+      else expect((await sdk.listTools()).tools).toHaveLength(8);
+    }
+  });
+
+  it('does not evict the caller on an outer authenticator outage', async () => {
+    const { client, raw, port, authenticator } = await setup();
+    const { sdk, transport } = await client(TOKEN_A);
+    vi.mocked(authenticator.authenticateAgent).mockRejectedValueOnce(new Error('SQLITE_BUSY'));
+    expect((await raw({ headers: ['Host', `127.0.0.1:${port}`, 'Authorization', `Bearer ${TOKEN_A}`, 'Mcp-Session-Id', transport.sessionId!] })).status).toBe(503);
+    expect((await sdk.listTools()).tools).toHaveLength(8);
+  });
+
+  it('keeps per-request authentication cost constant with 100 credentials', async () => {
+    const { raw, port, authenticator } = await setup({ maxSessions: 150 });
+    const tokens = new Map(Array.from({ length: 100 }, (_, i) => [`bb_agent_${Buffer.alloc(32, i + 3).toString('base64url')}`, { kind: 'agent' as const, agentId: `agent-${i}`, credentialId: `credential-${i}` }]));
+    vi.mocked(authenticator.authenticateAgent).mockImplementation(async (token) => tokens.get(token)!);
+    let first: string | undefined;
+    for (const [token] of tokens) {
+      const response = await raw({ headers: ['Host', `127.0.0.1:${port}`, 'Authorization', `Bearer ${token}`] });
+      expect(response.status).toBe(200);
+      first ??= String(response.headers['mcp-session-id']);
+    }
+    vi.mocked(authenticator.authenticateAgent).mockClear();
+    const token = tokens.keys().next().value!;
+    const response = await raw({ headers: ['Host', `127.0.0.1:${port}`, 'Authorization', `Bearer ${token}`, 'Mcp-Session-Id', first!],
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'budget_status', arguments: {} } }) });
+    expect(response.status).toBe(200);
+    expect(authenticator.authenticateAgent).toHaveBeenCalledTimes(2);
+  });
+
+  it('background reaping revokes A without evicting B on a transient authenticator hiccup', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      const { client, authenticator, revoked } = await setup({ sessionIdleTtlMs: 1000, clock: { now: () => 100 } });
+      const a = await client(TOKEN_A); const b = await client(TOKEN_B);
+      const live = vi.mocked(authenticator.authenticateAgent).getMockImplementation()!;
+      let hiccup = true;
+      vi.mocked(authenticator.authenticateAgent).mockImplementation(async (token) => {
+        if (token === TOKEN_B && hiccup) { hiccup = false; throw new Error('SQLITE_BUSY'); }
+        return live(token);
+      });
+      revoked.add(TOKEN_A);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(hiccup).toBe(false);
+      revoked.clear();
+      await expect(a.sdk.listTools()).rejects.toMatchObject({ code: 404 });
+      expect((await b.sdk.listTools()).tools).toHaveLength(8);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('refreshes activity on GET and protects long-running POST responses from the idle reaper', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    let release = () => {};
+    try {
+      let time = 100;
+      const { raw, port, client, broker } = await setup({ sessionIdleTtlMs: 1000, clock: { now: () => time } });
+      const initialized = await raw();
+      const id = String(initialized.headers['mcp-session-id']);
+      time = 850;
+      const abort = new AbortController();
+      const stream = await fetch(`http://127.0.0.1:${port}/mcp`, { headers: { Authorization: `Bearer ${TOKEN_A}`, 'Mcp-Session-Id': id, Accept: 'text/event-stream' }, signal: abort.signal });
+      expect(stream.status).toBe(200); abort.abort();
+      time = 1150;
+      await vi.advanceTimersByTimeAsync(1000);
+      const headers = ['Host', `127.0.0.1:${port}`, 'Authorization', `Bearer ${TOKEN_A}`, 'Mcp-Session-Id', id];
+      expect((await raw({ headers, body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' }) })).status).toBe(200);
+      const { sdk } = await client(TOKEN_B);
+      let enter!: () => void;
+      const entered = new Promise<void>((resolve) => { enter = resolve; });
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const original = broker.budgetStatus.getMockImplementation()!;
+      broker.budgetStatus.mockImplementationOnce(async (principal) => { enter(); await gate; return original(principal); });
+      const slow = sdk.callTool({ name: 'budget_status', arguments: {} }, undefined, { timeout: 1500 });
+      await entered;
+      time += 2000;
+      await vi.advanceTimersByTimeAsync(1000);
+      release();
+      expect((await slow).isError).not.toBe(true);
+      time += 500;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect((await sdk.listTools()).tools).toHaveLength(8);
+    } finally { release(); vi.useRealTimers(); }
   });
 
   it('checks path/method, UTF-8 and canonical JSON on otherwise valid initialization and established sessions', async () => {

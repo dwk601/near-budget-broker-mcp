@@ -27,8 +27,8 @@ async function setup() {
   await writeFile(tokenFile, `${TOKEN_A}\n`, { mode: 0o600 });
   return { ...deps, ...listener, dir, tokenFile, port, url: `http://127.0.0.1:${port}` };
 }
-async function sdkBridge(url: string, tokenFile: string) {
-  const transport = new StdioClientTransport({ command: process.execPath, args: ['--import', 'tsx', fixture], env: { BB_URL: url, BB_TOKEN_FILE: tokenFile }, stderr: 'pipe' });
+async function sdkBridge(url: string, tokenFile: string, timeoutMs = 5000) {
+  const transport = new StdioClientTransport({ command: process.execPath, args: ['--import', 'tsx', fixture], env: { BB_URL: url, BB_TOKEN_FILE: tokenFile, BB_TEST_TIMEOUT_MS: String(timeoutMs) }, stderr: 'pipe' });
   let stderr = '';
   transport.stderr!.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
   const errors: Error[] = [];
@@ -36,7 +36,7 @@ async function sdkBridge(url: string, tokenFile: string) {
   client.onerror = (error) => errors.push(error);
   cleanup.push(() => client.close());
   await client.connect(transport);
-  return { client, errors, diagnostics: () => stderr };
+  return { client, transport, errors, diagnostics: () => stderr };
 }
 
 describe('stdio -> HTTP bridge', () => {
@@ -97,6 +97,8 @@ describe('stdio -> HTTP bridge', () => {
 
   it('drops a broken connection but never automatically replays a call whose HTTP response was lost', async () => {
     const { url, tokenFile, broker, server } = await setup();
+    let deletes = 0;
+    server.prependListener('request', (req) => { if (req.method === 'DELETE') deletes++; });
     const { client } = await sdkBridge(url, tokenFile);
     await client.listTools();
     const implementation = broker.requestTransfer.getMockImplementation()!;
@@ -107,7 +109,99 @@ describe('stdio -> HTTP bridge', () => {
     });
     expect((await client.callTool({ name: 'request_transfer', arguments: transferArgs })).structuredContent).toEqual({ error: { code: 'BROKER_UNAVAILABLE', message: 'BROKER_UNAVAILABLE' } });
     expect(broker.requestTransfer).toHaveBeenCalledTimes(1);
+    expect(deletes).toBe(1);
+    await writeFile(tokenFile, TOKEN_B);
+    const recovered = await client.callTool({ name: 'budget_status', arguments: {} });
+    expect(recovered.isError).not.toBe(true);
+    expect(JSON.parse((recovered.content as Array<{ text: string }>)[0]!.text)).toMatchObject({ agent: { id: 'B' } });
+  });
+
+  it('keeps a healthy session after five request timeouts, without lockout or automatic replay', async () => {
+    const { url, tokenFile, broker, server } = await setup();
+    let initializes = 0;
+    server.prependListener('request', (req) => { if (req.method === 'POST' && !req.headers['mcp-session-id']) initializes++; });
+    const { client } = await sdkBridge(url, tokenFile, 300);
+    await client.listTools();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const original = broker.requestTransfer.getMockImplementation()!;
+    broker.requestTransfer.mockImplementation(async (p, input) => { await gate; return original(p, input); });
+    try {
+      for (let i = 0; i < 5; i++) {
+        expect((await client.callTool({ name: 'request_transfer', arguments: { ...transferArgs, idempotencyKey: `slow-${i}` } })).structuredContent).toEqual({ error: { code: 'BROKER_UNAVAILABLE', message: 'BROKER_UNAVAILABLE' } });
+      }
+      expect((await client.callTool({ name: 'budget_status', arguments: {} })).isError).not.toBe(true);
+      expect(broker.requestTransfer).toHaveBeenCalledTimes(5);
+      expect(initializes).toBe(1);
+    } finally { release(); }
+  });
+
+  it('releases sessions on SIGTERM and replaces abandoned sessions after SIGKILL', async () => {
+    const { url, tokenFile, server } = await setup();
+    let deletes = 0;
+    server.prependListener('request', (req) => { if (req.method === 'DELETE') deletes++; });
+    for (const signal of ['SIGTERM', 'SIGKILL'] as const) {
+      for (let i = 0; i < 5; i++) {
+        const { client, transport } = await sdkBridge(url, tokenFile);
+        expect((await client.listTools()).tools).toHaveLength(8);
+        const exited = new Promise<void>((resolve) => { client.onclose = resolve; });
+        process.kill(transport.pid!, signal);
+        await exited;
+      }
+      expect(deletes).toBe(5); // graceful signals delete; uncatchable death relies on own-idle eviction
+    }
+    const { client } = await sdkBridge(url, tokenFile);
     expect((await client.callTool({ name: 'budget_status', arguments: {} })).isError).not.toBe(true);
+  });
+
+  it('discards a 401 session with DELETE, then rereads the token file for the next call', async () => {
+    const { url, tokenFile, revoked, server } = await setup();
+    let deletes = 0;
+    server.prependListener('request', (req) => { if (req.method === 'DELETE') deletes++; });
+    const { client } = await sdkBridge(url, tokenFile);
+    await client.listTools();
+    revoked.add(TOKEN_A);
+    expect((await client.callTool({ name: 'budget_status', arguments: {} })).structuredContent).toEqual({ error: { code: 'UNAUTHENTICATED', message: 'UNAUTHENTICATED' } });
+    expect(deletes).toBe(1);
+    await writeFile(tokenFile, TOKEN_B);
+    const result = await client.callTool({ name: 'budget_status', arguments: {} });
+    expect(JSON.parse((result.content as Array<{ text: string }>)[0]!.text)).toMatchObject({ agent: { id: 'B' } });
+  });
+
+  it('never retries a second 404, for either tools/call or tools/list', async () => {
+    const { tokenFile } = await setup();
+    const fake = await fakeUpstream((message, res) => {
+      fake.calls++;
+      if (fake.calls <= 2) { res.writeHead(404); res.end(JSON.stringify({ error: { code: 'NOT_FOUND' } })); }
+      else { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: message.method === 'tools/list' ? { tools: [] } : { content: [{ type: 'text', text: 'unexpected third attempt' }] } })); }
+    });
+    const { client } = await sdkBridge(fake.url, tokenFile);
+    expect((await client.callTool({ name: 'budget_status', arguments: {} })).structuredContent).toEqual({ error: { code: 'NOT_FOUND', message: 'NOT_FOUND' } });
+    expect(fake.calls).toBe(2); expect(fake.initializes).toBe(2); expect(fake.deletes).toBe(2);
+    fake.calls = 0;
+    await expect(client.listTools()).rejects.toThrow('NOT_FOUND');
+    expect(fake.calls).toBe(2); expect(fake.initializes).toBe(4); expect(fake.deletes).toBe(4);
+  });
+
+  it('ignores 5xx error-body codes, bounds diagnostic bodies and cancels oversized unfinished bodies', async () => {
+    const { tokenFile } = await setup();
+    let mode = '5xx'; let cancelled = false;
+    const fake = await fakeUpstream((_message, res) => {
+      res.writeHead(mode === '5xx' ? 503 : 400, { 'Content-Type': 'application/json' });
+      if (mode === 'unfinished') {
+        res.once('close', () => { cancelled = true; });
+        res.write(' '.repeat(5000));
+      } else res.end(JSON.stringify({ error: { code: 'INVALID_AMOUNT', message: 'secret' }, padding: mode === 'large' ? ' '.repeat(10000) : '' }));
+    });
+    const { client } = await sdkBridge(fake.url, tokenFile, 500);
+    const call = () => client.callTool({ name: 'budget_status', arguments: {} });
+    expect((await call()).structuredContent).toEqual({ error: { code: 'BROKER_UNAVAILABLE', message: 'BROKER_UNAVAILABLE' } });
+    mode = 'large';
+    expect((await call()).structuredContent).toEqual({ error: { code: 'FORBIDDEN', message: 'FORBIDDEN' } });
+    mode = 'unfinished';
+    expect((await call()).structuredContent).toEqual({ error: { code: 'FORBIDDEN', message: 'FORBIDDEN' } });
+    await waitUntil(() => cancelled);
+    expect(fake.initializes).toBe(1); // neither timeouts nor temporary 5xx invalidate a healthy session
   });
 
   it('sends DELETE on stdio EOF so a new client can use a capped credential immediately', async () => {
@@ -220,6 +314,30 @@ async function refuses(url: string, tokenFile: string) {
   expect(stderr).toContain('protected token file');
   expect(stderr).not.toContain(TOKEN_A);
 }
+async function fakeUpstream(handler: (message: { id: string | number; method: string }, res: import('node:http').ServerResponse) => void) {
+  const counts = { calls: 0, initializes: 0, deletes: 0, url: '' };
+  const server = createServer((req, res) => {
+    if (req.method === 'GET') { res.writeHead(405); res.end(); return; }
+    if (req.method === 'DELETE') { counts.deletes++; res.writeHead(200); res.end(); return; }
+    let body = '';
+    req.setEncoding('utf8'); req.on('data', (chunk: string) => { body += chunk; });
+    req.on('end', () => {
+      const message = JSON.parse(body) as { id: string | number; method: string };
+      if (message.method === 'initialize') {
+        counts.initializes++;
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Mcp-Session-Id': `session-${counts.initializes}` });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'fake-upstream', version: '1' } } }));
+      } else if (message.method === 'notifications/initialized') { res.writeHead(202); res.end(); }
+      else if (message.method === 'notifications/cancelled') { res.writeHead(202); res.end(); }
+      else handler(message, res);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  cleanup.push(() => new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections(); }));
+  counts.url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  return counts;
+}
+
 async function waitUntil(predicate: () => boolean) {
   const end = Date.now() + 5000;
   while (!predicate()) {

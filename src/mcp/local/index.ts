@@ -59,7 +59,14 @@ export async function createAgentMcpServer(options: {
       const live = await authenticatePrincipal(authenticator, token);
       if (!samePrincipal(principal, live)) throw new BrokerError('UNAUTHENTICATED');
       return principal;
-    } catch (error) { options.onAuthenticationFailure?.(); throw error; }
+    } catch (error) {
+      // A transient dependency failure is not evidence of revocation. Let the MCP
+      // response be sent before notifying a session owner about definitive failure.
+      if (error instanceof BrokerError && error.code === 'UNAUTHENTICATED') {
+        setImmediate(() => options.onAuthenticationFailure?.());
+      }
+      throw error;
+    }
   }
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     await authenticate();

@@ -84,12 +84,13 @@ export async function runStdioBridge(options: StdioBridgeOptions = {}) {
     throw new BrokerError('FORBIDDEN');
   }
   const timeout = options.timeoutMs ?? 5000;
-  interface Upstream { client: Client; transport: StreamableHTTPClientTransport }
+  interface Upstream { client: Client; transport: StreamableHTTPClientTransport; disposal?: Promise<void> }
   let upstream: Upstream | undefined;
   let connecting: Promise<Upstream> | undefined;
   let stopped = false;
   const requestOptions = { timeout };
   async function connect(): Promise<Upstream> {
+    if (stopped) throw new BrokerError('BROKER_UNAVAILABLE');
     if (upstream) return upstream;
     if (connecting) return connecting;
     connecting = (async () => {
@@ -113,7 +114,10 @@ export async function runStdioBridge(options: StdioBridgeOptions = {}) {
         await client.connect(transport as Transport, requestOptions);
         if (stopped) throw new BrokerError('BROKER_UNAVAILABLE');
         return upstream = { client, transport };
-      } catch (error) { await client.close(); throw error; }
+      } catch (error) {
+        await transport.terminateSession().catch(() => undefined);
+        await client.close(); throw error;
+      }
     })().finally(() => { connecting = undefined; });
     return connecting;
   }
@@ -123,9 +127,23 @@ export async function runStdioBridge(options: StdioBridgeOptions = {}) {
     if (error instanceof StreamableHTTPError && error.code !== undefined) return statusCode(error.code);
     return 'BROKER_UNAVAILABLE';
   }
+  function isTimeout(error: unknown): boolean {
+    return (error instanceof McpError && error.code === McpErrorCode.RequestTimeout)
+      || (error instanceof Error && error.name === 'TimeoutError');
+  }
+  function shouldDiscard(error: unknown): boolean {
+    if (isTimeout(error)) return false; // A slow request does not invalidate its session.
+    if (error instanceof UpstreamError) return error.status === 401 || error.status === 404;
+    if (error instanceof StreamableHTTPError) return error.code === 401 || error.code === 404;
+    return true; // Broken transport, not a transient HTTP dependency error.
+  }
   async function discard(failed: Upstream): Promise<void> {
     if (upstream === failed) upstream = undefined;
-    await failed.client.close();
+    failed.disposal ??= (async () => {
+      await failed.transport.terminateSession().catch(() => undefined);
+      await failed.client.close();
+    })();
+    await failed.disposal;
   }
   async function proxy<T>(operation: (client: Client) => Promise<T>): Promise<T> {
     const connection = await connect();
@@ -138,9 +156,9 @@ export async function runStdioBridge(options: StdioBridgeOptions = {}) {
         // and freshly read credentials. Never replay an ambiguous network failure.
         const fresh = await connect();
         try { return await operation(fresh.client); }
-        catch (retryError) { await discard(fresh); throw retryError; }
+        catch (retryError) { if (shouldDiscard(retryError)) await discard(fresh); throw retryError; }
       }
-      if (status === undefined || status === 401 || status >= 500) await discard(connection);
+      if (shouldDiscard(error)) await discard(connection);
       throw error;
     }
   }
@@ -166,13 +184,16 @@ export async function runStdioBridge(options: StdioBridgeOptions = {}) {
       stdin.off('end', onEnd);
       await server.close();
       if (connecting) await connecting.catch(() => undefined);
-      await upstream?.transport.terminateSession().catch(() => undefined);
-      await upstream?.client.close();
+      if (upstream) await discard(upstream);
+      process.off('SIGTERM', onSignal); process.off('SIGINT', onSignal);
     })();
     return closePromise;
   }
   function onEnd() { void close(); }
+  function onSignal() { void close(); }
   stdin.once('end', onEnd);
-  await server.connect(transport);
+  process.on('SIGTERM', onSignal); process.on('SIGINT', onSignal);
+  try { await server.connect(transport); }
+  catch (error) { await close(); throw error; }
   return { close };
 }
