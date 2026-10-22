@@ -1,4 +1,4 @@
-import { canonicalJson } from '../../contracts/index.js';
+import { BrokerError, canonicalJson } from '../../contracts/index.js';
 
 /** Scan raw JSON before JSON.parse loses duplicate (including escaped) property names. */
 export function parseRequestJson(text: string): unknown {
@@ -46,6 +46,11 @@ export function parseRequestJson(text: string): unknown {
   value(0); whitespace();
   if (at !== text.length) throw new SyntaxError('Invalid JSON');
   const parsed: unknown = JSON.parse(text);
+  // Numeric money is invalid even when JSON's number is fractional/unsafe. Classify
+  // it before restricted canonical validation, without ever converting it to bigint.
+  const call = parsed as { method?: unknown; params?: { name?: unknown; arguments?: { amount?: unknown } } } | null;
+  if (call?.method === 'tools/call' && (call.params?.name === 'request_transfer' || call.params?.name === 'preview_transfer')
+    && typeof call.params?.arguments?.amount === 'number') throw new BrokerError('INVALID_AMOUNT');
   canonicalJson(parsed);
   return parsed;
 }

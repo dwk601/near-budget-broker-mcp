@@ -8,9 +8,10 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { createServer } from 'node:http';
 import { startAgentHttpServer } from '../../../src/mcp/http/index.js';
 import { MCP_AGENT_TOOL_NAMES } from '../../../src/contracts/index.js';
-import { fakes, principalA, TOKEN_A, transferArgs } from '../local/fakes.js';
+import { fakes, principalA, principalB, receipt, TOKEN_A, TOKEN_B, transferArgs } from '../local/fakes.js';
 
 const fixture = fileURLToPath(new URL('./bridge-process.ts', import.meta.url));
 const cleanup: Array<() => Promise<unknown>> = [];
@@ -24,7 +25,7 @@ async function setup() {
   cleanup.push(() => rm(dir, { recursive: true, force: true }));
   const tokenFile = join(dir, 'token');
   await writeFile(tokenFile, `${TOKEN_A}\n`, { mode: 0o600 });
-  return { ...deps, ...listener, dir, tokenFile, url: `http://127.0.0.1:${port}` };
+  return { ...deps, ...listener, dir, tokenFile, port, url: `http://127.0.0.1:${port}` };
 }
 async function sdkBridge(url: string, tokenFile: string) {
   const transport = new StdioClientTransport({ command: process.execPath, args: ['--import', 'tsx', fixture], env: { BB_URL: url, BB_TOKEN_FILE: tokenFile }, stderr: 'pipe' });
@@ -70,13 +71,100 @@ describe('stdio -> HTTP bridge', () => {
     const { client } = await sdkBridge(url, tokenFile);
     await client.callTool({ name: 'budget_status', arguments: {} });
     revoked.add(TOKEN_A);
-    expect((await client.callTool({ name: 'budget_status', arguments: {} })).isError).toBe(true);
+    expect((await client.callTool({ name: 'budget_status', arguments: {} })).structuredContent).toEqual({ error: { code: 'UNAUTHENTICATED', message: 'UNAUTHENTICATED' } });
     expect(broker.budgetStatus).toHaveBeenCalledTimes(1);
     await close();
     const result = await client.callTool({ name: 'request_transfer', arguments: transferArgs });
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toEqual({ error: { code: 'BROKER_UNAVAILABLE', message: 'BROKER_UNAVAILABLE' } });
     expect(broker.requestTransfer).not.toHaveBeenCalled();
+  });
+
+  it('reconnects after daemon restart, retries a stale 404 exactly once, and rereads rotated credentials', async () => {
+    const { url, tokenFile, close, port } = await setup();
+    const { client } = await sdkBridge(url, tokenFile);
+    expect((await client.callTool({ name: 'budget_status', arguments: {} })).isError).not.toBe(true);
+    await close();
+    await writeFile(tokenFile, TOKEN_B);
+    const deps = fakes();
+    const restarted = await startAgentHttpServer({ ...deps, config: { bindHost: '127.0.0.1', agentPort: port, allowedHosts: ['127.0.0.1'], allowedOrigins: [] } });
+    cleanup.push(restarted.close);
+    const result = await client.callTool({ name: 'request_transfer', arguments: transferArgs });
+    expect(result.isError).not.toBe(true);
+    expect(deps.broker.requestTransfer).toHaveBeenCalledExactlyOnceWith(principalB, { ...transferArgs, amount: BigInt(transferArgs.amount) });
+    expect((await client.listTools()).tools).toHaveLength(8);
+  });
+
+  it('drops a broken connection but never automatically replays a call whose HTTP response was lost', async () => {
+    const { url, tokenFile, broker, server } = await setup();
+    const { client } = await sdkBridge(url, tokenFile);
+    await client.listTools();
+    const implementation = broker.requestTransfer.getMockImplementation()!;
+    broker.requestTransfer.mockImplementationOnce(async (principal, input) => {
+      const view = await implementation(principal, input);
+      server.closeAllConnections();
+      return view;
+    });
+    expect((await client.callTool({ name: 'request_transfer', arguments: transferArgs })).structuredContent).toEqual({ error: { code: 'BROKER_UNAVAILABLE', message: 'BROKER_UNAVAILABLE' } });
+    expect(broker.requestTransfer).toHaveBeenCalledTimes(1);
+    expect((await client.callTool({ name: 'budget_status', arguments: {} })).isError).not.toBe(true);
+  });
+
+  it('sends DELETE on stdio EOF so a new client can use a capped credential immediately', async () => {
+    const { url, tokenFile, server } = await setup();
+    let deletes = 0;
+    server.prependListener('request', (req) => { if (req.method === 'DELETE') deletes++; });
+    const { client } = await sdkBridge(url, tokenFile);
+    await client.listTools();
+    await client.close();
+    expect(deletes).toBe(1);
+  });
+
+  it('rejects injection for every tool and preserves INVALID_AMOUNT through HTTP validation', async () => {
+    const { url, tokenFile, broker } = await setup();
+    const { client } = await sdkBridge(url, tokenFile);
+    const args = [{}, transferArgs, transferArgs, { requestId: 'request-A' }, { requestId: 'request-A' }, {}, { receipt: receipt() }, { reason: 'stop' }];
+    for (const [i, name] of MCP_AGENT_TOOL_NAMES.entries()) {
+      expect((await client.callTool({ name, arguments: { ...args[i], agentId: 'B' } })).structuredContent).toEqual({ error: { code: 'FORBIDDEN', message: 'FORBIDDEN' } });
+    }
+    for (const amount of [1, 1.5, 1e30]) {
+      expect((await client.callTool({ name: 'request_transfer', arguments: { ...transferArgs, amount } })).structuredContent).toEqual({ error: { code: 'INVALID_AMOUNT', message: 'INVALID_AMOUNT' } });
+    }
+    for (const method of Object.values(broker)) expect(method).not.toHaveBeenCalled();
+  });
+
+  it('maps permanent HTTP denials, rate limiting and outages without leaking upstream messages', async () => {
+    const { tokenFile } = await setup();
+    let status = 403;
+    let body: unknown = { error: { code: 'FORBIDDEN', message: 'secret' } };
+    const http = createServer((_req, res) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); });
+    await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve));
+    cleanup.push(() => new Promise<void>((resolve) => { http.close(() => resolve()); http.closeAllConnections(); }));
+    const { client } = await sdkBridge(`http://127.0.0.1:${(http.address() as AddressInfo).port}`, tokenFile);
+    for (const [value, expected] of [[400, 'FORBIDDEN'], [401, 'UNAUTHENTICATED'], [403, 'FORBIDDEN'], [413, 'FORBIDDEN'], [429, 'RATE_LIMITED'], [503, 'BROKER_UNAVAILABLE']] as const) {
+      status = value;
+      body = { error: { code: 'not-a-code', message: 'secret' } };
+      const result = await client.callTool({ name: 'budget_status', arguments: {} });
+      expect(result.structuredContent).toEqual({ error: { code: expected, message: expected } });
+      expect(JSON.stringify(result)).not.toContain('secret');
+    }
+    status = 400; body = { error: { code: 'INVALID_AMOUNT', message: 'secret' } };
+    expect((await client.callTool({ name: 'budget_status', arguments: {} })).structuredContent).toEqual({ error: { code: 'INVALID_AMOUNT', message: 'INVALID_AMOUNT' } });
+  });
+
+  it('never follows redirects with the agent bearer token', async () => {
+    const { tokenFile } = await setup();
+    let captures = 0;
+    const http = createServer((req, res) => {
+      if (req.url === '/mcp') { res.writeHead(307, { Location: '/capture' }); res.end(); }
+      else { captures++; res.writeHead(403); res.end(); }
+    });
+    await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve));
+    cleanup.push(() => new Promise<void>((resolve) => { http.close(() => resolve()); http.closeAllConnections(); }));
+    const { client } = await sdkBridge(`http://127.0.0.1:${(http.address() as AddressInfo).port}`, tokenFile);
+    const result = await client.callTool({ name: 'budget_status', arguments: {} });
+    expect(result.structuredContent).toEqual({ error: { code: 'BROKER_UNAVAILABLE', message: 'BROKER_UNAVAILABLE' } });
+    expect(captures).toBe(0);
   });
 
   it('writes only JSON-RPC frames to raw stdout, including when the daemon is unreachable, and exits on EOF', async () => {
@@ -110,7 +198,7 @@ describe('stdio -> HTTP bridge', () => {
     const { url, tokenFile, dir } = await setup();
     const link = join(dir, 'link');
     await symlink(tokenFile, link);
-    for (const mode of [0o640, 0o604, 0o660, 0o644]) {
+    for (const mode of [0o640, 0o604, 0o660, 0o644, 0o620, 0o602]) {
       await chmod(tokenFile, mode);
       await refuses(url, tokenFile);
     }

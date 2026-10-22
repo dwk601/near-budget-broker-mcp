@@ -31,8 +31,16 @@ describe('session-bound agent MCP factory', () => {
     const tools = (await client.listTools()).tools;
     expect(tools.map((t) => t.name)).toEqual([...MCP_AGENT_TOOL_NAMES]);
     for (const tool of tools) {
+      expect(tool.description?.length).toBeGreaterThan(15);
       expect(tool.inputSchema.additionalProperties).toBe(false);
       expect(tool.inputSchema.properties).not.toHaveProperty('agentId');
+    }
+    const listing = tools.find((tool) => tool.name === 'list_receipts')!.inputSchema;
+    expect(listing.required ?? []).toEqual([]);
+    for (const name of ['preview_transfer', 'request_transfer']) {
+      const tool = tools.find((tool) => tool.name === name)!;
+      expect(tool.description).toMatch(/yoctoNEAR/);
+      expect(tool.inputSchema.properties?.amount).toMatchObject({ type: 'string', maxLength: 39, pattern: '^(0|[1-9][0-9]*)$' });
     }
     expect(text(await call(client, 'budget_status'))).toMatchObject({ agent: { id: 'A' }, remaining: { perTx: transferArgs.amount }, usage: { agentLifetime: '2' } });
     expect(broker.budgetStatus).toHaveBeenCalledWith(principalA);
@@ -101,6 +109,30 @@ describe('session-bound agent MCP factory', () => {
     vi.mocked(authenticator.authenticateAgent).mockResolvedValue({ ...principalA, credentialId: 'rotated' });
     expect(text(await call(client, 'budget_status'))).toEqual({ code: 'UNAUTHENTICATED', message: 'UNAUTHENTICATED' });
     expect(broker.budgetStatus).not.toHaveBeenCalled();
+  });
+
+  it('freezes the session principal even against a broker attempting in-process mutation', async () => {
+    const { client, broker } = await setup();
+    broker.budgetStatus.mockImplementationOnce(async (principal) => {
+      expect(Object.isFrozen(principal)).toBe(true);
+      expect(Reflect.set(principal, 'agentId', 'B')).toBe(false);
+      expect(Reflect.set(principal, 'credentialId', 'stolen')).toBe(false);
+      return (await import('./fakes.js')).status(principal.agentId);
+    });
+    expect(text(await call(client, 'budget_status'))).toMatchObject({ agent: { id: 'A' } });
+    await call(client, 'freeze_self', { reason: 'stop' });
+    expect(broker.freezeSelf).toHaveBeenCalledWith(principalA, 'stop');
+  });
+
+  it('distinguishes authenticator outages from invalid credentials, both at initialization and mid-session', async () => {
+    const { client, authenticator, broker } = await setup();
+    vi.mocked(authenticator.authenticateAgent).mockRejectedValueOnce(new Error('sqlite secret busy'));
+    expect(text(await call(client, 'budget_status'))).toEqual({ code: 'BROKER_UNAVAILABLE', message: 'BROKER_UNAVAILABLE' });
+    expect(broker.budgetStatus).not.toHaveBeenCalled();
+    vi.mocked(authenticator.authenticateAgent).mockRejectedValueOnce(new BrokerError('AUDIT_UNAVAILABLE', 'secret'));
+    await expect(client.listTools()).rejects.toThrow('BROKER_UNAVAILABLE');
+    vi.mocked(authenticator.authenticateAgent).mockRejectedValueOnce(new Error('secret'));
+    await expect(createAgentMcpServer({ broker, authenticator, token: TOKEN_A })).rejects.toMatchObject({ code: 'BROKER_UNAVAILABLE' });
   });
 
   it('sanitizes both BrokerErrors and unexpected exceptions', async () => {

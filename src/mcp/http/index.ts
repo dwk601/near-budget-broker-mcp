@@ -6,9 +6,9 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { AgentPrincipalSchema, MCP_HTTP_PATH } from '../../contracts/index.js';
-import type { AgentBrokerService, AgentPrincipal, Authenticator, Config, ErrorCode } from '../../contracts/index.js';
-import { createAgentMcpServer, samePrincipal } from '../local/index.js';
+import { BrokerError, MCP_HTTP_PATH } from '../../contracts/index.js';
+import type { AgentBrokerService, AgentPrincipal, Authenticator, Clock, Config, ErrorCode } from '../../contracts/index.js';
+import { authenticatePrincipal, createAgentMcpServer, samePrincipal } from '../local/index.js';
 import { parseRequestJson } from './json.js';
 
 export type AgentHttpConfig = Pick<Config, 'bindHost' | 'agentPort' | 'allowedHosts' | 'allowedOrigins'>;
@@ -18,10 +18,17 @@ export interface AgentHttpOptions {
   authenticator: Authenticator;
   maxBodyBytes?: number;
   maxSessions?: number;
+  maxSessionsPerCredential?: number;
+  maxSessionsPerAgent?: number;
+  sessionIdleTtlMs?: number;
+  clock?: Clock;
   /** Explicit externally published Docker port, if different from listener. */
   publishedPort?: number;
 }
-interface Session { server: Server; transport: StreamableHTTPServerTransport; principal: AgentPrincipal }
+interface Session {
+  server: Server; transport: StreamableHTTPServerTransport; principal: AgentPrincipal;
+  token: string; lastUsed: number;
+}
 
 /** Reject duplicate raw headers before Node's header coalescing can hide them. */
 function singleHeader(req: IncomingMessage, name: string): string | undefined {
@@ -42,20 +49,49 @@ function deny(res: ServerResponse, status: number, code: ErrorCode): void {
 /** Creates an unstarted node:http server. B08 owns process lifecycle/listen. */
 export function createAgentHttpServer(options: AgentHttpOptions) {
   const { config, broker, authenticator } = options;
+  const now = () => (options.clock?.now() ?? Date.now());
   const maxBody = options.maxBodyBytes ?? 1024 * 1024;
   const maxSessions = options.maxSessions ?? 1000;
-  if (!Number.isSafeInteger(maxBody) || maxBody < 1 || !Number.isSafeInteger(maxSessions) || maxSessions < 1) {
+  const perCredential = options.maxSessionsPerCredential ?? Math.max(1, Math.min(4, Math.floor(maxSessions / 2)));
+  const perAgent = options.maxSessionsPerAgent ?? Math.max(1, Math.min(8, Math.floor(maxSessions / 2)));
+  const ttl = options.sessionIdleTtlMs ?? 300_000;
+  if ([maxBody, maxSessions, perCredential, perAgent, ttl].some((bound) => !Number.isSafeInteger(bound) || bound < 1)) {
     throw new RangeError('Invalid transport bounds');
   }
   const sessions = new Map<string, Session>();
   const allSessions = new Set<Session>();
+  const pending = new Map<string, AgentPrincipal>();
   let closing = false;
-  let pendingInitializations = 0;
   const server = createServer((req, res) => {
     void handle(req, res).catch(() => deny(res, 500, 'BROKER_UNAVAILABLE'));
   });
   server.requestTimeout = 15_000;
   server.headersTimeout = 10_000;
+  async function evictToken(token: string): Promise<void> {
+    await Promise.all([...allSessions].filter((s) => s.token === token).map((s) => s.server.close()));
+  }
+  // Reclaim revoked credentials even when clients cannot send an authenticated DELETE.
+  // A session id from a failed request alone is never grounds to evict somebody else.
+  let sweeping: Promise<void> | undefined;
+  function sweep(): Promise<void> {
+    sweeping ??= (async () => {
+      await Promise.all([...allSessions].filter((s) => now() - s.lastUsed >= ttl).map((s) => s.server.close()));
+      await Promise.all([...new Set([...allSessions].map((s) => s.token))].map(async (token) => {
+        try {
+          const live = await authenticatePrincipal(authenticator, token);
+          if ([...allSessions].some((s) => s.token === token && !samePrincipal(live, s.principal))) await evictToken(token);
+        } catch { await evictToken(token); }
+      }));
+    })().finally(() => { sweeping = undefined; });
+    return sweeping;
+  }
+  const reaper = setInterval(() => { if (!closing) void sweep(); }, Math.min(ttl, 30_000));
+  reaper.unref();
+  async function authenticationFailure(res: ServerResponse, error: unknown, token?: string) {
+    if (token) await evictToken(token);
+    const unauthenticated = error instanceof BrokerError && error.code === 'UNAUTHENTICATED';
+    deny(res, unauthenticated ? 401 : 503, unauthenticated ? 'UNAUTHENTICATED' : 'BROKER_UNAVAILABLE');
+  }
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (closing) { deny(res, 503, 'BROKER_UNAVAILABLE'); return; }
     // Never use X-Forwarded-* as an authority.
@@ -74,18 +110,21 @@ export function createAgentHttpServer(options: AgentHttpOptions) {
           || !config.allowedOrigins.includes(origin)) throw new Error('Origin');
       }
     } catch { deny(res, 403, 'FORBIDDEN'); return; }
-    let token: string;
+    let token: string | undefined;
     let principal: AgentPrincipal;
     try {
-      const header = singleHeader(req, 'authorization');
-      const match = header?.match(/^Bearer ([A-Za-z0-9_-]+)$/);
-      if (!match) throw new Error('Bearer required');
+      let header: string | undefined;
+      try { header = singleHeader(req, 'authorization'); }
+      catch { throw new BrokerError('UNAUTHENTICATED'); }
+      const match = header?.match(/^Bearer ([A-Za-z0-9_-]+)$/i);
+      if (!match) throw new BrokerError('UNAUTHENTICATED');
       token = match[1]!;
-      principal = AgentPrincipalSchema.parse(await authenticator.authenticateAgent(token));
-    } catch { deny(res, 401, 'UNAUTHENTICATED'); return; }
+      principal = await authenticatePrincipal(authenticator, token);
+    } catch (error) { await authenticationFailure(res, error, token); return; }
     if (closing) { deny(res, 503, 'BROKER_UNAVAILABLE'); return; }
     if (req.url !== MCP_HTTP_PATH) { deny(res, 404, 'NOT_FOUND'); return; }
     if (!['GET', 'POST', 'DELETE'].includes(req.method ?? '')) { deny(res, 405, 'FORBIDDEN'); return; }
+    await sweep();
     let sessionId: string | undefined;
     try { sessionId = singleHeader(req, 'mcp-session-id'); }
     catch { deny(res, 400, 'FORBIDDEN'); return; }
@@ -93,6 +132,7 @@ export function createAgentHttpServer(options: AgentHttpOptions) {
     if (sessionId !== undefined) {
       if (!session) { deny(res, 404, 'NOT_FOUND'); return; }
       if (!samePrincipal(principal, session.principal)) { deny(res, 403, 'FORBIDDEN'); return; }
+      session.lastUsed = now();
     }
     const length = req.headers['content-length'];
     if (length !== undefined && Number(length) > maxBody) { deny(res, 413, 'FORBIDDEN'); return; }
@@ -111,23 +151,30 @@ export function createAgentHttpServer(options: AgentHttpOptions) {
           chunks.push(bytes);
         }
         body = parseRequestJson(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
-      } catch { deny(res, 400, 'FORBIDDEN'); return; }
+      } catch (error) { deny(res, 400, error instanceof BrokerError && error.code === 'INVALID_AMOUNT' ? 'INVALID_AMOUNT' : 'FORBIDDEN'); return; }
     }
     if (!session) {
       if (req.method !== 'POST' || !isInitializeRequest(body)) { deny(res, 400, 'FORBIDDEN'); return; }
-      if (allSessions.size + pendingInitializations >= maxSessions) { deny(res, 429, 'RATE_LIMITED'); return; }
-      pendingInitializations++;
+      const principals = [...allSessions].map((s) => s.principal).concat([...pending.values()]);
+      if (principals.length >= maxSessions
+        || principals.filter((p) => p.credentialId === principal.credentialId).length >= perCredential
+        || principals.filter((p) => p.agentId === principal.agentId).length >= perAgent) {
+        deny(res, 429, 'RATE_LIMITED'); return;
+      }
+      const reservation = randomUUID();
+      pending.set(reservation, principal);
       try {
-        const mcp = await createAgentMcpServer({ broker, authenticator, token });
+        const mcp = await createAgentMcpServer({ broker, authenticator, token,
+          onAuthenticationFailure: () => { void evictToken(token); },
+        });
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: randomUUID, enableJsonResponse: true,
           onsessioninitialized: (id) => { sessions.set(id, created); },
           onsessionclosed: (id) => { sessions.delete(id); void mcp.close(); },
         });
-        const created: Session = { server: mcp, transport, principal: Object.freeze({ ...principal }) };
-        // Authenticate again inside the factory; prevent identity changes during initialization.
-        if (!samePrincipal(principal, await authenticator.authenticateAgent(token))) {
-          await mcp.close(); deny(res, 401, 'UNAUTHENTICATED'); return;
+        const created: Session = { server: mcp, transport, principal: Object.freeze({ ...principal }), token, lastUsed: now() };
+        if (!samePrincipal(principal, await authenticatePrincipal(authenticator, token))) {
+          await mcp.close(); throw new BrokerError('UNAUTHENTICATED');
         }
         // SDK 1.32.1 accessor declarations are not exactOptionalPropertyTypes-compatible.
         if (closing) { await mcp.close(); deny(res, 503, 'BROKER_UNAVAILABLE'); return; }
@@ -138,14 +185,16 @@ export function createAgentHttpServer(options: AgentHttpOptions) {
           if (transport.sessionId) sessions.delete(transport.sessionId);
         };
         session = created;
-      } catch { deny(res, 401, 'UNAUTHENTICATED'); return; }
-      finally { pendingInitializations--; }
+      } catch (error) { await authenticationFailure(res, error, token); return; }
+      finally { pending.delete(reservation); }
     }
-    await session.transport.handleRequest(req, res, body);
-    if (!session.transport.sessionId) await session.server.close();
+    try { await session.transport.handleRequest(req, res, body); }
+    finally { if (!session.transport.sessionId) await session.server.close(); }
   }
   async function close(): Promise<void> {
     closing = true;
+    clearInterval(reaper);
+    await sweeping;
     await Promise.all([...allSessions].map((session) => session.server.close()));
     if (server.listening) {
       await new Promise<void>((resolve, reject) => {
@@ -159,11 +208,13 @@ export function createAgentHttpServer(options: AgentHttpOptions) {
 
 export async function startAgentHttpServer(options: AgentHttpOptions) {
   const listener = createAgentHttpServer(options);
-  await new Promise<void>((resolve, reject) => {
-    listener.server.once('error', reject);
-    listener.server.listen(options.config.agentPort, options.config.bindHost, () => {
-      listener.server.off('error', reject); resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      listener.server.once('error', reject);
+      listener.server.listen(options.config.agentPort, options.config.bindHost, () => {
+        listener.server.off('error', reject); resolve();
+      });
     });
-  });
-  return listener;
+    return listener;
+  } catch (error) { await listener.close(); throw error; }
 }

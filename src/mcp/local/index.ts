@@ -13,11 +13,32 @@ export function toolError(code: ErrorCode): CallToolResult {
   return { isError: true, content: [{ type: 'text', text: JSON.stringify(error) }], structuredContent: { error } };
 }
 
+const descriptions = {
+  budget_status: 'Inspect your own policy, usage and remaining budget; not a capacity promise.',
+  preview_transfer: 'Preview a native NEAR transfer without reserving funds. amount is unsigned decimal yoctoNEAR text (1 NEAR = 10^24 yoctoNEAR).',
+  request_transfer: 'Request a native NEAR transfer using an idempotency key. amount is positive decimal yoctoNEAR text, never a JSON number or human NEAR decimal.',
+  get_request: 'Read one of your own transfer requests.',
+  cancel_request: 'Cancel your own request before signing; ambiguous or signed transfers cannot be cancelled.',
+  list_receipts: 'List your signed receipts after an exclusive sequence cursor; defaults: afterSeq=0, limit=100.',
+  verify_receipt: 'Verify a receipt scoped to your own agent chain.',
+  freeze_self: 'Activate your agent kill switch to block new transfers and dispatch.',
+} as const;
+
+/** Distinguish invalid credentials from failures of the authentication dependency. */
+export async function authenticatePrincipal(authenticator: Authenticator, token: string): Promise<AgentPrincipal> {
+  try { return AgentPrincipalSchema.parse(await authenticator.authenticateAgent(token)); }
+  catch (error) {
+    throw new BrokerError(error instanceof BrokerError && error.code === 'UNAUTHENTICATED'
+      ? 'UNAUTHENTICATED' : 'BROKER_UNAVAILABLE');
+  }
+}
+
 /** Only shared strict input schemas are advertised, including additionalProperties:false. */
 export function agentTools(): Tool[] {
   return MCP_AGENT_TOOL_NAMES.map((name) => ({
     name,
-    inputSchema: z.toJSONSchema(MCP_AGENT_TOOL_INPUT_SCHEMAS[name]) as Tool['inputSchema'],
+    description: descriptions[name],
+    inputSchema: z.toJSONSchema(MCP_AGENT_TOOL_INPUT_SCHEMAS[name], { io: 'input' }) as Tool['inputSchema'],
   }));
 }
 
@@ -28,16 +49,17 @@ export function samePrincipal(a: AgentPrincipal, b: AgentPrincipal): boolean {
 /** A session captures a credential, never a mutable current-user slot. */
 export async function createAgentMcpServer(options: {
   broker: AgentBrokerService; authenticator: Authenticator; token: string;
+  onAuthenticationFailure?: () => void;
 }): Promise<Server> {
   const { broker, authenticator, token } = options;
-  const principal = Object.freeze(AgentPrincipalSchema.parse(await authenticator.authenticateAgent(token)));
+  const principal = Object.freeze(await authenticatePrincipal(authenticator, token));
   const server = new Server({ name: 'budget-broker', version: '0.1.0' }, { capabilities: { tools: {} } });
   async function authenticate(): Promise<AgentPrincipal> {
     try {
-      const live = await authenticator.authenticateAgent(token);
+      const live = await authenticatePrincipal(authenticator, token);
       if (!samePrincipal(principal, live)) throw new BrokerError('UNAUTHENTICATED');
       return principal;
-    } catch { throw new BrokerError('UNAUTHENTICATED'); }
+    } catch (error) { options.onAuthenticationFailure?.(); throw error; }
   }
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     await authenticate();
