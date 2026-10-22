@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
+import { inspect } from 'node:util';
 import { describe, expect, it, vi } from 'vitest';
 import { actions, baseEncode, createTransaction, KeyPair, Signature, SignedTransaction } from 'near-api-js';
 import { NativeNearChain, allocateNonce, allocateStoreNonce } from '../../src/near/index.js';
+import { BrokerError } from '../../src/contracts/index.js';
 import type { CustodySigner, NativeTransferToSign, Store, StoreTransaction } from '../../src/contracts/index.js';
 
 const hash = (fill: number): string => baseEncode(new Uint8Array(32).fill(fill));
@@ -27,8 +29,9 @@ function fakeRpc(handler: (request: Request) => unknown | Promise<unknown> = () 
     accountId: transfer.signerId, fetch: fetcher, clock: { now: () => 1234 }, timeoutMs: 20 }) };
 }
 function rpcReject(invalid: unknown) {
-  return { error: { name: 'HANDLER_ERROR', cause: { name: 'INVALID_TRANSACTION', info: { InvalidTxError: invalid } },
-    code: -32000, message: 'Server error', data: 'This data is not forwarded' } };
+  // Captured testnet envelope: cause is present but its info is empty.
+  return { error: { name: 'HANDLER_ERROR', cause: { info: {}, name: 'INVALID_TRANSACTION' },
+    code: -32000, message: 'Server error', data: { TxExecutionError: { InvalidTxError: invalid } } } };
 }
 function finalOutcome(failed = false) {
   const outcome = (id: string, gas: string, tokens: string, children: string[] = []) => ({
@@ -135,22 +138,59 @@ describe('broadcast values (never a blind retry)', () => {
     ['legacy expired', { error: { code: -32000, message: 'Server error', data: {
       TxExecutionError: { InvalidTxError: 'Expired' },
     } } }, 'rejected', 'EXPIRED_BLOCK_HASH'],
-    ['other validation', rpcReject({ InvalidSignerId: { signer_id: 'bad' } }), 'rejected', 'RPC_REJECTED'],
-    ['timeout RPC', { error: { cause: { name: 'TIMEOUT_ERROR' } } }, 'outcome_unknown', undefined],
+    ['SignerDoesNotExist', rpcReject({ SignerDoesNotExist: { signer_id: 'missing.testnet' } }), 'rejected', 'RPC_REJECTED'],
+    ['timeout RPC', { error: { name: 'HANDLER_ERROR', cause: { info: {}, name: 'TIMEOUT_ERROR' },
+      code: -32000, message: 'Server error', data: 'Timeout' } }, 'outcome_unknown', undefined],
     ['unclassified', { error: { message: 'InvalidNonce' } }, 'outcome_unknown', undefined],
-    ['wrong hash', hash(8), 'outcome_unknown', undefined],
+    ['alternate cause.info', { error: { cause: { name: 'INVALID_TRANSACTION', info: {
+      InvalidTxError: { InvalidNonce: { tx_nonce: 3, ak_nonce: 4 } },
+    } } } }, 'rejected', 'INVALID_NONCE'],
+    ['data wins over cause.info', { error: { ...rpcReject('Expired').error, cause: {
+      name: 'INVALID_TRANSACTION', info: { InvalidTxError: { InvalidNonce: { tx_nonce: 3, ak_nonce: 4 } } },
+    } } }, 'rejected', 'EXPIRED_BLOCK_HASH'],
+    ['wrong hash', { final_execution_status: 'INCLUDED', transaction: { hash: hash(8), signer_id: transfer.signerId } }, 'outcome_unknown', undefined],
+    ['NONE is not inclusion', { final_execution_status: 'NONE' }, 'outcome_unknown', undefined],
   ])('%s', async (_name, response, kind, code) => {
     let signedHash = '';
-    const rpc = fakeRpc((r) => r.method === 'broadcast_tx_async' ? response ?? signedHash : undefined);
+    const rpc = fakeRpc((r) => {
+      // A real async send always acknowledges even an invalid transaction.
+      // Regression: reverting to broadcast_tx_async must NOT pass rejection tests.
+      if (r.method === 'broadcast_tx_async') return signedHash;
+      return r.method === 'send_tx' ? response ?? { final_execution_status: 'INCLUDED',
+        transaction: { hash: signedHash, signer_id: transfer.signerId } } : undefined;
+    });
     const chain = await rpc.connect(); const signed = await chain.buildAndSignNativeTransfer(transfer, signer);
     signedHash = signed.txHash;
     const result = await chain.broadcast(signed.signedTxBase64);
     expect(result).toMatchObject({ kind, txHash: signedHash, ...(code ? { code } : {}) });
-    expect(rpc.requests.filter((r) => r.method === 'broadcast_tx_async').map((r) => r.params)).toEqual([[signed.signedTxBase64]]);
+    expect(rpc.requests.filter((r) => r.method === 'broadcast_tx_async')).toHaveLength(0);
+    expect(rpc.requests.filter((r) => r.method === 'send_tx').map((r) => r.params)).toEqual([
+      { signed_tx_base64: signed.signedTxBase64, wait_until: 'INCLUDED' },
+    ]);
+  });
+  it('canonicalizes equivalent base64 pad-bit aliases before submitting exact bytes', async () => {
+    const rpc = fakeRpc((r) => r.method === 'send_tx' ? { final_execution_status: 'INCLUDED' } : undefined);
+    const chain = await rpc.connect();
+    let signed = await chain.buildAndSignNativeTransfer(transfer, signer);
+    if (!signed.signedTxBase64.endsWith('=')) {
+      signed = await chain.buildAndSignNativeTransfer({ ...transfer, receiverId: 'bobb.testnet' }, signer);
+    }
+    const canonical = signed.signedTxBase64;
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const padIndex = canonical.indexOf('=');
+    expect(padIndex).toBeGreaterThan(0);
+    const last = alphabet.indexOf(canonical[padIndex - 1]!);
+    const alias = canonical.slice(0, padIndex - 1) + alphabet[last + 1]! + canonical.slice(padIndex);
+    expect(alias).not.toBe(canonical);
+    expect(Buffer.from(alias, 'base64')).toEqual(Buffer.from(canonical, 'base64'));
+    expect(await chain.broadcast(alias)).toEqual({ kind: 'accepted', txHash: signed.txHash });
+    expect(rpc.requests.at(-1)).toMatchObject({ method: 'send_tx', params: {
+      signed_tx_base64: canonical, wait_until: 'INCLUDED',
+    } });
   });
   it.each(['timeout', 'network', 'http'])('%s -> outcome_unknown', async (mode) => {
     const rpc = fakeRpc((r) => {
-      if (r.method !== 'broadcast_tx_async') return undefined;
+      if (r.method !== 'send_tx') return undefined;
       if (mode === 'timeout') return new Promise(() => {});
       if (mode === 'http') return new Response('unavailable', { status: 503 });
       throw new Error('private RPC details');
@@ -158,6 +198,32 @@ describe('broadcast values (never a blind retry)', () => {
     const chain = await rpc.connect(); const signed = await chain.buildAndSignNativeTransfer(transfer, signer);
     expect(await chain.broadcast(signed.signedTxBase64)).toEqual({ kind: 'outcome_unknown', txHash: signed.txHash,
       reason: 'Broadcast acknowledgment unavailable' });
+  });
+});
+
+describe('provider errors stay behind the adapter boundary', () => {
+  it.each(['account', 'access key', 'block', 'protocol config'])('redacts %s errors to a stable broker code', async (view) => {
+    const providerSecret = 'injected-private-provider-body';
+    const rpc = fakeRpc((r) => {
+      if (r.method === 'status') return undefined;
+      if (view === 'protocol config' && r.method === 'query') {
+        return { amount: '1000', locked: '0', storage_usage: 10, block_hash: block };
+      }
+      return { error: { code: -32000, message: providerSecret, data: providerSecret } };
+    });
+    const chain = await rpc.connect();
+    try {
+      if (view === 'access key') await chain.viewAccessKey(transfer.signerId, key);
+      else if (view === 'block') await chain.recentBlockHash();
+      else await chain.viewAccount(transfer.signerId);
+      expect.unreachable('provider error must fail closed');
+    } catch (error) {
+      expect(error).toBeInstanceOf(BrokerError);
+      expect(error).toHaveProperty('code', 'BROKER_UNAVAILABLE');
+      expect(error).not.toHaveProperty('response');
+      expect(error).not.toHaveProperty('cause');
+      expect(String(error) + JSON.stringify(error) + inspect(error)).not.toContain(providerSecret);
+    }
   });
 });
 

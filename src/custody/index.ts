@@ -8,11 +8,14 @@ import {
 import type { Custody, CustodySigner, EncryptedCustodyKey } from '../contracts/index.js';
 
 // Envelope v1 pins these parameters: untrusted files cannot request expensive KDFs.
-// ~32 MiB memory, 32768 iterations; independently random 32-byte salts, 96-bit IVs.
-const SCRYPT = { N: 32768, r: 8, p: 1, maxmem: 64 * 1024 * 1024 } as const;
+// ~128 MiB memory (N=2^17, r=8, p=1); allow overhead with 256 MiB maxmem.
+// Independently random 32-byte salts, 96-bit IVs. Master secrets must be at least
+// 32 bytes; operators should generate them randomly, not use human passwords.
+const SCRYPT = { N: 131072, r: 8, p: 1, maxmem: 256 * 1024 * 1024 } as const;
+const MIN_MASTER_BYTES = 32;
 const denied = (): BrokerError => new BrokerError('BROKER_UNAVAILABLE', 'Custody operation failed');
 function derive(master: Uint8Array, salt: Uint8Array): Promise<Buffer> {
-  if (master.byteLength < 16 || master.byteLength > 4096) return Promise.reject(denied());
+  if (master.byteLength < MIN_MASTER_BYTES || master.byteLength > 4096) return Promise.reject(denied());
   return new Promise((resolve, reject) => {
     scrypt(master, salt, 32, SCRYPT, (error, key) => error ? reject(denied()) : resolve(key));
   });
@@ -153,7 +156,7 @@ export async function readMasterSecret(env: NodeJS.ProcessEnv = process.env): Pr
     const direct = env['BB_MASTER_SECRET']; const path = env['BB_MASTER_SECRET_FILE'];
     if ((direct === undefined) === (path === undefined)) throw denied();
     const secret = direct === undefined ? await readBounded(path!, 4096) : Buffer.from(direct, 'utf8');
-    if (secret.length < 16 || secret.length > 4096) { secret.fill(0); throw denied(); }
+    if (secret.length < MIN_MASTER_BYTES || secret.length > 4096) { secret.fill(0); throw denied(); }
     return secret;
   } catch { throw denied(); }
 }

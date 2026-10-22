@@ -53,7 +53,9 @@ export class RpcClient {
         return body['result'];
       })()]);
     } catch (error) {
-      if (error instanceof RpcFailure) throw error;
+      // Only the internal send classifier needs the structured provider body.
+      // Read/view ports must expose stable broker codes, never raw RPC data.
+      if (error instanceof RpcFailure && method === 'send_tx') throw error;
       throw new BrokerError('BROKER_UNAVAILABLE');
     } finally { clearTimeout(timer); }
   }

@@ -154,8 +154,16 @@ export class NativeNearChain implements NearChain {
     await this.verifyNetwork(); // A mismatch is a refusal, not a send attempt.
     const txHash = signed.txHash;
     try {
-      const result = await this.#rpc.call('broadcast_tx_async', [signedTxBase64]);
-      if (result === txHash) return { kind: 'accepted', txHash };
+      // Async/NONE acknowledgment does not validate the transaction. Wait for
+      // inclusion so nearcore can report InvalidNonce/Expired, without re-signing.
+      const result = record(await this.#rpc.call('send_tx', {
+        signed_tx_base64: signed.signedTxBase64, wait_until: 'INCLUDED',
+      }));
+      const transaction = result['transaction'];
+      const matches = transaction === undefined || (record(transaction)['hash'] === txHash
+        && record(transaction)['signer_id'] === signed.transfer.signerId);
+      if (matches && ['INCLUDED', 'INCLUDED_FINAL', 'EXECUTED_OPTIMISTIC', 'EXECUTED', 'FINAL']
+        .includes(String(result['final_execution_status']))) return { kind: 'accepted', txHash };
       return { kind: 'outcome_unknown', txHash, reason: 'Unrecognized broadcast acknowledgment' };
     } catch (error) {
       if (error instanceof RpcFailure) {
@@ -219,15 +227,15 @@ export class NativeNearChain implements NearChain {
 function rejectionCode(error: unknown): 'INVALID_NONCE' | 'EXPIRED_BLOCK_HASH' | 'RPC_REJECTED' | null {
   try {
     const body = record(error);
+    // near-api-js 7.3.1 parseHandlerError reads data.TxExecutionError even
+    // when cause is present: real nodes commonly send cause.info = {}.
     let invalid: unknown;
-    if (body['cause'] !== undefined) {
+    try { invalid = record(record(body['data'])['TxExecutionError'])['InvalidTxError']; }
+    catch { /* An alternate RPC may put the enum in cause.info instead. */ }
+    if (invalid === undefined && body['cause'] !== undefined) {
       const cause = record(body['cause']);
       if (cause['name'] !== 'INVALID_TRANSACTION') return null;
       invalid = record(cause['info'])['InvalidTxError'];
-    } else {
-      // Legacy JSON-RPC structured validation errors (not free-form data strings).
-      const data = record(body['data']);
-      invalid = record(data['TxExecutionError'])['InvalidTxError'];
     }
     if (invalid === 'Expired') return 'EXPIRED_BLOCK_HASH';
     if (invalid && typeof invalid === 'object' && 'InvalidNonce' in invalid) return 'INVALID_NONCE';

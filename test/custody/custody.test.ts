@@ -1,15 +1,51 @@
-import { createHash } from 'node:crypto';
+import { createDecipheriv, createHash, scryptSync } from 'node:crypto';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { baseEncode, KeyPair } from 'near-api-js';
+import { baseDecode, baseEncode, KeyPair } from 'near-api-js';
+import type { EncryptedCustodyKey } from '../../src/contracts/index.js';
 import { EncryptedFileCustody, readMasterSecret } from '../../src/custody/index.js';
 import { NativeNearChain } from '../../src/near/index.js';
 
 const secret = KeyPair.fromRandom('ed25519').toString();
 const master = Buffer.from('strong-test-master-secret-not-for-production');
 const digest = createHash('sha256').update('native transaction').digest();
+// Fixed independent known-answer vectors: Node crypto PKCS8 zero Ed25519 seed,
+// scrypt(N=131072,r=8,p=1,dkLen=32), AES-256-GCM with sorted header JSON as AAD.
+// These are disposable test keys, never funded or used for live tests. Do not
+// regenerate these via the implementation under test: that hides KDF mutations.
+const vectorMaster = Buffer.from('budget-broker-scrypt-v1-known-answer-master');
+const vector: EncryptedCustodyKey = {
+  version: 1, algorithm: 'aes-256-gcm', kdf: 'scrypt',
+  saltBase64: 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=', ivBase64: 'ICEiIyQlJicoKSor',
+  publicKey: 'ed25519:4zvwRjXUKGfvwnParsHAS3HuSVzV5cA4McphgmoCtajS',
+  tagBase64: 'j6Pjlgj2MZpTJ+X5AhHtag==',
+  ciphertextBase64: 'UvzvKpAOHpz8zDuEpU4Kpf/9ZOvMojyyp12WmC1QYDlQEAHlQWol+asGfW/7bIDaiKSckHukzzI6WHHvuTn0Zw==',
+};
+const wrongCostVector: EncryptedCustodyKey = { ...vector,
+  // Same plaintext, master, salt, IV and AAD, but scrypt N=2.
+  tagBase64: 'z9EQmZBo9ohZG+RRv3SWOA==',
+  ciphertextBase64: 'hBNZ1mgYhtkza2n7fVVF431SCN+3oBwXKgPQG70GNkHbG8xbjushLJ/VKmD+vAsq6GfXs1ZymsNOSRmd8Kkp7w==',
+};
+const shortMasterVector: EncryptedCustodyKey = { ...vector,
+  // Correct pinned KDF, but the master is exactly 31 ASCII 'a' bytes.
+  tagBase64: 'g8/sbhF14Op/hiFTlG3uOw==',
+  ciphertextBase64: 'QOxIrojKXbR5Tp8Gk1lxHmlcaoHWjJ/W+MwtM4dWzZxdLNoV4b2Xy8+DxdnCmUClb3M/ADE1jFVv+kyNr2tz3Q==',
+};
+function independentDecrypt(encrypted: EncryptedCustodyKey, password: Uint8Array, N = 131072): Buffer {
+  const key = scryptSync(password, Buffer.from(encrypted.saltBase64, 'base64'), 32,
+    { N, r: 8, p: 1, maxmem: 256 * 1024 * 1024 });
+  let partial: Buffer | undefined;
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(encrypted.ivBase64, 'base64'));
+    decipher.setAAD(Buffer.from(JSON.stringify({ algorithm: encrypted.algorithm, ivBase64: encrypted.ivBase64,
+      kdf: encrypted.kdf, publicKey: encrypted.publicKey, saltBase64: encrypted.saltBase64, version: encrypted.version })));
+    decipher.setAuthTag(Buffer.from(encrypted.tagBase64, 'base64'));
+    partial = decipher.update(Buffer.from(encrypted.ciphertextBase64, 'base64'));
+    return Buffer.concat([partial, decipher.final()]);
+  } finally { key.fill(0); partial?.fill(0); }
+}
 const dirs: string[] = [];
 const custodians: EncryptedFileCustody[] = [];
 function custody() { const value = new EncryptedFileCustody(); custodians.push(value); return value; }
@@ -31,6 +67,38 @@ async function safeError(operation: Promise<unknown>) {
 }
 
 describe('AES-256-GCM / pinned scrypt envelope v1', () => {
+  it('decrypts the fixed pinned-cost vector and rejects a different scrypt N', async () => {
+    const c = custody();
+    const signer = await c.loadKey(vector, vectorMaster);
+    expect(signer.publicKey).toBe(vector.publicKey);
+    const expected = KeyPair.fromString(`ed25519:${baseEncode(Buffer.alloc(64))}`);
+    expect(expected.verify(digest, await signer.sign(digest))).toBe(true);
+    await safeError(c.loadKey(wrongCostVector, vectorMaster));
+    expect(() => independentDecrypt(vector, vectorMaster, 2)).toThrow();
+    const wrongCostPlain = independentDecrypt(wrongCostVector, vectorMaster, 2);
+    expect(wrongCostPlain.subarray(0, 32)).toEqual(Buffer.alloc(32));
+    wrongCostPlain.fill(0);
+  });
+  it('encrypts using independently verified N=2^17, r=8, p=1', async () => {
+    const encrypted = await custody().encryptKey(secret, master);
+    const decrypted = independentDecrypt(encrypted, master);
+    expect(decrypted).toEqual(Buffer.from(baseDecode(secret.slice(8))));
+    decrypted.fill(0);
+  });
+  it('enforces 32..4096 master bytes on encryption and rejects a valid short-master envelope', async () => {
+    const c = custody();
+    for (const length of [0, 16, 31, 4097]) await safeError(c.encryptKey(secret, Buffer.alloc(length, 0x61)));
+    // Authentication would succeed if only the load-side minimum were removed.
+    const shortPlain = independentDecrypt(shortMasterVector, Buffer.alloc(31, 0x61));
+    expect(shortPlain.subarray(0, 32)).toEqual(Buffer.alloc(32)); shortPlain.fill(0);
+    await safeError(c.loadKey(shortMasterVector, Buffer.alloc(31, 0x61)));
+    for (const length of [32, 4096]) {
+      const password = Buffer.alloc(length, 0x61);
+      const signer = await c.loadKey(await c.encryptKey(secret, password), password);
+      expect(KeyPair.fromString(secret).verify(digest, await signer.sign(digest))).toBe(true);
+      password.fill(0);
+    }
+  });
   it('roundtrips, signs exact transaction hashes, and randomizes salt/IV', async () => {
     const c = custody();
     const encrypted = await c.encryptKey(secret, master);
@@ -66,7 +134,7 @@ describe('AES-256-GCM / pinned scrypt envelope v1', () => {
   });
   it('wrong master and tampering fail without secrets, RPC details, or crypto exceptions', async () => {
     const c = custody(); const encrypted = await c.encryptKey(secret, master);
-    await safeError(c.loadKey(encrypted, Buffer.from('incorrect master secret')));
+    await safeError(c.loadKey(encrypted, Buffer.from('incorrect master secret with sufficient length')));
     for (const field of ['ciphertextBase64', 'saltBase64', 'ivBase64', 'tagBase64'] as const) {
       const bytes = Buffer.from(encrypted[field], 'base64'); bytes[0]! ^= 1;
       await safeError(c.loadKey({ ...encrypted, [field]: bytes.toString('base64') }, master));
@@ -108,7 +176,7 @@ describe('daemon encrypted file and master-secret sources', () => {
     const signer = await c.loadKeyFile(path, master);
     expect(KeyPair.fromString(secret).verify(digest, await signer.sign(digest))).toBe(true);
     await safeError(c.createEncryptedKeyFile(path, secret, master));
-    await safeError(c.loadKeyFile(path, Buffer.from('wrong master password')));
+    await safeError(c.loadKeyFile(path, Buffer.from('wrong master password with sufficient length')));
     const bad = join(await temp(), 'bad.json'); await writeFile(bad, `{malformed ${secret}`);
     await safeError(c.loadKeyFile(bad, master));
   });
@@ -122,5 +190,18 @@ describe('daemon encrypted file and master-secret sources', () => {
     await safeError(readMasterSecret({ BB_MASTER_SECRET: master.toString(), BB_MASTER_SECRET_FILE: file }));
     await safeError(readMasterSecret({ BB_MASTER_SECRET_FILE: `${file}-missing` }));
     await safeError(readMasterSecret({ BB_MASTER_SECRET: 'short' }));
+    for (const length of [16, 31, 4097]) {
+      await safeError(readMasterSecret({ BB_MASTER_SECRET: 'a'.repeat(length) }));
+      await writeFile(file, 'a'.repeat(length));
+      await safeError(readMasterSecret({ BB_MASTER_SECRET_FILE: file }));
+    }
+    for (const length of [32, 4096]) {
+      const value = 'a'.repeat(length);
+      const direct = await readMasterSecret({ BB_MASTER_SECRET: value });
+      expect(direct.length).toBe(length); direct.fill(0);
+      await writeFile(file, value);
+      const fromFile = await readMasterSecret({ BB_MASTER_SECRET_FILE: file });
+      expect(fromFile.length).toBe(length); fromFile.fill(0);
+    }
   });
 });
