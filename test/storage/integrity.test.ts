@@ -164,6 +164,20 @@ describe('signed-attempt persistence and replacement guards', () => {
     expect(store.read((v) => v.getRequest('r'))).toMatchObject({ state: 'submitted', txHash: HASH });
   });
 
+  it.each(['outcome_unknown', 'submitted'] as const)('refuses replacement of a %s attempt even with non-null evidence', (status) => {
+    const store = open(); signed(store);
+    const prior = { ...attempt(), status, nonExecutionEvidence: 'persisted positive observation' };
+    store.transaction((tx) => { tx.putAttempt(prior); tx.allocateNonce(KEY, 0n); });
+    const beforeRequest = store.read((v) => v.getRequest('r'));
+    const beforeOutbox = store.read((v) => v.listOutbox({ limit: 10 }));
+    expect(beforeOutbox.items).toEqual([prior]);
+    // Signed request, matching hash, evidence and a higher allocated nonce leave
+    // only the prior.status === proven_not_executed guard to reject replacement.
+    errorCode(() => store.transaction((tx) => tx.replaceUnexecutedAttempt('r', 'attempt', attempt('next', 'r', 2n, HASH2))), 'FORBIDDEN');
+    expect(store.read((v) => v.getRequest('r'))).toEqual(beforeRequest);
+    expect(store.read((v) => v.listOutbox({ limit: 10 }))).toEqual(beforeOutbox);
+  });
+
   it('cannot replace an already-replaced prior hash a second time', () => {
     const store = open(); proven(store);
     store.transaction((tx) => { tx.allocateNonce(KEY, 0n); tx.replaceUnexecutedAttempt('r', 'attempt', attempt('next', 'r', 2n, HASH2)); tx.allocateNonce(KEY, 0n); });

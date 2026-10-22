@@ -104,6 +104,18 @@ describe('real getUsageSnapshot windows and reservation exclusion', () => {
     expect(store.read((v) => v.getUsageSnapshot('a', NOW, 'other-agent').agentRequestsLastMinute)).toBe(included ? 2 : 0);
   });
 
+  it('excludes a cancelled request from agentOutstanding while still counting its active hold', () => {
+    const store = open(); seed(store);
+    const r = request();
+    const hold = { requestId: r.id, agentId: r.agentId, principal: r.amount, feeReserve: 2n, status: 'active' as const };
+    store.transaction((tx) => { tx.insertRequest(r); tx.putHold(hold); });
+    expect(store.read((v) => v.getUsageSnapshot('a', NOW))).toMatchObject({ agentOutstanding: 1, outstandingHolds: 12n });
+    // Leave the hold active to isolate terminal-request exclusion from release.
+    store.transaction((tx) => tx.updateRequest({ ...r, state: 'cancelled' }, 'queued'));
+    expect(store.read((v) => v.getHold(r.id))).toEqual(hold);
+    expect(store.read((v) => v.getUsageSnapshot('a', NOW))).toMatchObject({ agentOutstanding: 0, outstandingHolds: 12n });
+  });
+
   it.each([DAY, DAY + 1, 10 * DAY, 365 * DAY].flatMap((age) =>
     (['pending_approval', 'queued', 'signed', 'submitted', 'outcome_unknown'] as const).map((state) => ({ age, state }))))(
     'active $state holds never age out (age=$age), and own-hold exclusion is exact across reopen', ({ age, state }) => {
