@@ -1,0 +1,8 @@
+{
+  "name": "near-budget-broker-mcp",
+  "version": "0.1.0",
+  "description": "Budget Broker MCP server for NEAR Protocol",
+  "private": true,
+  "type": "module",
+  "license": "MIT"
+}
