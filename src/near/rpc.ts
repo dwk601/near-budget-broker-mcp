@@ -53,9 +53,9 @@ export class RpcClient {
         return body['result'];
       })()]);
     } catch (error) {
-      // Only the internal send classifier needs the structured provider body.
-      // Read/view ports must expose stable broker codes, never raw RPC data.
-      if (error instanceof RpcFailure && method === 'send_tx') throw error;
+      // Only internal send/status classifiers need structured provider bodies.
+      // Public read/view ports expose stable codes/outcomes, never raw RPC data.
+      if (error instanceof RpcFailure && (method === 'send_tx' || method === 'tx')) throw error;
       throw new BrokerError('BROKER_UNAVAILABLE');
     } finally { clearTimeout(timer); }
   }

@@ -154,7 +154,9 @@ export interface NearChain {
   decodeSignedTx(bytes: Uint8Array): SignedNativeTransfer;
   /** Broadcast exact persisted signed bytes, no implicit nonce selection/retry-signing. */
   broadcast(signedTxBase64: string): Promise<BroadcastResult>;
-  txStatus(txHash: string, signerId: string): Promise<ChainOutcome>;
+  /** Optional persisted attempt supplies exact bytes/nonce/block for positive
+   * non-execution evidence; legacy two-argument readers remain supported. */
+  txStatus(txHash: string, signerId: string, attempt?: TxAttempt): Promise<ChainOutcome>;
   classifyOutcome(rpcResponse: unknown): ChainOutcome;
 }
 
@@ -192,7 +194,14 @@ export interface OwnerBrokerService {
   revokeStandingApproval(principal: OwnerPrincipal, approvalId: string): Promise<StandingApproval>;
   freeze(principal: OwnerPrincipal, target: FreezeTarget, reason: string): Promise<Freeze>;
   unfreeze(principal: OwnerPrincipal, target: FreezeTarget, reason: string): Promise<Freeze>;
+  /** Reconcile existing attempts only; never admit/dispatch unrelated queued work.
+   * Result contains only requests examined by this call, not the request table. */
   reconcile(principal: OwnerPrincipal, requestId?: string): Promise<ReconcileResult>;
+  /** Owner attests zero execution, accepting responsibility when evidence is
+   * unavailable. Requires a nonempty reason. Refused on pending/final execution
+   * evidence. Atomically fails the current attempt, releases hold and receipts
+   * on owner + agent chains. Does not authorize a replacement payment. */
+  resolveAttempt(principal: OwnerPrincipal, requestId: string, reason: string): Promise<TransferRequest>;
   exportReceipts(principal: OwnerPrincipal, chainId: ChainId, afterSeq: number, limit: number): Promise<ReceiptEvent[]>;
   listRequests(principal: OwnerPrincipal, filter: RequestFilter, query: PageQuery): Promise<Page<TransferRequest>>;
 }

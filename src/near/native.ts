@@ -10,7 +10,7 @@ import {
 } from '../contracts/index.js';
 import type {
   AccountBalance, AccessKeyView, BroadcastResult, ChainOutcome, Clock, CustodySigner,
-  NativeTransferToSign, NearChain, RecentBlock, SignedNativeTransfer,
+  NativeTransferToSign, NearChain, RecentBlock, SignedNativeTransfer, TxAttempt,
 } from '../contracts/index.js';
 import { record, RpcClient, RpcFailure, unsigned } from './rpc.js';
 import type { RpcFetch } from './rpc.js';
@@ -174,16 +174,70 @@ export class NativeNearChain implements NearChain {
       return { kind: 'outcome_unknown', txHash, reason: 'Broadcast acknowledgment unavailable' };
     }
   }
-  async txStatus(txHash: string, signerId: string): Promise<ChainOutcome> {
+  async txStatus(txHash: string, signerId: string, attempt?: TxAttempt): Promise<ChainOutcome> {
     ChainHashSchema.parse(txHash); AccountIdSchema.parse(signerId);
     try {
       const result = await this.#rpc.call('tx', { tx_hash: txHash, sender_account_id: signerId, wait_until: 'FINAL' });
-      const response = record(result);
-      const tx = record(response['transaction']);
-      if (tx['hash'] !== txHash || tx['signer_id'] !== signerId
-        || record(response['transaction_outcome'])['id'] !== txHash) return unknownOutcome();
-      return this.classifyOutcome(response);
+      return this.observedOutcome(record(result), txHash, signerId);
+    } catch (error) {
+      if (attempt && unknownTransaction(error)) return this.proveNotExecuted(txHash, signerId, attempt);
+      return unknownOutcome();
+    }
+  }
+  private async proveNotExecuted(txHash: string, signerId: string, attempt: TxAttempt): Promise<ChainOutcome> {
+    try {
+      await this.verifyNetwork();
+      // Never accept caller metadata alone as evidence. Decode and verify the
+      // exact persisted signature, then bind every proof field to that message.
+      const signed = fromBase64(attempt.signedTxBase64);
+      const t = signed.transfer;
+      if (signed.txHash !== txHash || attempt.txHash !== txHash || t.signerId !== signerId
+        || signerId !== this.#accountId || t.nonce !== attempt.nonce || t.publicKey !== attempt.publicKey
+        || t.blockHash !== attempt.blockHash) return unknownOutcome();
+      const head = record(record(await this.#rpc.call('block', { finality: 'final' }))['header']);
+      const headHash = ChainHashSchema.parse(head['hash']); blockHash(headHash);
+      const headHeight = unsigned(head['height'], U64_MAX);
+      const key = record(await this.#rpc.call('query', { request_type: 'view_access_key', account_id: signerId,
+        public_key: t.publicKey, block_id: headHash }));
+      if (key['block_hash'] !== headHash) return unknownOutcome();
+      const nonce = unsigned(key['nonce'], U64_MAX);
+      let evidence: string;
+      let invalidNonce = false;
+      if (nonce >= t.nonce) {
+        invalidNonce = true;
+        evidence = `UNKNOWN_TRANSACTION; final access key ${headHash} nonce ${nonce} >= attempt ${t.nonce}`;
+      } else {
+        const anchor = record(record(await this.#rpc.call('block', { block_id: t.blockHash }))['header']);
+        if (anchor['hash'] !== t.blockHash) return unknownOutcome();
+        const height = unsigned(anchor['height'], U64_MAX);
+        const protocol = record(await this.#rpc.call('EXPERIMENTAL_protocol_config', { block_id: headHash }));
+        const validity = unsigned(protocol['transaction_validity_period'], U64_MAX);
+        if (validity === 0n || headHeight <= height + validity) return unknownOutcome();
+        evidence = `UNKNOWN_TRANSACTION; final head ${headHash} height ${headHeight} > anchor ${t.blockHash} height ${height} + validity ${validity}`;
+      }
+      // A second negative lookup AFTER the final nonce/expiry observation closes
+      // the observation race. Timeout, malformed result, or any other error is
+      // not a negative lookup. Execution always wins over exclusion evidence.
+      try {
+        const result = await this.#rpc.call('tx', { tx_hash: txHash, sender_account_id: signerId, wait_until: 'FINAL' });
+        return this.observedOutcome(record(result), txHash, signerId);
+      } catch (error) {
+        if (!unknownTransaction(error)) return unknownOutcome();
+      }
+      return { kind: 'not_executed', evidence, invalidNonce };
     } catch { return unknownOutcome(); }
+  }
+  private observedOutcome(response: Record<string, unknown>, txHash: string, signerId: string): ChainOutcome {
+    const tx = record(response['transaction']);
+    if (tx['hash'] !== txHash || tx['signer_id'] !== signerId) return unknownOutcome();
+    // Once a matching transaction is observed, incomplete/malformed accounting
+    // must still veto owner or exclusion resolution. Never downgrade it to an
+    // absence claim merely because the fee graph cannot be read yet.
+    try {
+      if (record(response['transaction_outcome'])['id'] !== txHash) return { kind: 'pending' };
+      const outcome = this.classifyOutcome(response);
+      return outcome.kind === 'outcome_unknown' ? { kind: 'pending' } : outcome;
+    } catch { return { kind: 'pending' }; }
   }
   classifyOutcome(rpcResponse: unknown): ChainOutcome {
     try {
@@ -222,6 +276,12 @@ export class NativeNearChain implements NearChain {
         : { kind: 'failed', final: true, receiptIds, gasBurnt, tokensBurnt, error: 'Transaction execution failed' });
     } catch { return unknownOutcome(); }
   }
+}
+
+function unknownTransaction(error: unknown): boolean {
+  try {
+    return error instanceof RpcFailure && record(record(error.response)['cause'])['name'] === 'UNKNOWN_TRANSACTION';
+  } catch { return false; }
 }
 
 function rejectionCode(error: unknown): 'INVALID_NONCE' | 'EXPIRED_BLOCK_HASH' | 'RPC_REJECTED' | null {

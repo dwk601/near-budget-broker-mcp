@@ -48,7 +48,12 @@ export const RECEIPT_PAYLOAD_SCHEMAS = {
   submitted: z.strictObject({ ...request, attemptId: IdSchema, txHash: ChainHashSchema,
     phase: z.enum(['intent', 'acknowledged']) }),
   succeeded: z.strictObject(settlement),
-  failed: z.strictObject({ ...settlement, reason: z.string().min(1) }),
+  failed: z.strictObject({ ...settlement, reason: z.string().min(1),
+    /** Explicit zero-execution resolution, not a measured chain failure. */
+    resolution: z.strictObject({ attemptId: IdSchema, basis: z.enum(['owner_attested', 'chain_proof', 'never_offered']),
+      evidence: z.string().min(1) }).optional() })
+    .refine((p) => p.resolution === undefined || (p.gasBurnt === '0' && p.tokensBurnt === '0'
+      && p.receiptIds.length === 0 && p.reason.length <= 1024 && p.reason.trim().length > 0), 'Resolution requires zero execution'),
   outcome_unknown: z.strictObject({ ...request, attemptId: IdSchema, txHash: ChainHashSchema, reason: z.string().min(1) }),
   freeze: FreezeSchema.refine((freeze) => freeze.frozen, 'Expected frozen=true'),
   unfreeze: FreezeSchema.refine((freeze) => !freeze.frozen, 'Expected frozen=false'),

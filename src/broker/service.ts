@@ -3,7 +3,7 @@ import type { z } from 'zod';
 import {
   AgentSchema, AgentPrincipalSchema, AgentPolicySchema, AgentPolicyWireSchema,
   AppendReceiptSchema, BrokerError, BudgetStatusSchema, OwnerPrincipalSchema,
-  TransferInputSchema, WalletPolicySchema, WalletPolicyWireSchema,
+  TransferInputSchema, WalletPolicySchema, WalletPolicyWireSchema, AccountBalanceSchema,
   requestDigest, toDecimalText, transferExplorerUrl,
 } from '../contracts/index.js';
 import type {
@@ -19,7 +19,7 @@ import {
   expirePending, listStandingApprovals, reserveStandingApproval,
 } from '../approvals/index.js';
 import { PurePolicyEvaluator } from '../policy/index.js';
-import { custodyLane } from './lane.js';
+import { custodyLane, custodyPump } from './lane.js';
 
 export interface BrokerOptions {
   store: Store;
@@ -74,10 +74,12 @@ const preSigning = ['pending_approval', 'approved', 'queued'] as const;
 export class BrokerService implements BrokerPort {
   private readonly evaluator: PurePolicyEvaluator;
   private readonly lane: ReturnType<typeof custodyLane>;
+  private readonly pump: ReturnType<typeof custodyPump>;
   private readonly receipts: ReceiptLog;
   private readonly ttl: number;
   constructor(private readonly o: BrokerOptions) {
     this.lane = custodyLane(o.config.accountId, o.signer.publicKey);
+    this.pump = custodyPump(o.config.accountId, o.signer.publicKey);
     this.evaluator = new PurePolicyEvaluator({ balanceMaxAgeMs: o.config.balanceMaxAgeMs,
       matchStandingApproval: o.approvals.matchStandingApproval.bind(o.approvals) });
     this.ttl = o.pendingApprovalTtlMs ?? 300_000;
@@ -122,8 +124,26 @@ export class BrokerService implements BrokerPort {
       walletPolicy: r.getWalletPolicy(), usage: r.getUsageSnapshot(request.agentId, now, requestId ?? undefined),
       request: { agentId: request.agentId, receiverId: request.receiverId, amount: request.amount,
         feeReserve: (requestId === null ? null : r.getHold(requestId))?.feeReserve ?? this.o.config.feeReservePerTx },
-      requestId, requestDigest: request.requestDigest, standingApprovals: listStandingApprovals(r, request.agentId),
+      requestId, requestDigest: request.requestDigest, standingApprovals: listStandingApprovals(r, request.agentId)
+        .filter((a) => {
+          const ref = requestId === null ? null : r.getRequest(requestId)?.approvalRef;
+          return ref?.kind !== 'standing' || a.id === ref.id;
+        }),
       requestApproval: requestId === null ? null : r.getRequestApproval(requestId), now };
+  }
+  private boundDecision(r: StoreReader, e: PolicyEvaluationInput): PolicyDecision {
+    const decision = this.evaluator.evaluate(e);
+    if (decision.kind === 'deny' || decision.kind === 'needs_approval' || e.requestId === null) return decision;
+    const ref = r.getRequest(e.requestId)?.approvalRef;
+    if (ref?.kind === 'standing') {
+      const grant = e.standingApprovals.find((a) => a.id === ref.id);
+      const reservedTotal = Object.hasOwn(e.usage.standingReserved, ref.id) ? e.usage.standingReserved[ref.id]! : 0n;
+      if (!grant || this.o.approvals.matchStandingApproval({ approval: grant, agentId: e.agent.id,
+        receiverId: e.request.receiverId, amount: e.request.amount, reservedTotal, now: e.now }).kind !== 'match') {
+        return { kind: 'needs_approval', reasons: ['APPROVAL_REQUIRED'] };
+      }
+    }
+    return decision;
   }
   private digest(agentId: string, input: TransferInput): string {
     return requestDigest({ agentId, receiverId: input.receiverId, amount: toDecimalText(input.amount), memo: input.memo ?? null });
@@ -199,10 +219,23 @@ export class BrokerService implements BrokerPort {
     return view(this.o.store.read((r) => must(r.getRequest(request.id))));
   }
   async previewTransfer(principal: AgentPrincipal, raw: TransferInput) {
+    this.o.store.read((r) => this.agent(r, principal));
+    const input = validate(TransferInputSchema, raw);
+    // Ephemeral RPC view only: preview must not mutate even the balance row.
+    let fresh: PolicyEvaluationInput['usage']['balance'] = null;
+    if (this.o.store.read((r) => this.stale(r))) {
+      try {
+        await this.attest();
+        const b = validate(AccountBalanceSchema, await this.o.chain.viewAccount(this.o.config.accountId));
+        const now = this.o.clock.now();
+        if (b.accountId === this.o.config.accountId && b.observedAt <= now && now - b.observedAt <= this.o.config.balanceMaxAgeMs)
+          fresh = { spendable: b.spendable, observedAt: b.observedAt, validUntil: b.observedAt + this.o.config.balanceMaxAgeMs };
+      } catch (e) { if (e instanceof BrokerError && e.code === 'MAINNET_REFUSED') throw e; }
+    }
     return this.o.store.read((r) => {
       this.agent(r, principal);
-      const input = validate(TransferInputSchema, raw);
       const e = this.evaluation(r, { ...input, agentId: principal.agentId, requestDigest: this.digest(principal.agentId, input) }, null);
+      if (fresh) e.usage.balance = fresh;
       return { decision: this.evaluator.evaluate(e), policyRevision: e.agentPolicy?.revision ?? null, at: e.now };
     });
   }
@@ -336,6 +369,7 @@ export class BrokerService implements BrokerPort {
         const request = must(tx.getRequest(requestId));
         const decision = this.evaluator.evaluate(this.evaluation(tx, request, request.id));
         if (decision.kind === 'deny') throw new BrokerError(decision.reasons[0]!);
+        if (tx.getPolicy(request.agentId)?.revision !== request.policyRevision) throw new BrokerError('POLICY_CHANGED');
         const approved = this.auditCall(() => this.o.approvals.approve(tx, { requestId, approvalId: randomUUID(), expiresAt, now: this.o.clock.now() }));
         if (approved.state !== 'approved') return approved;
         const queued: TransferRequest = { ...approved, state: 'queued', updatedAt: this.o.clock.now() };
@@ -417,38 +451,84 @@ export class BrokerService implements BrokerPort {
   async expirePending(): Promise<void> {
     this.o.store.withImmediateTransaction((tx) => {
       const requests = pages((q) => tx.listRequests({ states: ['pending_approval'] }, q));
-      for (const request of requests) expirePending(tx, request.id, this.o.clock.now(), this.receipts);
+      for (const request of requests) {
+        // A backwards wall-clock step cannot expire a newer reservation.
+        if (this.o.clock.now() >= request.updatedAt) expirePending(tx, request.id, this.o.clock.now(), this.receipts);
+      }
     });
   }
   async reconcile(p: OwnerPrincipal, requestId?: string) {
     this.owner(p);
-    // Always reconcile the whole lane first, even when a single ID was requested.
-    // An ID filter must never let a later nonce leapfrog an ambiguous predecessor.
-    await this.drain();
-    return { requests: this.o.store.read((r) => requestId === undefined
-      ? pages((q) => r.listRequests({}, q)) : [must(r.getRequest(requestId))]), at: this.o.clock.now() };
+    if (requestId !== undefined) this.o.store.read((r) => must(r.getRequest(requestId)));
+    return { requests: await this.run(false, requestId), at: this.o.clock.now() };
+  }
+  async resolveAttempt(p: OwnerPrincipal, requestId: string, reason: string): Promise<TransferRequest> {
+    this.owner(p);
+    if (typeof reason !== 'string' || !reason.trim() || reason.length > 1024 || !reason.isWellFormed()) throw new BrokerError('FORBIDDEN');
+    // Pump excludes concurrent reconciliation; lane excludes dispatch and owner
+    // policy/freeze writes. Execution/inclusion evidence always vetoes override.
+    return this.pump.run(async () => {
+      const attempt = this.o.store.read((r) => {
+        const request = must(r.getRequest(requestId));
+        if (!['signed', 'submitted', 'outcome_unknown'].includes(request.state)) throw new BrokerError('FORBIDDEN');
+        return must(r.listAttempts(requestId).find((a) => a.txHash === request.txHash));
+      });
+      const outcome = await this.status(attempt);
+      if (outcome.kind === 'succeeded' || outcome.kind === 'failed' || outcome.kind === 'pending') throw new BrokerError('FORBIDDEN');
+      return this.lane.run(async () => this.finishAttempt(attempt, 'owner_attested', reason,
+        outcome.kind === 'not_executed' ? outcome.evidence : 'Owner attests no execution; chain evidence unavailable'));
+    });
   }
   async drain(): Promise<void> {
     await this.o.hooks?.beforeDispatch?.();
-    return this.lane.run(async () => {
+    await this.run(true);
+  }
+  private outstanding(r: StoreReader) {
+    return pages((q) => r.listRequests({ states: ['signed', 'submitted', 'outcome_unknown'] }, q))
+      .map((request) => ({ request, attempt: must(r.listAttempts(request.id).find((a) => a.txHash === request.txHash)) }))
+      .sort((a, b) => a.attempt.nonce < b.attempt.nonce ? -1 : a.attempt.nonce > b.attempt.nonce ? 1 : 0);
+  }
+  private async run(dispatchQueued: boolean, requestId?: string): Promise<TransferRequest[]> {
+    return this.pump.run(async () => {
       await this.expirePending();
-      await this.refreshLocked();
-      // Recover requests rather than trusting outbox ID order (or omitting a
-      // proven_not_executed attempt persisted immediately before a crash).
-      const outstanding = this.o.store.read((r) => pages((q) => r.listRequests({ states: ['signed', 'submitted', 'outcome_unknown'] }, q))
-        .map((request) => ({ request, attempt: must(r.listAttempts(request.id).find((a) => a.txHash === request.txHash)) }))
-        .sort((a, b) => a.attempt.nonce < b.attempt.nonce ? -1 : a.attempt.nonce > b.attempt.nonce ? 1 : 0));
-      for (const { request, attempt } of outstanding) if (!await this.recover(request, attempt)) return;
-      const queued = this.o.store.read((r) => pages((q) => r.listRequests({ states: ['queued', 'approved'] }, q)))
-        .sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1));
-      for (const request of queued) {
-        const current = this.o.store.withImmediateTransaction((tx) => this.authorizeQueued(tx, request.id));
-        if (!current) continue;
-        const attempt = await this.sign(current);
-        if (!attempt) continue;
-        await this.o.hooks?.afterPersistSigned?.(attempt);
-        if (!await this.send(attempt)) return;
+      const touched = new Set<string>(); const skipped = new Set<string>();
+      for (;;) {
+        // Re-read after EVERY attempt. Owner mutations queued behind the current
+        // broadcast acquire the lane before the next item. FINAL polling is never
+        // inside that lane, so even a hung status call cannot delay a freeze.
+        const existing = this.o.store.read((r) => this.outstanding(r)[0]);
+        if (existing) {
+          if (requestId !== undefined && existing.request.id !== requestId) break;
+          touched.add(existing.request.id);
+          if (!await this.recover(existing.request, existing.attempt)) break;
+          continue;
+        }
+        if (!dispatchQueued) break;
+        const next = this.o.store.read((r) => pages((q) => r.listRequests({ states: ['queued', 'approved'] }, q)))
+          .filter((r) => !skipped.has(r.id))
+          .sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1))[0];
+        if (!next) break;
+        skipped.add(next.id);
+        const attempt = await this.lane.run(async () => {
+          await this.refreshLocked();
+          const current = this.o.store.withImmediateTransaction((tx) => this.authorizeQueued(tx, next.id));
+          if (!current) return null;
+          const attempt = await this.sign(current);
+          if (attempt) {
+            await this.o.hooks?.afterPersistSigned?.(attempt);
+            await this.send(attempt);
+          }
+          return attempt;
+        });
+        if (attempt) {
+          touched.add(attempt.requestId);
+          // Query/settle before any later nonce; no blind duplicate replacement.
+          const current = this.o.store.read((r) => must(r.getRequest(attempt.requestId)));
+          const stored = this.o.store.read((r) => must(r.listAttempts(current.id).find((a) => a.txHash === current.txHash)));
+          if (!await this.observe(stored, await this.status(stored))) break;
+        }
       }
+      return this.o.store.read((r) => [...touched].map((id) => must(r.getRequest(id))));
     });
   }
   private authorizeQueued(tx: StoreTransaction, id: string): TransferRequest | null {
@@ -457,11 +537,12 @@ export class BrokerService implements BrokerPort {
     const now = this.o.clock.now();
     if (request.expiresAt !== null && now >= request.expiresAt) { this.finishUnsent(tx, request, 'expired', 'Queue expired'); return null; }
     const e = this.evaluation(tx, request, request.id);
-    const decision = this.evaluator.evaluate(e);
+    const decision = this.boundDecision(tx, e);
     if (decision.kind === 'deny') {
       // Freezes pause work, preserving its reservation. Other hard failures
       // deny unsent requests, but can never release an ambiguous payment.
-      if (decision.reasons.includes('GLOBAL_FROZEN') || decision.reasons.includes('AGENT_FROZEN')) return null;
+      if (decision.reasons.includes('GLOBAL_FROZEN') || decision.reasons.includes('AGENT_FROZEN')
+        || (decision.reasons.length === 1 && decision.reasons.includes('WALLET_CAPACITY') && this.stale(tx))) return null;
       this.finishUnsent(tx, request, 'denied', 'Dispatch denied', decision); return null;
     }
     if (decision.kind === 'needs_approval') {
@@ -498,10 +579,15 @@ export class BrokerService implements BrokerPort {
         return null;
       }
       const e = this.evaluation(tx, current, current.id);
-      const decision = this.evaluator.evaluate(e);
+      const decision = this.boundDecision(tx, e);
       if (decision.kind !== 'allow' && decision.kind !== 'allow_via_standing_approval') return null;
-      const approvalRef = decision.kind === 'allow_via_standing_approval'
-        ? reserveStandingApproval(tx, current, decision.standingApprovalId, this.o.clock.now()) : current.approvalRef;
+      const standingId = current.approvalRef?.kind === 'standing' ? current.approvalRef.id
+        : decision.kind === 'allow_via_standing_approval' ? decision.standingApprovalId : null;
+      const approvalRef = standingId === null ? current.approvalRef
+        : reserveStandingApproval(tx, current, standingId, this.o.clock.now());
+      if (!prior && approvalRef?.id !== current.approvalRef?.id) {
+        this.decisionReceipt(tx, { ...current, approvalRef }, decision);
+      }
       const now = this.o.clock.now();
       const attempt: TxAttempt = { id: randomUUID(), requestId: request.id, nonce, publicKey: this.o.signer.publicKey,
         blockHash: block.hash, signedTxBase64: signed.signedTxBase64, txHash: signed.txHash, status: 'signed', receiptIds: [],
@@ -520,7 +606,7 @@ export class BrokerService implements BrokerPort {
     });
   }
   private async status(attempt: TxAttempt): Promise<ChainOutcome> {
-    try { return await this.o.chain.txStatus(attempt.txHash, this.o.config.accountId); }
+    try { return await this.o.chain.txStatus(attempt.txHash, this.o.config.accountId, attempt); }
     catch { return { kind: 'outcome_unknown', reason: 'Status unavailable' }; }
   }
   private unknown(attempt: TxAttempt, reason: string): void {
@@ -543,12 +629,11 @@ export class BrokerService implements BrokerPort {
     this.event(tx, { type: 'submitted', payload: { requestId: request.id, agentId: request.agentId, attemptId: attempt.id, txHash: attempt.txHash, phase: 'acknowledged' } }, request.agentId);
     return next;
   }
-  /** Return false to pause the nonce lane. A freeze check and intent receipt
-   * commit precede broadcast while the same lane as freeze mutations is held. */
-  private async send(attempt: TxAttempt): Promise<boolean> {
+  /** Caller holds the per-attempt lane, never the whole queue or FINAL polling. */
+  private async send(attempt: TxAttempt): Promise<void> {
     const ready = this.o.store.withImmediateTransaction((tx) => {
       const request = must(tx.getRequest(attempt.requestId));
-      const decision = this.evaluator.evaluate(this.evaluation(tx, request, request.id));
+      const decision = this.boundDecision(tx, this.evaluation(tx, request, request.id));
       if (decision.kind !== 'allow' && decision.kind !== 'allow_via_standing_approval') return false;
       if (decision.kind === 'allow_via_standing_approval'
         && (request.approvalRef?.kind !== 'standing' || request.approvalRef.id !== decision.standingApprovalId)) return false;
@@ -556,7 +641,7 @@ export class BrokerService implements BrokerPort {
         attemptId: attempt.id, txHash: attempt.txHash, phase: 'intent' } }, request.agentId);
       return true;
     });
-    if (!ready) return false;
+    if (!ready) return;
     // Network attestation failures before invocation are NOT execution evidence.
     await this.attest();
     let result;
@@ -568,43 +653,108 @@ export class BrokerService implements BrokerPort {
         tx.putAttempt({ ...attempt, status: 'submitted', updatedAt: this.o.clock.now() });
         this.acknowledged(tx, must(tx.getRequest(attempt.requestId)), attempt);
       });
-      const outcome = await this.status(attempt);
-      if (outcome.kind === 'succeeded' || outcome.kind === 'failed') { this.settle(attempt, outcome); return true; }
-      // A pending response is not final; keep all holds and pause newer nonces.
-      this.unknown({ ...attempt, status: 'submitted' }, 'Execution not final'); return false;
+      return;
     }
-    // Rejection is not proof. Query status; only positive evidence can replace.
+    // Rejection is not proof. Query status outside the lane before replacement.
     this.unknown(attempt, 'Broadcast acknowledgment unavailable');
-    const current = this.o.store.read((r) => must(r.getRequest(attempt.requestId)));
-    return this.recover(current, { ...attempt, status: 'outcome_unknown' }, false);
   }
-  private async recover(request: TransferRequest, attempt: TxAttempt, allowReplace = true): Promise<boolean> {
-    if (attempt.status === 'proven_not_executed') {
-      if (!allowReplace) return false;
-      const decision = this.o.store.read((r) => this.evaluator.evaluate(this.evaluation(r, request, request.id)));
-      if (decision.kind === 'deny' || decision.kind === 'needs_approval') return false;
-      const replacement = await this.sign(request, attempt);
-      if (!replacement) return false;
-      await this.o.hooks?.afterPersistSigned?.(replacement);
-      return this.send(replacement);
+  private neverOffered(r: StoreReader, attempt: TxAttempt): boolean {
+    let after = 0;
+    for (;;) {
+      const events = r.listReceipts(`agent:${must(r.getRequest(attempt.requestId)).agentId}`, after, 1000);
+      if (!events.length) return true;
+      if (events.some((e) => e.type === 'submitted' && e.payload.attemptId === attempt.id)) return false;
+      after = events.at(-1)!.seq;
     }
-    const outcome = await this.status(attempt);
-    if (outcome.kind === 'succeeded' || outcome.kind === 'failed') { this.settle(attempt, outcome); return true; }
-    if (outcome.kind === 'not_executed') {
-      this.o.store.withImmediateTransaction((tx) => {
-        const current = must(tx.getRequest(request.id));
-        if (current.state !== 'outcome_unknown') tx.updateRequest({ ...current, state: 'outcome_unknown', updatedAt: this.o.clock.now() }, current.state);
-        tx.putAttempt({ ...attempt, status: 'proven_not_executed', nonExecutionEvidence: outcome.evidence, updatedAt: this.o.clock.now() });
-        this.event(tx, { type: 'outcome_unknown', payload: { requestId: request.id, agentId: request.agentId,
-          attemptId: attempt.id, txHash: attempt.txHash, reason: 'Positive non-execution evidence; replacement pending' } }, request.agentId);
-      });
-      // Defer replacement until a later drain. This durable proof boundary is
-      // restart-safe and prevents an unbounded reject/proof/re-sign retry loop.
+  }
+  private finishAttempt(attempt: TxAttempt, basis: 'owner_attested' | 'chain_proof' | 'never_offered', reason: string, evidence: string): TransferRequest {
+    return this.o.store.withImmediateTransaction((tx) => {
+      const current = must(tx.getRequest(attempt.requestId));
+      const stored = must(tx.listAttempts(current.id).find((a) => a.id === attempt.id));
+      if (current.txHash !== attempt.txHash || !['signed', 'submitted', 'outcome_unknown'].includes(current.state)) throw new BrokerError('FORBIDDEN');
+      if (basis === 'never_offered' && !this.neverOffered(tx, stored)) throw new BrokerError('FORBIDDEN');
+      if (basis === 'chain_proof' && stored.status !== 'proven_not_executed') throw new BrokerError('FORBIDDEN');
+      if (stored.status !== 'proven_not_executed') tx.putAttempt({ ...stored, status: 'failed', gasBurnt: 0n, tokensBurnt: 0n, updatedAt: this.o.clock.now() });
+      const next: TransferRequest = { ...current, state: 'failed', gasBurnt: 0n, tokensBurnt: 0n,
+        updatedAt: this.o.clock.now(), completedAt: this.o.clock.now() };
+      tx.updateRequest(next, current.state);
+      this.release(tx, next);
+      this.accounting(tx, next, 'gas_charged', 0n);
+      this.event(tx, { type: 'failed', payload: { requestId: current.id, agentId: current.agentId, txHash: attempt.txHash,
+        receiptIds: [], gasBurnt: '0', tokensBurnt: '0', reason, resolution: { attemptId: attempt.id, basis, evidence } } }, current.agentId, true);
+      return next;
+    });
+  }
+  private async observe(attempt: TxAttempt, outcome: ChainOutcome): Promise<boolean> {
+    return this.lane.run(async () => {
+      if (outcome.kind === 'succeeded' || outcome.kind === 'failed') { this.settle(attempt, outcome); return true; }
+      if (outcome.kind === 'pending') {
+        this.o.store.withImmediateTransaction((tx) => {
+          tx.putAttempt({ ...attempt, status: 'submitted', updatedAt: this.o.clock.now() });
+          this.acknowledged(tx, must(tx.getRequest(attempt.requestId)), attempt);
+        });
+        return false;
+      }
+      if (outcome.kind === 'not_executed') {
+        this.o.store.withImmediateTransaction((tx) => {
+          const current = must(tx.getRequest(attempt.requestId));
+          if (current.state !== 'outcome_unknown') tx.updateRequest({ ...current, state: 'outcome_unknown', updatedAt: this.o.clock.now() }, current.state);
+          tx.putAttempt({ ...attempt, status: 'proven_not_executed', nonExecutionEvidence: outcome.evidence, updatedAt: this.o.clock.now() });
+          this.event(tx, { type: 'outcome_unknown', payload: { requestId: current.id, agentId: current.agentId,
+            attemptId: attempt.id, txHash: attempt.txHash, reason: 'Positive non-execution evidence; replacement pending' } }, current.agentId);
+        });
+        return false; // durable proof boundary; at most one replacement per drain
+      }
+      this.unknown(attempt, 'Final execution evidence unavailable');
       return false;
+    });
+  }
+  private async recover(request: TransferRequest, attempt: TxAttempt): Promise<boolean> {
+    if (attempt.status !== 'proven_not_executed') {
+      const outcome = await this.status(attempt);
+      if (outcome.kind !== 'outcome_unknown') return this.observe(attempt, outcome);
     }
-    if (attempt.status === 'signed') return this.send(attempt); // identical durable bytes, never a new signature
-    this.unknown(attempt, 'Final execution evidence unavailable');
-    return false;
+    const next = await this.lane.run(async () => {
+      const unoffered = this.o.store.read((r) => this.neverOffered(r, attempt));
+      let decision = this.o.store.read((r) => this.boundDecision(r, this.evaluation(r, request, request.id)));
+      // Positive exclusion (or never-offered evidence) needs no live wallet RPC
+      // to release work already prohibited by revocation/freeze/policy. A stale
+      // balance alone, however, is retryable and must not terminally deny work.
+      const certain = attempt.status === 'proven_not_executed' || unoffered;
+      const hardDenied = decision.kind === 'needs_approval' || (decision.kind === 'deny'
+        && !decision.reasons.includes('GLOBAL_FROZEN') && decision.reasons.some((reason) => reason !== 'WALLET_CAPACITY'));
+      if (certain && hardDenied) {
+        this.finishAttempt(attempt, unoffered ? 'never_offered' : 'chain_proof', 'Authorization no longer permits transfer',
+          unoffered ? 'Broker evidence: no submission intent or acknowledgment exists' : must(attempt.nonExecutionEvidence));
+        return true;
+      }
+      await this.refreshLocked();
+      decision = this.o.store.read((r) => this.boundDecision(r, this.evaluation(r, request, request.id)));
+      if (decision.kind === 'deny' || decision.kind === 'needs_approval') {
+        const reasons: readonly string[] = decision.reasons;
+        if (reasons.includes('GLOBAL_FROZEN') || (reasons.length === 1 && reasons.includes('WALLET_CAPACITY') && this.o.store.read((r) => this.stale(r)))) return null;
+        if (attempt.status === 'proven_not_executed' || unoffered) {
+          this.finishAttempt(attempt, unoffered ? 'never_offered' : 'chain_proof', 'Authorization no longer permits transfer',
+            unoffered ? 'Broker evidence: no submission intent or acknowledgment exists' : must(attempt.nonExecutionEvidence));
+          return true;
+        }
+        return null; // already offered: a per-agent freeze cannot undo ambiguity
+      }
+      let send = attempt;
+      if (attempt.status === 'proven_not_executed') {
+        const replacement = await this.sign(request, attempt);
+        if (!replacement) return null;
+        send = replacement;
+        await this.o.hooks?.afterPersistSigned?.(send);
+      }
+      // Safe even for outcome_unknown: rebroadcast the EXACT durable bytes.
+      await this.send(send);
+      return send;
+    });
+    if (next === true) return true;
+    if (next === null) return false;
+    const stored = this.o.store.read((r) => must(r.listAttempts(next.requestId).find((a) => a.id === next.id)));
+    return this.observe(stored, await this.status(stored));
   }
   private settle(attempt: TxAttempt, outcome: Extract<ChainOutcome, { kind: 'succeeded' | 'failed' }>): void {
     this.o.store.withImmediateTransaction((tx) => {

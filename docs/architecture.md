@@ -566,3 +566,63 @@ explicit nonce use. Do **not** use Account.transfer/signAndSendTransaction for
 dispatch: their convenience nonce/retry behavior bypasses the persisted outbox
 contract. The offline contract test creates nonce 123n, signs a native transfer,
 and verifies both class and root helper signed codecs without contacting RPC.
+
+## B06 review amendment: liveness and explicit resolution
+
+This coordinator-authorized amendment takes precedence over earlier statements
+about indefinitely paused signed work. One daemon process per custody key remains
+a deployment prerequisite (B08 must enforce exclusive process ownership).
+
+The dispatch pump is serialized separately from the per-attempt authorization
+lane. Acquire/release that lane for each attempt, re-reading live queue state and
+refreshing stale balance before the next attempt. Freeze/policy/revocation writes
+share the final authorization/broadcast boundary, not the entire queue or FINAL
+status polling. Stale-only WALLET_CAPACITY pauses admitted work; it never
+terminally denies it. Pending execution remains submitted with its hold active.
+Rebroadcast identical persisted bytes for signed AND outcome_unknown attempts;
+never re-sign without positive exclusion evidence. Reconciliation examines only
+existing attempts (and returns only examined requests), never queued payments.
+Preview may fetch an ephemeral balance but writes no balance/request/hold/receipt.
+A backwards clock step skips pending expirations newer than the clock.
+
+NearChain.txStatus accepts an optional persisted TxAttempt (the two-argument
+form remains compatible). The native adapter validates its signed bytes and binds
+hash/signer/key/nonce/block before proving exclusion. A structured
+UNKNOWN_TRANSACTION lookup plus a pinned final access-key nonce >= attempt nonce
+proves that nonce cannot execute anew. Alternatively a final head strictly past
+the signed block height + protocol transaction_validity_period establishes
+expiry. Both paths require a second UNKNOWN_TRANSACTION lookup AFTER the final
+observation. Timeouts, arbitrary error strings, missing fields, an unpinned key
+view or a head merely at the validity boundary never prove exclusion. Any positive
+transaction/inclusion evidence vetoes exclusion even if final fee data is missing.
+Proof is retained in nonExecutionEvidence and through restart. When replacement
+is no longer authorized, positively proven-unexecuted work may fail with zero
+burn and release its hold rather than wedge unrelated agents.
+
+Broker-evidenced abandonment is permitted ONLY for a never-offered attempt:
+there is no durable submission-intent or acknowledged receipt for that attempt,
+and the broker has never invoked broadcast (intent MUST commit before invocation).
+Under the shared lane, a revoked/frozen agent or other failed authorization may
+abandon such an attempt, mark it failed with zero burn, release its hold and let
+other agents proceed with strictly higher nonces. It can never be revived or
+rebroadcast. Global freeze still pauses the lane. Already-offered ambiguous work
+cannot use this exception. A standing grant remains bound to the exact grant in
+the decision receipt; signing must re-reserve that same grant. A benign revision
+mismatch at owner approval returns the stable POLICY_CHANGED code.
+
+OwnerBrokerService.resolveAttempt(owner, requestId, reason) is an explicit
+owner-attested **zero-execution** resolution for a stuck current attempt. Reason
+must be nonempty, well-formed and <=1024 characters. Authenticate the owner as
+usual; serialize against dispatch/reconciliation, query current chain evidence,
+and REFUSE resolution if pending, successful or failed execution is observed.
+With unknown evidence the owner explicitly accepts responsibility for the
+attestation; this is not an automatic proof or a gas estimate. Resolution fails
+that request with zero burn, releases its hold, never creates a replacement, and
+atomically appends a failed receipt on BOTH owner and affected-agent chains.
+The backward-compatible optional failed.payload.resolution is
+{attemptId,basis:owner_attested|chain_proof|never_offered,evidence}; failed.reason
+records the mandatory explanation. Automatic proof/never-offered abandonment uses
+the same explicit resolution metadata. These receipts distinguish attestation
+from measured chain failure. Receipt failure rolls back the entire resolution.
+Externally pin exported checkpoints using the existing B13 list API; the legacy
+receipt-array export remains unchanged.

@@ -168,7 +168,7 @@ describe('approval/checkpoint/owner integration seams (type-level regression)', 
   });
   it('provides owner reads, permanent revokeAgent and accounting access without trusting agent args', () => {
     for (const operation of ['listAgents', 'getPolicy', 'listStandingApprovals', 'walletStatus',
-      'getFreeze', 'getRequest', 'auditPublicKey', 'revokeAgent'] as const) {
+      'getFreeze', 'getRequest', 'auditPublicKey', 'revokeAgent', 'resolveAttempt'] as const) {
       expectTypeOf<Parameters<OwnerBrokerService[typeof operation]>[0]>().toEqualTypeOf<OwnerPrincipal>();
     }
     expectTypeOf<ReturnType<OwnerBrokerService['getRequest']>>().toEqualTypeOf<Promise<TransferView>>();
@@ -251,6 +251,19 @@ describe('complete correlated receipt vocabulary', () => {
     expect(AppendReceiptSchema.safeParse({ ...scoped, type: 'queued', payload: { requestId: 'r', agentId: 'other' } }).success).toBe(false);
     expect(AppendReceiptSchema.safeParse({ ...scoped, type: 'agent_created', payload: { agent: { ...agent, id: 'other' } } }).success).toBe(false);
     expect(AppendReceiptSchema.safeParse({ ...scoped, type: 'standing_approval_granted', payload: { agentId: 'a', approval: { ...approval, agentId: 'other' } } }).success).toBe(false);
+  });
+  it('supports explicit, backward-compatible zero-execution resolution receipts', () => {
+    const base = { chainId: 'agent:a', at: 1, type: 'failed', payload: { ...settlement, receiptIds: [], gasBurnt: '0', tokensBurnt: '0', reason: 'Owner investigated',
+      resolution: { attemptId: 't', basis: 'owner_attested', evidence: 'Owner attests no execution' } } };
+    expect(AppendReceiptSchema.safeParse(base).success).toBe(true);
+    expect(AppendReceiptSchema.safeParse({ ...base, chainId: 'owner' }).success).toBe(true);
+    for (const resolution of [{}, { ...base.payload.resolution, basis: 'timeout' }, { ...base.payload.resolution, evidence: '' }]) {
+      expect(AppendReceiptSchema.safeParse({ ...base, payload: { ...base.payload, resolution } }).success).toBe(false);
+    }
+    expect(AppendReceiptSchema.safeParse({ ...base, payload: { ...base.payload, reason: '' } }).success).toBe(false);
+    expect(AppendReceiptSchema.safeParse({ ...base, payload: { ...base.payload, tokensBurnt: '1' } }).success).toBe(false);
+    expectTypeOf<Parameters<OwnerBrokerService['resolveAttempt']>>().toEqualTypeOf<[OwnerPrincipal, string, string]>();
+    expectTypeOf<ReturnType<OwnerBrokerService['resolveAttempt']>>().toEqualTypeOf<Promise<TransferRequest>>();
   });
   it('has schemas for exactly every event and pins submitted phase and approval amounts', () => {
     expect(Object.keys(RECEIPT_PAYLOAD_SCHEMAS)).toEqual([...RECEIPT_EVENT_TYPES]);

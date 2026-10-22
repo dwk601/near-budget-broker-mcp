@@ -11,6 +11,15 @@ class Lane {
   }
 }
 const lanes = new Map<string, Lane>();
+const pumps = new Map<string, Lane>();
+/** Drain serialization is separate from the short authorization/broadcast lane:
+ * owner kill switches never wait behind a whole queue or FINAL-status polling. */
+export function custodyPump(accountId: string, publicKey: string): Lane {
+  const key = `testnet:${accountId}:${publicKey}`;
+  let pump = pumps.get(key);
+  if (!pump) { pump = new Lane(); pumps.set(key, pump); }
+  return pump;
+}
 export function custodyLane(accountId: string, publicKey: string): Lane {
   const key = `testnet:${accountId}:${publicKey}`;
   let lane = lanes.get(key);
