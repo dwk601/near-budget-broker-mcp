@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { ALLOWED_TRANSITIONS, BrokerError, TRANSFER_STATES } from '../../src/contracts/index.js';
 import type { Hold, TransferRequest, TransferState, TxAttempt } from '../../src/contracts/index.js';
 import { SCHEMA_VERSION, SqliteStore } from '../../src/storage/index.js';
+import { migrate } from '../../src/storage/migrations.js';
 import { ACCOUNT, HASH, HASH2, KEY, NOW, agent, attempt, checkpoint, policy, receipt, request } from './fixtures.js';
 
 const KEY2 = `ed25519:${'2'.repeat(32)}`;
@@ -52,9 +53,9 @@ describe('complete request transition and identity guards', () => {
   it.each(TRANSFER_STATES.flatMap((from) => TRANSFER_STATES.map((to) => ({ from, to }))))('$from -> $to matches ALLOWED_TRANSITIONS', ({ from, to }) => {
     const store = open(); signed(store);
     const r = seedState(store, from);
-    // Settle the attempt first for terminal targets. This ensures rejection is
-    // actually the transition guard, not the new outbox-coherence guard.
-    if (['denied', 'rejected', 'expired', 'cancelled', 'succeeded', 'failed'].includes(to)) {
+    // Resolve the attempt for all targets outside the post-signing lane. This
+    // isolates ALLOWED_TRANSITIONS from the independently tested coherence guard.
+    if (!['signed', 'submitted', 'outcome_unknown'].includes(to)) {
       store.transaction((tx) => tx.putAttempt({ ...attempt(), status: 'failed' }));
     }
     const operation = () => store.transaction((tx) => tx.updateRequest({ ...r, state: to }, from));
@@ -85,22 +86,75 @@ describe('complete request transition and identity guards', () => {
     expect(store.read((v) => v.listOutbox({ limit: 10 }).items)).toEqual([]);
   });
 
-  it.each(['cancelled', 'expired', 'denied', 'failed', 'succeeded'] as const)('cannot enter %s with unresolved signed bytes in the outbox', (state) => {
-    const store = open(); signed(store);
-    const from = state === 'succeeded' ? 'submitted' : state === 'failed' ? 'signed' : 'queued';
-    const r = seedState(store, from);
-    errorCode(() => store.transaction((tx) => tx.updateRequest({ ...r, state }, from)));
-    expect(store.read((v) => v.getHold('r'))).toEqual(h);
-    expect(store.read((v) => v.listOutbox({ limit: 10 }).items)).toHaveLength(1);
-    store.transaction((tx) => {
-      tx.putAttempt({ ...attempt(), status: state === 'succeeded' ? 'succeeded' : 'failed' });
-      tx.updateRequest({ ...r, state }, from);
-    });
-    expect(store.read((v) => v.listOutbox({ limit: 10 }).items)).toEqual([]);
+  it.each((['signed', 'submitted', 'outcome_unknown'] as const).flatMap((status) =>
+    (['cancelled', 'expired', 'denied', 'rejected', 'failed', 'succeeded'] as const).map((state) => ({ status, state }))))(
+    'cannot enter $state with an unresolved $status attempt', ({ status, state }) => {
+      const store = open(); signed(store);
+      const from = state === 'succeeded' ? 'submitted' : state === 'failed' ? 'signed' : state === 'rejected' ? 'pending_approval' : 'queued';
+      const r = seedState(store, from);
+      const a = { ...attempt(), status };
+      store.transaction((tx) => tx.putAttempt(a));
+      errorCode(() => store.transaction((tx) => tx.updateRequest({ ...r, state }, from)));
+      expect(store.read((v) => v.getRequest('r'))).toEqual(r);
+      expect(store.read((v) => v.getHold('r'))).toEqual(h);
+      expect(store.read((v) => v.listOutbox({ limit: 10 }).items)).toEqual([a]);
+      store.transaction((tx) => {
+        tx.putAttempt({ ...a, status: state === 'succeeded' ? 'succeeded' : 'failed' });
+        tx.updateRequest({ ...r, state }, from);
+      });
+      expect(store.read((v) => v.listOutbox({ limit: 10 }).items)).toEqual([]);
+    },
+  );
+
+  it.each((['signed', 'submitted', 'outcome_unknown'] as const).flatMap((status) =>
+    (['pending_approval', 'approved', 'queued'] as const).map((state) => ({ status, state }))))(
+    'cannot return to $state with an unresolved $status attempt', ({ status, state }) => {
+      const store = open(); signed(store);
+      const from = state === 'pending_approval' ? 'queued' : state === 'approved' ? 'pending_approval' : 'approved';
+      const r = seedState(store, from);
+      const a = { ...attempt(), status };
+      store.transaction((tx) => tx.putAttempt(a));
+      errorCode(() => store.transaction((tx) => tx.updateRequest({ ...r, state }, from)));
+      expect(store.read((v) => v.getRequest('r'))).toEqual(r);
+      expect(store.read((v) => v.getHold('r'))).toEqual(h);
+      expect(store.read((v) => v.listOutbox({ limit: 10 }).items)).toEqual([a]);
+    },
+  );
+
+  it('blocks the queued-to-approval race after bytes are persisted but before the request is signed', () => {
+    const store = open(); const r = request();
+    store.transaction((tx) => { tx.insertRequest(r); tx.putHold(h); tx.allocateNonce(KEY, 0n); tx.putAttempt(attempt()); });
+    // No raw state seeding: this is the legitimate intermediate persistence order.
+    errorCode(() => store.transaction((tx) => tx.updateRequest({ ...r, state: 'pending_approval' }, 'queued')));
+    expect(store.read((v) => v.getRequest('r'))).toEqual(r);
+    expect(store.read((v) => v.listOutbox({ limit: 10 }).items)).toEqual([attempt()]);
   });
 });
 
 describe('signed-attempt persistence and replacement guards', () => {
+  it('refuses a first signed attempt before request approval and queueing', () => {
+    const store = open();
+    const r = { ...request(), state: 'pending_approval' as const };
+    store.transaction((tx) => { tx.insertRequest(r); tx.allocateNonce(KEY, 0n); });
+    // Allocated nonce, null request hash and no prior attempts: only the
+    // request.state === queued check can reject this otherwise-valid attempt.
+    errorCode(() => store.transaction((tx) => tx.putAttempt(attempt())));
+    expect(store.read((v) => v.listAttempts('r'))).toEqual([]);
+    expect(store.read((v) => v.getRequest('r'))).toEqual(r);
+  });
+
+  it('refuses a second unevidenced attempt while the request is still queued', () => {
+    const store = open();
+    store.transaction((tx) => {
+      tx.insertRequest(request()); tx.allocateNonce(KEY, 0n); tx.putAttempt(attempt()); tx.allocateNonce(KEY, 0n);
+    });
+    // A different ID, hash and allocated nonce avoid every SQL uniqueness guard.
+    // The request is still queued with txHash=null, so only prior-attempt absence
+    // prevents this from bypassing replaceUnexecutedAttempt.
+    errorCode(() => store.transaction((tx) => tx.putAttempt(attempt('second', 'r', 2n, HASH2))));
+    expect(store.read((v) => v.listAttempts('r'))).toEqual([attempt()]);
+    expect(store.read((v) => v.getRequest('r'))).toEqual(request());
+  });
   it('refuses replacement while submitted even when the current attempt is proven unexecuted', () => {
     const store = open(); proven(store);
     store.transaction((tx) => {
@@ -195,6 +249,45 @@ describe('remaining mutation-sensitive store guards', () => {
     expect(reopened.read((v) => v.getUsageSnapshot('a', NOW + 778).balance)).toEqual({ spendable: 85n, observedAt: NOW, validUntil: NOW + 777 });
     reopened.transaction((tx) => tx.putBalance({ ...balance, observedAt: NOW + 1, spendable: 84n }, NOW + 1000));
     expect(reopened.read((v) => v.getUsageSnapshot('a', NOW + 1).balance)).toEqual({ spendable: 84n, observedAt: NOW + 1, validUntil: NOW + 1000 });
+  });
+
+  it.each([
+    { accountId: 'foreign.testnet', validUntil: NOW + 1 },
+    { accountId: ACCOUNT, validUntil: NOW - 1 },
+  ])('rejects invalid balance custody/freshness binding %o', ({ accountId, validUntil }) => {
+    const store = open();
+    const balance = { accountId, total: 100n, locked: 10n, storageReserve: 5n, spendable: 85n, observedAt: NOW, blockHash: HASH };
+    errorCode(() => store.transaction((tx) => tx.putBalance(balance, validUntil)));
+    expect(store.read((v) => v.getUsageSnapshot('a', NOW).balance)).toBeNull();
+    expect(store.read((v) => v.getWalletStatus(NOW).balance)).toBeNull();
+  });
+
+  it.each([{ tokenHash: 'b'.repeat(64) }, { agentId: 'b' }, { createdAt: NOW + 1 }])('keeps credential identity immutable %o', (patch) => {
+    const store = open();
+    const credential = { id: 'credential', agentId: 'a', tokenHash: 'a'.repeat(64), createdAt: NOW, revokedAt: null };
+    store.transaction((tx) => tx.putCredential(credential));
+    // Both agents are active, and the replacement hash is unused. No FK,
+    // uniqueness or credential-revocation rule masks identity immutability.
+    errorCode(() => store.transaction((tx) => tx.putCredential({ ...credential, ...patch })));
+    expect(store.read((v) => v.getCredential(credential.id))).toEqual(credential);
+    expect(store.read((v) => v.findCredentialByHash(credential.tokenHash))).toEqual(credential);
+    expect(store.read((v) => v.findCredentialByHash('b'.repeat(64)))).toBeNull();
+  });
+
+  it('refuses freeze records for an unknown agent', () => {
+    const store = open();
+    errorCode(() => store.transaction((tx) => tx.putFreeze({ scope: 'agent', agentId: 'missing', frozen: true, reason: 'stop', at: NOW })));
+    expect(store.read((v) => v.getFreeze('agent', 'missing'))).toBeNull();
+  });
+
+  it.each([false, true])('never refills standing usedTotal (revoked=%s)', (revoked) => {
+    const store = open();
+    const approval = { id: 'grant', agentId: 'a', perTxMax: 10n, totalMax: 20n, usedTotal: 10n, expiresAt: NOW + 1000,
+      ...(revoked ? { revokedAt: NOW } : {}) };
+    store.transaction((tx) => tx.putStandingApproval(approval));
+    // Revocation is unchanged; only the monotonic usage check can reject this.
+    errorCode(() => store.transaction((tx) => tx.putStandingApproval({ ...approval, usedTotal: 9n })));
+    expect(store.read((v) => v.getStandingApproval('grant'))).toEqual(approval);
   });
 
   it('requires the held principal to match the request, and keeps fees immutable', () => {
@@ -329,6 +422,56 @@ describe('file custody identity, migration and infrastructure failures', () => {
     errorCode(() => new SqliteStore(filename, { accountId: 'custody-b.testnet' }));
     const raw = new DatabaseSync(filename);
     try { expect(raw.prepare('PRAGMA user_version').get()?.['user_version']).toBe(1); } finally { raw.close(); }
+    expect(open(filename).read((v) => v.listOutbox({ limit: 10 }).items)).toEqual([attempt()]);
+  });
+
+  it('rejects a legacy balance account mismatch even without any local nonces', () => {
+    const filename = file(); const store = open(filename);
+    const balance = { accountId: ACCOUNT, total: 100n, locked: 10n, storageReserve: 5n, spendable: 85n, observedAt: NOW, blockHash: HASH };
+    store.transaction((tx) => tx.putBalance(balance, NOW + 1000));
+    expect(db(store).prepare('SELECT COUNT(*) AS n FROM nonces').get()?.['n']).toBe(0);
+    downgradeToV1(store); store.close();
+    errorCode(() => new SqliteStore(filename, { accountId: 'foreign.testnet' }));
+    const raw = new DatabaseSync(filename);
+    try {
+      expect(raw.prepare('PRAGMA user_version').get()?.['user_version']).toBe(1);
+      expect(raw.prepare("SELECT name FROM sqlite_master WHERE name = 'store_identity'").get()).toBeUndefined();
+    } finally { raw.close(); }
+    expect(open(filename).read((v) => v.getWalletStatus(NOW).balance)).toEqual(balance);
+  });
+
+  it('rolls back V2 DDL, identity and data on a mid-migration failure before the connection is closed', () => {
+    const filename = file(); const store = open(filename); signed(store); downgradeToV1(store); store.close();
+    const raw = new DatabaseSync(filename);
+    try {
+      const schema = raw.prepare('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name').all();
+      const attempts = raw.prepare('SELECT * FROM attempts').all();
+      const prepare = raw.prepare.bind(raw);
+      const failure = new Error('injected failure copying V1 signed bytes');
+      let reachedCopy = false;
+      const spy = vi.spyOn(raw, 'prepare').mockImplementation((sql) => {
+        if (sql.startsWith('INSERT INTO attempts(')) {
+          // Confirm the failure occurs AFTER the destructive rename/recreate,
+          // index DDL and identity insertion, not before migration starts.
+          reachedCopy = true;
+          expect(prepare('SELECT account_id FROM store_identity').get()?.['account_id']).toBe(ACCOUNT);
+          expect(prepare("SELECT name FROM pragma_table_info('attempts') WHERE name = 'account_id'").get()).not.toBeUndefined();
+          expect(prepare('SELECT * FROM attempts_v1').all()).toEqual(attempts);
+          throw failure;
+        }
+        return prepare(sql);
+      });
+      try { expect(() => migrate(raw, ACCOUNT)).toThrow(failure); } finally { spy.mockRestore(); }
+      expect(reachedCopy).toBe(true);
+      // These assertions run on the STILL OPEN connection: implicit rollback
+      // on close cannot hide a missing rollback in migrate's catch block.
+      expect(raw.prepare('PRAGMA user_version').get()?.['user_version']).toBe(1);
+      expect(raw.prepare('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name').all()).toEqual(schema);
+      expect(raw.prepare('SELECT * FROM attempts').all()).toEqual(attempts);
+      raw.exec('BEGIN IMMEDIATE; ROLLBACK');
+      migrate(raw, ACCOUNT);
+      expect(raw.prepare('PRAGMA user_version').get()?.['user_version']).toBe(SCHEMA_VERSION);
+    } finally { raw.close(); }
     expect(open(filename).read((v) => v.listOutbox({ limit: 10 }).items)).toEqual([attempt()]);
   });
 

@@ -322,7 +322,11 @@ class Transaction implements StoreTransaction {
     const attempts = this.listAttempts(request.id);
     if (['signed', 'submitted', 'outcome_unknown'].includes(request.state)) requireThat(request.txHash !== null);
     if (request.txHash !== null) requireThat(attempts.some((a) => a.txHash === request.txHash));
-    if (terminal.has(request.state)) requireThat(!attempts.some((a) => (OUTBOX_STATUSES as readonly string[]).includes(a.status)));
+    // Recoverable signed bytes may only remain in the post-signing lane.
+    // Never return them to approval/queueing or finalize around an unresolved send.
+    if (terminal.has(request.state) || ['pending_approval', 'approved', 'queued'].includes(request.state)) {
+      requireThat(!attempts.some((a) => (OUTBOX_STATUSES as readonly string[]).includes(a.status)));
+    }
     this.exec('UPDATE requests SET state = ?, data = ? WHERE id = ? AND state = ?', request.state, encode(request), request.id, expectedState);
   }
   putHold(input: Hold): void {
