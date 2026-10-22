@@ -4,7 +4,7 @@ import {
 } from '../../src/contracts/index.js';
 import type {
   AgentPolicy, PolicyDecision, PolicyEvaluationInput, ReasonCode, RequestApproval,
-  StandingApproval, UsageSnapshot,
+  StandingApproval,
 } from '../../src/contracts/index.js';
 import { evaluatePolicy, previewPolicy, PurePolicyEvaluator } from '../../src/policy/index.js';
 
@@ -77,6 +77,10 @@ describe('all hard admission rules', () => {
     ['wallet principal + fees + holds + safety', (i) => { i.usage.balance!.spendable = 81n; }, 'WALLET_CAPACITY'],
     ['missing balance', (i) => { i.usage.balance = null; }, 'WALLET_CAPACITY'],
     ['balance expired', (i) => { i.usage.balance!.validUntil = NOW - 1; }, 'WALLET_CAPACITY'],
+    ['balance validity expires before the default age bound', (i) => {
+      i.usage.balance!.observedAt = NOW - 5_000;
+      i.usage.balance!.validUntil = NOW - 1;
+    }, 'WALLET_CAPACITY'],
     ['future balance observation', (i) => { i.usage.balance!.observedAt = NOW + 1; }, 'WALLET_CAPACITY'],
     ['stale despite extended validUntil', (i) => { i.usage.balance!.observedAt = NOW - 10_001; }, 'WALLET_CAPACITY'],
     ['zero amount', (i) => { i.request.amount = 0n; }, 'INVALID_AMOUNT'],
@@ -295,13 +299,30 @@ describe('approval gate (strictly greater than threshold)', () => {
     i.usage.standingReserved = Object.fromEntries([['__proto__', value]]) as Record<string, bigint>;
     deny(i, 'INVALID_AMOUNT');
   });
-  test('uses an explicitly injected B12 matcher only after hard caps and local grant checks', () => {
+  test.each([
+    ['Map', new Map([['grant-a', 151n]])],
+    ['array', [151n]],
+    ['null', null],
+  ])('invalid %s reservation container fails closed rather than appearing empty', (_name, value) => {
+    const i = fixture(); withPolicy(i, { approvalThreshold: 0n }); i.standingApprovals = [grant()];
+    i.usage.standingReserved = value as unknown as Record<string, bigint>;
+    deny(i, 'INVALID_AMOUNT');
+  });
+  test('null-prototype reservation records remain supported and count in full', () => {
+    const i = fixture(); withPolicy(i, { approvalThreshold: 0n }); i.standingApprovals = [grant()];
+    const reservations: Record<string, bigint> = Object.create(null) as Record<string, bigint>;
+    reservations['grant-a'] = 151n;
+    i.usage.standingReserved = reservations;
+    expectDecision(i, { kind: 'needs_approval', reasons: ['APPROVAL_REQUIRED'] });
+  });
+  test.each([0n, 5n])('passes reservedTotal %s to the injected B12 matcher only after hard caps and local checks', (reservedTotal) => {
     const matcher = vi.fn(() => ({ kind: 'match' as const, approvalId: 'grant-a' }));
     const evaluator = new PurePolicyEvaluator({ matchStandingApproval: matcher });
     const i = fixture(); withPolicy(i, { approvalThreshold: 0n }); i.standingApprovals = [grant()];
+    i.usage.standingReserved['grant-a'] = reservedTotal;
     expect(evaluator.evaluate(i).kind).toBe('allow_via_standing_approval');
     expect(matcher).toHaveBeenCalledExactlyOnceWith({ approval: i.standingApprovals[0], agentId: i.agent.id,
-      receiverId: i.request.receiverId, amount: i.request.amount, reservedTotal: 0n, now: NOW });
+      receiverId: i.request.receiverId, amount: i.request.amount, reservedTotal, now: NOW });
     matcher.mockClear(); withPolicy(i, { perTxMax: 0n });
     expect(evaluator.evaluate(i)).toEqual({ kind: 'deny', reasons: ['PER_TX_EXCEEDED'] });
     expect(matcher).not.toHaveBeenCalled();
@@ -342,62 +363,35 @@ describe('approval gate (strictly greater than threshold)', () => {
   });
 });
 
-/** These are explicit Store-port vectors, not a replacement Store implementation.
- * The frozen evaluator has no settled/hold timestamps to filter. Build snapshots
- * according to the documented aggregation contract and assert their decisions. */
-describe('windowed usage snapshot contract vectors', () => {
-  type Event = { at: number; principal: bigint; fee: bigint; success: boolean };
-  function snapshot(now: number, settled: Event[], holds: { principal: bigint; fee: bigint }[], admissions: number[]): UsageSnapshot {
-    const u = fixture().usage;
-    const inDay = settled.filter((event) => event.at > now - DAY && event.at <= now);
-    const held = holds.reduce((total, hold) => total + hold.principal, 0n);
-    u.agentRolling24h = inDay.reduce((total, event) => total + (event.success ? event.principal : 0n), held);
-    u.walletRolling24h = u.agentRolling24h;
-    u.agentLifetime = settled.filter((event) => event.at <= now && event.success)
-      .reduce((total, event) => total + event.principal, held);
-    u.agentGas24h = inDay.reduce((total, event) => total + event.fee,
-      holds.reduce((total, hold) => total + hold.fee, 0n));
-    u.outstandingHolds = holds.reduce((total, hold) => total + hold.principal + hold.fee, 0n);
-    u.agentOutstanding = holds.length;
-    u.agentRequestsLastMinute = admissions.filter((at) => at > now - 60_000 && at <= now).length;
-    u.balance = { spendable: 5_000n, observedAt: now, validUntil: now + 10_000 };
-    return u;
-  }
-  test.each([-1, 0, 1, DAY, DAY + 1])('24h settled boundary offset %i uses exclusive cutoff / inclusive now', (offset) => {
-    const i = fixture();
-    withPolicy(i, { rolling24hMax: 20n, gasBudget24h: 2n });
-    i.usage = snapshot(NOW, [{ at: NOW - DAY + offset, principal: 1n, fee: 1n, success: true }], [], []);
-    if (offset > 0 && offset <= DAY) deny(i, 'ROLLING_24H_EXCEEDED', 'GAS_BUDGET_EXCEEDED');
-    else expectDecision(i, { kind: 'allow', reasons: [] });
-  });
-  test.each([-1, 0, 1, 60_000, 60_001])('minute boundary offset %i uses exclusive cutoff / inclusive now', (offset) => {
-    const i = fixture(); withPolicy(i, { ratePerMinute: 1 });
-    i.usage = snapshot(NOW, [], [], [NOW - 60_000 + offset]);
-    if (offset > 0 && offset <= 60_000) deny(i, 'RATE_LIMITED');
-    else expectDecision(i, { kind: 'allow', reasons: [] });
-  });
-  test('failed executions charge gas but not principal', () => {
-    const i = fixture(); withPolicy(i, { gasBudget24h: 2n, rolling24hMax: 20n, lifetimeMax: 20n });
-    i.usage = snapshot(NOW, [{ at: NOW, principal: 999n, fee: 1n, success: false }], [], []);
-    deny(i, 'GAS_BUDGET_EXCEEDED');
-  });
-  test.each(['pending_approval', 'queued', 'signed', 'submitted', 'outcome_unknown'])(
-    '%s active holds stay reserved arbitrarily beyond 24h', (_state) => {
-      for (const now of [NOW, NOW + DAY, NOW + DAY * 365]) {
-        const i = fixture(); i.now = now;
-        withPolicy(i, { rolling24hMax: 20n, lifetimeMax: 20n, gasBudget24h: 2n, maxOutstanding: 1 });
-        i.walletPolicy!.rolling24hMax = 20n;
-        // Holds deliberately have no time filter; settled rows can age out.
-        i.usage = snapshot(now, [], [{ principal: 1n, fee: 1n }], []);
-        deny(i, 'ROLLING_24H_EXCEEDED', 'LIFETIME_EXCEEDED', 'GLOBAL_CAP_EXCEEDED', 'GAS_BUDGET_EXCEEDED', 'MAX_OUTSTANDING');
-      }
+/** The evaluator sees totals, not accounting timestamps or request states.
+ * These tests ONLY prove consumption of pre-aggregated snapshots. B01/B06 must
+ * prove the exclusive 24h/minute cutoffs, own-hold exclusion and old unresolved
+ * (including outcome_unknown) hold inclusion against the real getUsageSnapshot.
+ * A test-local windowing/hold implementation would not prove those invariants. */
+describe('consumption of pre-aggregated Store totals (not Store windowing coverage)', () => {
+  test.each([NOW, NOW + DAY, NOW + DAY * 365])(
+    'supplied reserved totals are not discounted at evaluator time %i', (now) => {
+      const i = fixture(); i.now = now;
+      withPolicy(i, { rolling24hMax: 20n, lifetimeMax: 20n, gasBudget24h: 2n, maxOutstanding: 1 });
+      i.walletPolicy!.rolling24hMax = 20n;
+      Object.assign(i.usage, { agentRolling24h: 1n, agentLifetime: 1n, agentGas24h: 1n,
+        agentOutstanding: 1, walletRolling24h: 1n, outstandingHolds: 2n });
+      i.usage.balance = { spendable: 5_000n, observedAt: now, validUntil: now + 10_000 };
+      deny(i, 'ROLLING_24H_EXCEEDED', 'LIFETIME_EXCEEDED', 'GLOBAL_CAP_EXCEEDED', 'GAS_BUDGET_EXCEEDED', 'MAX_OUTSTANDING');
     },
   );
-  test('re-evaluation uses own-hold-excluded totals and does not subtract a second time', () => {
+  test('supplied gas-only usage does not consume principal caps', () => {
+    const i = fixture(); withPolicy(i, { gasBudget24h: 2n, rolling24hMax: 20n, lifetimeMax: 20n });
+    Object.assign(i.usage, { agentRolling24h: 0n, agentLifetime: 0n, agentGas24h: 1n });
+    deny(i, 'GAS_BUDGET_EXCEEDED');
+  });
+  test('already-own-hold-excluded totals are used without a second subtraction', () => {
     const i = fixture(); withPolicy(i, { rolling24hMax: 20n, lifetimeMax: 20n, gasBudget24h: 2n,
       ratePerMinute: 1, maxOutstanding: 1, approvalThreshold: 0n });
     i.walletPolicy = { revision: 1, rolling24hMax: 20n, safetyReserve: 0n };
-    i.usage = snapshot(NOW, [], [], []); i.usage.balance!.spendable = 22n;
+    Object.assign(i.usage, { agentRolling24h: 0n, agentLifetime: 0n, agentGas24h: 0n,
+      agentOutstanding: 0, agentRequestsLastMinute: 0, walletRolling24h: 0n, outstandingHolds: 0n });
+    i.usage.balance!.spendable = 22n;
     i.standingApprovals = [grant({ totalMax: 20n, usedTotal: 0n })];
     expectDecision(i, { kind: 'allow_via_standing_approval', standingApprovalId: 'grant-a', reasons: [] });
     i.usage.agentRolling24h = 1n;
