@@ -1,10 +1,13 @@
 import { z } from 'zod';
 import { YoctoNearSchema } from './amounts.js';
-import { AccountIdSchema, Base64Schema, Ed25519PublicKeySchema, IdSchema, TimestampSchema } from './primitives.js';
+import { AccountIdSchema, Base64Schema, Ed25519PublicKeySchema, IdSchema, TimestampSchema, CountSchema } from './primitives.js';
 
 export const NonceSchema = z.bigint().nonnegative();
 export const ChainHashSchema = z.string().regex(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
 export type ChainHash = z.infer<typeof ChainHashSchema>;
+/** Let final RPC/indexer visibility converge after the most recent offer.
+ * This is a minimum safety delay, never configurable down by an agent. */
+export const NON_EXECUTION_MIN_AGE_MS = 60_000;
 export const OUTBOX_STATUSES = ['signed', 'submitted', 'outcome_unknown'] as const;
 /** Expected RPC/transport failures are values, not untyped thrown errors.
  * A rejection applies to THIS send only, not proof an earlier send didn't execute. */
@@ -23,6 +26,17 @@ export const TxAttemptSchema = z.strictObject({
   tokensBurnt: YoctoNearSchema.nullable(), createdAt: TimestampSchema, updatedAt: TimestampSchema,
   /** Positive chain-adapter evidence retained before any replacement is eligible. */
   nonExecutionEvidence: z.string().min(1).nullable(),
+  /** Persisted BEFORE every offer; null proves no submission intent was written.
+   * Missing on legacy records requires receipt recovery, never a freshness guess. */
+  lastOfferedAt: TimestampSchema.nullable().optional(),
+  /** Number of durable offer intents, incremented before each invocation.
+   * Only a definitive rejection of the sole first offer proves that this broker
+   * has never offered bytes that might have been accepted. */
+  offerCount: CountSchema.optional(),
+  firstRejection: z.enum(['INVALID_NONCE', 'EXPIRED_BLOCK_HASH']).optional(),
+  /** Artificially resolved attempts remain watched until actual final accounting.
+   * Watching beyond expiry also catches late historical visibility. */
+  resolutionWatch: z.boolean().optional(),
 }).refine((attempt) => attempt.status !== 'proven_not_executed' || attempt.nonExecutionEvidence !== null,
   'proven_not_executed requires persisted positive evidence');
 export type TxAttempt = z.infer<typeof TxAttemptSchema>;

@@ -262,7 +262,11 @@ describe('complete correlated receipt vocabulary', () => {
     }
     expect(AppendReceiptSchema.safeParse({ ...base, payload: { ...base.payload, reason: '' } }).success).toBe(false);
     expect(AppendReceiptSchema.safeParse({ ...base, payload: { ...base.payload, tokensBurnt: '1' } }).success).toBe(false);
-    expectTypeOf<Parameters<OwnerBrokerService['resolveAttempt']>>().toEqualTypeOf<[OwnerPrincipal, string, string]>();
+    expect(AppendReceiptSchema.safeParse({ ...base, payload: { ...base.payload,
+      resolution: { ...base.payload.resolution, holdRetained: true } } }).success).toBe(false);
+    expect(AppendReceiptSchema.safeParse({ ...base, payload: { ...base.payload,
+      resolution: { ...base.payload.resolution, force: true, holdRetained: true } } }).success).toBe(true);
+    expectTypeOf<Parameters<OwnerBrokerService['resolveAttempt']>>().toEqualTypeOf<[OwnerPrincipal, string, string, boolean?]>();
     expectTypeOf<ReturnType<OwnerBrokerService['resolveAttempt']>>().toEqualTypeOf<Promise<TransferRequest>>();
   });
   it('has schemas for exactly every event and pins submitted phase and approval amounts', () => {

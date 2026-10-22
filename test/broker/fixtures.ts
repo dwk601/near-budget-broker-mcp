@@ -19,8 +19,9 @@ import type {
 
 export const owner: OwnerPrincipal = { kind: 'owner' };
 export const hash = (s: string): string => baseEncode(createHash('sha256').update(s).digest());
+let nextFakeKey = 0;
 export class FakeChain implements NearChain {
-  readonly signer: CustodySigner = { publicKey: `ed25519:${hash('custody')}`, sign: async () => new Uint8Array(64) };
+  readonly signer: CustodySigner = { publicKey: `ed25519:${hash(`custody-${nextFakeKey++}`)}`, sign: async () => new Uint8Array(64) };
   readonly clock: Clock;
   balance = parseNear('1');
   nonce = 0n;

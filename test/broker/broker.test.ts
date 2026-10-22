@@ -81,7 +81,7 @@ describe('admission, exact accounting and isolation', () => {
     expect((await f.broker.listReceipts(a, 0, 100)).length).toBe(head);
     f.now += 1001; f.chain.accountError = true;
     expect((await f.broker.requestTransfer(a, f.input('stale'))).reasons).toContain('WALLET_CAPACITY');
-    f.chain.accountError = false;
+    f.chain.accountError = false; f.now += 250; // short failure cache expires
     expect((await f.broker.requestTransfer(a, f.input('fresh'))).state).toBe('queued');
     expect(f.chain.built).toHaveLength(0);
   });
@@ -181,6 +181,7 @@ describe('freeze, outbox, crash recovery and audit fail-closed', () => {
     expect(request.state).toBe('outcome_unknown');
     const old = f.store.read((r) => r.listAttempts(request.id)[0]!);
     await f.broker.reconcile(owner); expect(f.chain.built).toHaveLength(1);
+    f.now += 60_000;
     f.chain.outcomes.set(old.txHash, { kind: 'not_executed', evidence: 'final canonical chain exclusion proof', invalidNonce: true });
     await f.broker.reconcile(owner); // persist proof, crash/restart at this boundary
     expect(f.store.read((r) => r.listOutbox({ limit: 100 }).items)).toHaveLength(0);

@@ -67,7 +67,14 @@ export interface StoreTransaction extends StoreReader {
   putStandingApproval(approval: StandingApproval): void;
   putRequestApproval(approval: RequestApproval): void;
   putFreeze(freeze: Freeze): void;
+  /** Positive execution may correct a current proven_not_executed observation;
+   * its exclusion evidence and signed identity must be retained. */
   putAttempt(attempt: TxAttempt): void;
+  /** Narrow correction for a failed, explicitly resolved current attempt with a
+   * resolutionWatch marker. Requires actual final execution; atomically corrects
+   * request/attempt/hold without reopening any generic terminal transition.
+   * Caller appends actual accounting and signed correction receipts in this tx. */
+  correctResolvedExecution(request: TransferRequest, attempt: TxAttempt): void;
   /** Persist max(local, chain)+1, strictly increasing for the custody key. */
   allocateNonce(publicKey: string, chainNonce: bigint): bigint;
   putBalance(balance: AccountBalance, validUntil: Timestamp): void;
@@ -197,11 +204,13 @@ export interface OwnerBrokerService {
   /** Reconcile existing attempts only; never admit/dispatch unrelated queued work.
    * Result contains only requests examined by this call, not the request table. */
   reconcile(principal: OwnerPrincipal, requestId?: string): Promise<ReconcileResult>;
-  /** Owner attests zero execution, accepting responsibility when evidence is
-   * unavailable. Requires a nonempty reason. Refused on pending/final execution
-   * evidence. Atomically fails the current attempt, releases hold and receipts
-   * on owner + agent chains. Does not authorize a replacement payment. */
-  resolveAttempt(principal: OwnerPrincipal, requestId: string, reason: string): Promise<TransferRequest>;
+  /** Default requires fresh, aged exclusion with retained history (definitive
+   * UNKNOWN_TRANSACTION and final nonce consumed/validity expired). Explicit
+   * force may retire a still-uncertain lane item, but retains its full hold.
+   * Pending/final execution always vetoes resolution. Requires a reason and
+   * receipts on owner + agent chains. Resolved work is durably watched; late
+   * execution corrects actual accounting. Never creates a replacement payment. */
+  resolveAttempt(principal: OwnerPrincipal, requestId: string, reason: string, force?: boolean): Promise<TransferRequest>;
   exportReceipts(principal: OwnerPrincipal, chainId: ChainId, afterSeq: number, limit: number): Promise<ReceiptEvent[]>;
   listRequests(principal: OwnerPrincipal, filter: RequestFilter, query: PageQuery): Promise<Page<TransferRequest>>;
 }

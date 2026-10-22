@@ -5,7 +5,7 @@ import type { TxAttempt } from '../../src/contracts/index.js';
 const hash = (i: number) => baseEncode(new Uint8Array(32).fill(i));
 const pair = KeyPair.fromRandom('ed25519'); const publicKey = pair.getPublicKey().toString();
 const unknown = { error: { name: 'HANDLER_ERROR', cause: { name: 'UNKNOWN_TRANSACTION', info: {} } } };
-async function fixture(options: { nonce?: string; height?: string; validity?: string; txError?: unknown; second?: unknown; wrongHead?: boolean } = {}) {
+async function fixture(options: { nonce?: string; height?: string; validity?: string; txError?: unknown; second?: unknown; wrongHead?: boolean; gcAnchor?: boolean; now?: number } = {}) {
   let lookups = 0; let txHash = '';
   const calls: string[] = [];
   const fetcher: typeof fetch = async (_url, init) => {
@@ -13,6 +13,8 @@ async function fixture(options: { nonce?: string; height?: string; validity?: st
     calls.push(req.method);
     let result: unknown;
     if (req.method === 'status') result = { chain_id: 'testnet' };
+    if (req.method === 'block' && req.params['block_id'] && options.gcAnchor) return Response.json({ jsonrpc: '2.0', id: req.id,
+      error: { cause: { name: 'UNKNOWN_BLOCK', info: {} } } });
     if (req.method === 'block') result = { header: { hash: req.params['block_id'] ?? hash(2), height: req.params['block_id'] ? '10' : options.height ?? '111' } };
     if (req.method === 'query') result = { nonce: options.nonce ?? '0', block_hash: options.wrongHead ? hash(9) : hash(2) };
     if (req.method === 'EXPERIMENTAL_protocol_config') result = { transaction_validity_period: options.validity ?? '100' };
@@ -24,12 +26,13 @@ async function fixture(options: { nonce?: string; height?: string; validity?: st
     }
     return Response.json({ jsonrpc: '2.0', id: req.id, result });
   };
-  const chain = await NativeNearChain.connect({ accountId: 'broker.testnet', rpcUrl: 'http://fake.invalid', fetch: fetcher });
+  const chain = await NativeNearChain.connect({ accountId: 'broker.testnet', rpcUrl: 'http://fake.invalid', fetch: fetcher, clock: { now: () => options.now ?? 120_000 } });
   const signed = await chain.buildAndSignNativeTransfer({ signerId: 'broker.testnet', receiverId: 'bob.testnet', amount: 1n,
     nonce: 5n, publicKey, blockHash: hash(1) }, { publicKey, sign: async (bytes) => pair.sign(bytes).signature });
   txHash = signed.txHash;
   const attempt: TxAttempt = { id: 't', requestId: 'r', nonce: 5n, publicKey, blockHash: hash(1), signedTxBase64: signed.signedTxBase64,
-    txHash, status: 'outcome_unknown', receiptIds: [], gasBurnt: null, tokensBurnt: null, createdAt: 1, updatedAt: 1, nonExecutionEvidence: null };
+    txHash, status: 'outcome_unknown', receiptIds: [], gasBurnt: null, tokensBurnt: null, createdAt: 1, updatedAt: 1, nonExecutionEvidence: null, lastOfferedAt: 1, offerCount: 1,
+    firstRejection: options.nonce === '5' ? 'INVALID_NONCE' : 'EXPIRED_BLOCK_HASH' };
   return { chain, attempt, calls };
 }
 it('Expired: exact negative lookup plus final head strictly beyond protocol validity yields proof', async () => {
@@ -51,6 +54,32 @@ it.each([
 ])('never fabricates exclusion from boundary, malformed, timeout or unpinned evidence %#', async (options) => {
   const { chain, attempt } = await fixture(options);
   expect((await chain.txStatus(attempt.txHash, 'broker.testnet', attempt)).kind).toBe('outcome_unknown');
+});
+it.each(['5', '0'])('N1 GC anchor forbids exclusion on BOTH nonce=%s and expired-block paths', async (nonce) => {
+  const { chain, attempt, calls } = await fixture({ nonce, gcAnchor: true });
+  expect((await chain.txStatus(attempt.txHash, 'broker.testnet', attempt)).kind).toBe('outcome_unknown');
+  expect(calls.filter((c) => c === 'query')).toHaveLength(0);
+});
+it.each([1, 60_000])('N1 minimum age rejects last offer too recent for final RPC visibility (now=%s)', async (now) => {
+  const { chain, attempt } = await fixture({ nonce: '5', now });
+  expect((await chain.txStatus(attempt.txHash, 'broker.testnet', attempt)).kind).toBe('outcome_unknown');
+});
+it('N1 creation age does not substitute for durable last-offer age or missing metadata', async () => {
+  const { chain, attempt } = await fixture({ nonce: '5' });
+  for (const lastOfferedAt of [undefined, null, 120_001, 119_999]) {
+    expect((await chain.txStatus(attempt.txHash, 'broker.testnet', { ...attempt, lastOfferedAt })).kind).toBe('outcome_unknown');
+  }
+});
+it('a lagging final head cannot prove nonce exclusion before the retrievable anchor', async () => {
+  const { chain, attempt } = await fixture({ nonce: '5', height: '9' });
+  expect((await chain.txStatus(attempt.txHash, 'broker.testnet', attempt)).kind).toBe('outcome_unknown');
+});
+it('prolonged lookup lag after an accepted/ambiguous offer never proves absence, even with retained anchor and consumed nonce', async () => {
+  const { chain, attempt } = await fixture({ nonce: '5' });
+  for (const metadata of [{ offerCount: 1, firstRejection: undefined }, { offerCount: undefined, firstRejection: undefined },
+    { offerCount: 2, firstRejection: 'INVALID_NONCE' as const }]) {
+    expect((await chain.txStatus(attempt.txHash, 'broker.testnet', { ...attempt, ...metadata })).kind).toBe('outcome_unknown');
+  }
 });
 it('persisted bytes must bind hash, signer, nonce and block, including on a fresh adapter', async () => {
   const { chain, attempt } = await fixture();

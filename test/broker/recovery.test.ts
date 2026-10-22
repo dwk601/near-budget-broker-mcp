@@ -26,6 +26,7 @@ it('acceptance followed by lost status may rebroadcast only identical bytes, nev
   const crash = f.another({ hooks: { afterBroadcast: async () => { throw new Error('crash'); } } });
   await expect(crash.drain()).rejects.toThrow('crash');
   const status = vi.spyOn(f.chain, 'txStatus').mockResolvedValueOnce({ kind: 'outcome_unknown', reason: 'indexer lag' });
+  f.now += 60_000;
   await f.another().start();
   expect(status).toHaveBeenCalledTimes(2);
   expect(f.chain.broadcasts).toHaveLength(2);

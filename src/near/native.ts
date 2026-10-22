@@ -6,7 +6,7 @@ import {
 import {
   AccountBalanceSchema, AccountIdSchema, AccessKeyViewSchema, Base64Schema, BrokerError,
   ChainHashSchema, ChainOutcomeSchema, ConfigSchema, MAX_U128,
-  NativeTransferToSignSchema, SignedNativeTransferSchema,
+  NativeTransferToSignSchema, SignedNativeTransferSchema, NON_EXECUTION_MIN_AGE_MS,
 } from '../contracts/index.js';
 import type {
   AccountBalance, AccessKeyView, BroadcastResult, ChainOutcome, Clock, CustodySigner,
@@ -194,9 +194,28 @@ export class NativeNearChain implements NearChain {
       if (signed.txHash !== txHash || attempt.txHash !== txHash || t.signerId !== signerId
         || signerId !== this.#accountId || t.nonce !== attempt.nonce || t.publicKey !== attempt.publicKey
         || t.blockHash !== attempt.blockHash) return unknownOutcome();
+      // Never infer non-execution from a fresh offer or missing legacy offer
+      // metadata. RPC pools/indexers may lag inclusion by multiple final blocks.
+      // Even retained history plus a delay cannot turn an indexer/pool's
+      // prolonged negative lookup lag into an absence proof for an accepted
+      // transaction. Only a definitive rejection of our sole FIRST offer can
+      // establish never-accepted bytes. Ambiguous/accepted/replayed work cannot
+      // auto-replace from UNKNOWN_TRANSACTION alone, however old it becomes.
+      if (attempt.offerCount !== 1 || (attempt.firstRejection !== 'INVALID_NONCE'
+        && attempt.firstRejection !== 'EXPIRED_BLOCK_HASH')) return unknownOutcome();
+      const offered = attempt.lastOfferedAt;
+      const now = this.#clock.now();
+      if (offered === undefined || offered === null || !Number.isSafeInteger(offered)
+        || offered > now || now - offered < NON_EXECUTION_MIN_AGE_MS) return unknownOutcome();
+      // BOTH nonce and expiry paths require retained history at the anchor.
+      // A GC'd executed transaction also has UNKNOWN_TRANSACTION + consumed nonce.
+      const anchor = record(record(await this.#rpc.call('block', { block_id: t.blockHash }))['header']);
+      if (anchor['hash'] !== t.blockHash) return unknownOutcome();
+      const height = unsigned(anchor['height'], U64_MAX);
       const head = record(record(await this.#rpc.call('block', { finality: 'final' }))['header']);
       const headHash = ChainHashSchema.parse(head['hash']); blockHash(headHash);
       const headHeight = unsigned(head['height'], U64_MAX);
+      if (headHeight < height) return unknownOutcome();
       const key = record(await this.#rpc.call('query', { request_type: 'view_access_key', account_id: signerId,
         public_key: t.publicKey, block_id: headHash }));
       if (key['block_hash'] !== headHash) return unknownOutcome();
@@ -205,15 +224,12 @@ export class NativeNearChain implements NearChain {
       let invalidNonce = false;
       if (nonce >= t.nonce) {
         invalidNonce = true;
-        evidence = `UNKNOWN_TRANSACTION; final access key ${headHash} nonce ${nonce} >= attempt ${t.nonce}`;
+        evidence = `FIRST_OFFER_REJECTED:${attempt.firstRejection}; UNKNOWN_TRANSACTION; retained anchor ${t.blockHash} height ${height}; final access key ${headHash} nonce ${nonce} >= attempt ${t.nonce}; last offer ${offered}`;
       } else {
-        const anchor = record(record(await this.#rpc.call('block', { block_id: t.blockHash }))['header']);
-        if (anchor['hash'] !== t.blockHash) return unknownOutcome();
-        const height = unsigned(anchor['height'], U64_MAX);
         const protocol = record(await this.#rpc.call('EXPERIMENTAL_protocol_config', { block_id: headHash }));
         const validity = unsigned(protocol['transaction_validity_period'], U64_MAX);
         if (validity === 0n || headHeight <= height + validity) return unknownOutcome();
-        evidence = `UNKNOWN_TRANSACTION; final head ${headHash} height ${headHeight} > anchor ${t.blockHash} height ${height} + validity ${validity}`;
+        evidence = `FIRST_OFFER_REJECTED:${attempt.firstRejection}; UNKNOWN_TRANSACTION; final head ${headHash} height ${headHeight} > anchor ${t.blockHash} height ${height} + validity ${validity}`;
       }
       // A second negative lookup AFTER the final nonce/expiry observation closes
       // the observation race. Timeout, malformed result, or any other error is

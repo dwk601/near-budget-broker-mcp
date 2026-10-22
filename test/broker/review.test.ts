@@ -74,13 +74,13 @@ it('F2 latency: refresh between payments; stale-only capacity failure pauses rat
   f.now += 20; f.chain.accountError = true; await f.broker.drain();
   expect((await f.broker.getRequest(a, pending.id)).state).toBe('queued');
   expect(f.store.read((r) => r.getHold(pending.id)?.status)).toBe('active');
-  f.chain.accountError = false; await f.broker.drain();
+  f.chain.accountError = false; f.now += 250; await f.broker.drain();
   expect((await f.broker.getRequest(a, pending.id)).state).toBe('succeeded');
 });
 
 it('F3a outcome_unknown rebroadcasts byte-identically and recovers without a new signature', async () => {
   f = new Fixture(); await f.init(); const a = await f.agent(); f.chain.mode = 'throw';
-  const request = await f.broker.requestTransfer(a, f.input('retry')); f.chain.mode = 'accepted';
+  const request = await f.broker.requestTransfer(a, f.input('retry')); f.chain.mode = 'accepted'; f.now += 60_000;
   await f.another().reconcile(owner, request.id);
   expect(f.chain.broadcasts).toHaveLength(2); expect(f.chain.broadcasts[0]).toBe(f.chain.broadcasts[1]);
   expect(f.chain.built).toHaveLength(1); expect(f.chain.paid.size).toBe(1);
@@ -98,7 +98,8 @@ it('F3c owner-attested resolution requires auth/reason, vetoes any execution evi
     f.chain.outcomes.set(attempt.txHash, evidence);
     await expect(f.broker.resolveAttempt(owner, request.id, 'no payment')).rejects.toHaveProperty('code', 'FORBIDDEN');
   }
-  f.chain.outcomes.delete(attempt.txHash);
+  f.now += 60_000;
+  f.chain.outcomes.set(attempt.txHash, { kind: 'not_executed', evidence: 'retained history, definitive absence and consumed nonce', invalidNonce: true });
   const spy = vi.spyOn(f.receipts, 'append');
   spy.mockImplementation(() => { throw new Error('audit'); });
   await expect(f.broker.resolveAttempt(owner, request.id, 'operator investigated')).rejects.toHaveProperty('code', 'AUDIT_UNAVAILABLE');
@@ -117,6 +118,7 @@ it('F4 proven non-execution plus revoked authorization fails with zero burn and 
   f = new Fixture({ autoDispatch: false }); await f.init(); const a = await f.agent('A'); const b = await f.agent('B');
   const request = await f.broker.requestTransfer(a, f.input('proof')); f.chain.mode = 'unknown'; await f.broker.drain();
   const attempt = f.store.read((r) => r.listAttempts(request.id)[0]!);
+  f.now += 60_000;
   f.chain.outcomes.set(attempt.txHash, { kind: 'not_executed', evidence: 'final exclusion', invalidNonce: true });
   await f.broker.reconcile(owner); await f.broker.revokeAgent(owner, a.agentId, 'revoked');
   await f.broker.requestTransfer(b, f.input('B')); f.chain.mode = 'accepted'; await f.broker.drain();
@@ -129,6 +131,7 @@ it('F4 a stale/offline balance cannot pin a proven-unexecuted revoked request', 
   f = new Fixture({ autoDispatch: false }); await f.init(); const a = await f.agent();
   const request = await f.broker.requestTransfer(a, f.input('proof-offline')); f.chain.mode = 'unknown'; await f.broker.drain();
   const attempt = f.store.read((r) => r.listAttempts(request.id)[0]!);
+  f.now += 60_000;
   f.chain.outcomes.set(attempt.txHash, { kind: 'not_executed', evidence: 'final exclusion', invalidNonce: true });
   await f.broker.reconcile(owner); await f.broker.revokeAgent(owner, a.agentId, 'permanent');
   f.now += 1001; f.chain.accountError = true;

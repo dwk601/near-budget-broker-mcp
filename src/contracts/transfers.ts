@@ -72,7 +72,7 @@ export const HoldSchema = z.strictObject({
 export type Hold = z.infer<typeof HoldSchema>;
 export const AccountingEntrySchema = z.strictObject({
   id: IdSchema, requestId: IdSchema, agentId: IdSchema,
-  kind: z.enum(['principal_reserved', 'fee_reserved', 'principal_committed', 'gas_charged', 'principal_released', 'fee_released']),
+  kind: z.enum(['principal_reserved', 'fee_reserved', 'principal_committed', 'gas_charged', 'gas_correction', 'principal_released', 'fee_released']),
   amount: YoctoNearSchema, at: TimestampSchema,
 });
 export type AccountingEntry = z.infer<typeof AccountingEntrySchema>;

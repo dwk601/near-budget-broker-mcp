@@ -17,7 +17,9 @@ const decision = {
   requestDigest: Sha256Schema, policyRevision: CountSchema.min(1).nullable(), approvalRef: ApprovalRefSchema.nullable(),
 };
 const settlement = {
-  ...request, txHash: ChainHashSchema, receiptIds: z.array(ChainHashSchema),
+  ...request,
+  /** Actual final accounting superseding an earlier zero-execution resolution. */
+  lateResolution: z.strictObject({ attemptId: IdSchema }).optional(), txHash: ChainHashSchema, receiptIds: z.array(ChainHashSchema),
   gasBurnt: DecimalTextSchema, tokensBurnt: DecimalTextSchema,
 };
 /** Receipt payloads are JSON wire records: amounts/gas use decimal TEXT. */
@@ -51,9 +53,10 @@ export const RECEIPT_PAYLOAD_SCHEMAS = {
   failed: z.strictObject({ ...settlement, reason: z.string().min(1),
     /** Explicit zero-execution resolution, not a measured chain failure. */
     resolution: z.strictObject({ attemptId: IdSchema, basis: z.enum(['owner_attested', 'chain_proof', 'never_offered']),
-      evidence: z.string().min(1) }).optional() })
+      evidence: z.string().min(1), force: z.boolean().optional(), holdRetained: z.boolean().optional() }).optional() })
     .refine((p) => p.resolution === undefined || (p.gasBurnt === '0' && p.tokensBurnt === '0'
-      && p.receiptIds.length === 0 && p.reason.length <= 1024 && p.reason.trim().length > 0), 'Resolution requires zero execution'),
+      && p.receiptIds.length === 0 && p.reason.length <= 1024 && p.reason.trim().length > 0
+      && p.lateResolution === undefined && (p.resolution.holdRetained !== true || p.resolution.force === true)),  'Resolution requires zero execution'),
   outcome_unknown: z.strictObject({ ...request, attemptId: IdSchema, txHash: ChainHashSchema, reason: z.string().min(1) }),
   freeze: FreezeSchema.refine((freeze) => freeze.frozen, 'Expected frozen=true'),
   unfreeze: FreezeSchema.refine((freeze) => !freeze.frozen, 'Expected frozen=false'),

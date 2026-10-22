@@ -626,3 +626,92 @@ the same explicit resolution metadata. These receipts distinguish attestation
 from measured chain failure. Receipt failure rolls back the entire resolution.
 Externally pin exported checkpoints using the existing B13 list API; the legacy
 receipt-array export remains unchanged.
+
+## B06 safety amendment N1–N10 (supersedes weaker resolution/proof rules above)
+
+Negative RPC visibility is not an everlasting proof. BOTH nonce and expiry
+exclusion paths must retrieve and validate the signed transaction's anchor block
+from retained history. A GC/history error, wrong anchor, final head older than the
+anchor, malformed fields or a transport error means outcome_unknown, never
+not_executed. A final consumed nonce alone is insufficient: the transaction itself
+could have consumed that nonce before RPC history was garbage-collected. Require
+at least NON_EXECUTION_MIN_AGE_MS (60,000 ms) since the most recent durable offer.
+The age is measured from lastOfferedAt, not creation/signing time; unknown legacy
+offer metadata is recovered from receipts or fails closed. The final observations
+and repeated definitive UNKNOWN_TRANSACTION lookups rely on the configured trusted
+RPC's retained, consistent final history, not arbitrary indexer absence.
+
+Minimum age/retained history are necessary but not sufficient: prolonged negative
+lookup lag can still hide an ACCEPTED transaction. Therefore the native adapter
+additionally requires a durable offerCount=1 and a structured firstRejection
+(INVALID_NONCE or EXPIRED_BLOCK_HASH) from that sole offer. Only those bytes are
+known never to have been accepted under the trusted node validation contract.
+An ambiguous/accepted/replayed offer never gets automatic exclusion or replacement
+from UNKNOWN_TRANSACTION alone, even with a retained anchor and consumed nonce.
+New offer counts are persisted before invocation and cannot decrease; definitive
+first-rejection provenance cannot be erased. Legacy missing counters do not get
+upgraded into first-offer evidence. Known rejected bytes are not pointlessly
+rebroadcast while waiting for the aged final proof. Long-lived uncertainty may
+therefore retain its budget until actual final evidence arrives; owner force can
+retire its lane item but cannot manufacture spendable capacity. This stronger rule
+is intentional: neither a delay nor an indexer's silence is an absence proof.
+
+Persist lastOfferedAt BEFORE every invocation (including byte-identical retries).
+Reuse the first signed submission-intent receipt for those same bytes rather than
+manufacturing another intent receipt per retry. New-format attempts have explicit
+lastOfferedAt=null before intent, so never-offered checks do not scan receipt
+history. Legacy rows recover offer metadata once per changed chain head. Status
+queries may run every drain, but identical-byte retries are spaced by the same
+minimum age so frequent retries cannot perpetually reset the proof-age clock.
+A send-gate early return leaves the attempt signed/never-offered, not unknown.
+
+A persisted exclusion observation must be queried again on recovery, and again
+AFTER asynchronous construction/signing immediately before replacement persistence.
+Fresh exclusion evidence is receipted atomically with the replacement. Newly
+visible pending/final execution of the current, unreplaced proof corrects its
+attempt status while retaining earlier evidence; it must never authorize another
+payment. Store.putAttempt permits only this narrow positive correction out of
+proven_not_executed. Signed identity and monotonic offer time remain immutable.
+
+resolveAttempt(owner,id,reason,force=false) now REQUIRES fresh definitive exclusion:
+retained history, minimum offer age, UNKNOWN_TRANSACTION and final consumed nonce
+or expired validity. It cannot default-resolve a still-valid transaction or an
+unreachable RPC. Explicit force=true is separately receipted and may retire an
+uncertain lane item, but RETAINS its entire principal+fee hold until fresh exclusion
+or actual final execution is observed. Thus force cannot free the same agent's
+budget for a second payment. Positive pending/final execution always vetoes even
+force. Failed resolution receipts record force and holdRetained explicitly.
+
+All offered, artificially resolved attempts have durable resolutionWatch metadata.
+Drains/start/reconcile continue watching through their validity window AND beyond
+it for late historical visibility; watches never rebroadcast. A forced hold is
+released only on fresh mature exclusion. Actual late success/failure is charged
+exactly once, with actual principal and tokensBurnt, a signed lateResolution
+receipt on both owner/agent chains, and a global freeze requiring owner review.
+A narrow Store.correctResolvedExecution seam atomically corrects only an explicit
+watched failed request/attempt/hold, not generic terminal states. Old zero-burn
+resolution accounting is never rewritten: positive gas_correction entries charge
+any legacy zero-charge difference and participate in gas usage. If a released
+standing grant is now exhausted, actual principal/gas accounting still wins over
+the grant's limits; revoke that grant so owner unfreeze cannot re-spend stale
+remaining standing capacity. The freeze requires reconciliation of the late overrun.
+Legacy signed resolution receipts enroll old resolved rows into the watch after
+restart. No SQLite migration is needed for these optional JSON metadata fields.
+
+Balance refresh is single-flight per custody key across broker connections, with
+one admission lane entry, a 250 ms negative cache, and shared ephemeral preview
+cache. Cache timestamps never extend observation freshness. A settlement generation
+invalidates in-flight pre-payment preview results before they can overwrite a
+conservative balance debit. Owner mutations wait for at most the current refresh,
+not a hostile queue of repeated failed RPCs. Preview still writes no rows.
+
+An agent-scope freeze may permanently abandon NEVER-OFFERED signed work, as already
+authorized. **Unfreeze does not restore that failed request**; the agent must submit
+a new idempotency key if the owner permits a fresh payment. Already-offered work
+cannot use abandonment. Stale-only capacity failure must pause a never-offered
+attempt and preserve its hold, not abandon it. Global freeze pauses signed work.
+
+The mutation runner operates exclusively on an isolated temporary source/test
+copy. It never rewrites worktree src, even on interruption. Required MCP/HTTP
+placeholder suites remain owned by their downstream tasks; B06 does not skip or
+silence them.

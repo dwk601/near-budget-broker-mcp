@@ -232,7 +232,7 @@ class Transaction implements StoreTransaction {
     const args: SQLInputValue[] = excludeRequestId === undefined ? [] : [excludeRequestId];
     for (const row of this.rows(`SELECT data FROM accounting WHERE
       ((kind = 'principal_committed' AND (agent_id = ? OR at > ?))
-       OR (kind = 'gas_charged' AND agent_id = ? AND at > ?)) AND at <= ?${exclude}`,
+       OR (kind IN ('gas_charged','gas_correction') AND agent_id = ? AND at > ?)) AND at <= ?${exclude}`,
       agentId, now - 86_400_000, agentId, now - 86_400_000, now, ...args)) {
       const entry = decode(row, AccountingEntrySchema, ['amount']);
       // Future entries never contribute to a snapshot at an earlier clock time.
@@ -371,14 +371,56 @@ class Transaction implements StoreTransaction {
     if (old) {
       const immutable = ['id', 'requestId', 'nonce', 'publicKey', 'blockHash', 'signedTxBase64', 'txHash', 'createdAt'] as const;
       requireThat(immutable.every((key) => old[key] === attempt[key]));
-      requireThat(!['succeeded', 'failed', 'proven_not_executed'].includes(old.status) || same(old, attempt));
+      const watchEnrollment = ['failed', 'proven_not_executed'].includes(old.status) && request.state === 'failed'
+        && old.resolutionWatch === undefined && attempt.resolutionWatch === true
+        && same({ ...old, resolutionWatch: true }, attempt)
+        && this.rows('SELECT data FROM receipts WHERE chain_id = ?', `agent:${request.agentId}`).some((row) => {
+          const receipt = decode(row, ReceiptEventSchema);
+          return receipt.type === 'failed' && receipt.payload.resolution?.attemptId === old.id
+            && receipt.payload.resolution.basis !== 'never_offered';
+        });
+      const proofCorrection = old.status === 'proven_not_executed' && request.txHash === old.txHash
+        && ['signed', 'submitted', 'outcome_unknown'].includes(request.state)
+        && ['submitted', 'succeeded', 'failed'].includes(attempt.status)
+        && (attempt.status === 'submitted' || (attempt.gasBurnt !== null && attempt.tokensBurnt !== null));
+      requireThat(!['succeeded', 'failed', 'proven_not_executed'].includes(old.status) || same(old, attempt) || proofCorrection || watchEnrollment);
       requireThat(attempt.status !== 'signed' || old.status === 'signed');
       requireThat(old.nonExecutionEvidence === null || old.nonExecutionEvidence === attempt.nonExecutionEvidence);
+      requireThat(old.offerCount === undefined
+        ? attempt.offerCount === undefined || attempt.offerCount >= 2
+        : attempt.offerCount !== undefined && attempt.offerCount >= old.offerCount);
+      requireThat(old.firstRejection === undefined || old.firstRejection === attempt.firstRejection);
+      requireThat(attempt.firstRejection === undefined || (old.firstRejection === attempt.firstRejection
+        || (attempt.offerCount === 1 && old.offerCount === 1)));
+      // Offer timestamps are monotonic durable intent; never erase a past offer.
+      requireThat(old.lastOfferedAt === undefined || old.lastOfferedAt === null
+        || (attempt.lastOfferedAt !== undefined && attempt.lastOfferedAt !== null && attempt.lastOfferedAt >= old.lastOfferedAt));
     } else {
       requireThat(attempt.status === 'signed' && attempt.nonce > 0n && attempt.nonce <= this.getLocalNonce(attempt.publicKey), 'NONCE_CONFLICT');
       requireThat(replacement || (request.state === 'queued' && request.txHash === null && this.listAttempts(request.id).length === 0));
     }
     this.exec('INSERT INTO attempts(id, request_id, network, account_id, status, public_key, nonce, tx_hash, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET status = excluded.status, data = excluded.data', attempt.id, attempt.requestId, 'testnet', this.options.accountId, attempt.status, attempt.publicKey, attempt.nonce.toString(), attempt.txHash, encode(attempt));
+  }
+  correctResolvedExecution(input: TransferRequest, inputAttempt: TxAttempt): void {
+    const request = TransferRequestSchema.parse(input); const attempt = TxAttemptSchema.parse(inputAttempt);
+    const old = this.getRequest(request.id); const prior = this.getAttempt(attempt.id); const hold = this.getHold(request.id);
+    requireThat(old && prior && hold && old.state === 'failed' && prior.resolutionWatch === true
+      && attempt.resolutionWatch === false && ['failed', 'proven_not_executed'].includes(prior.status)
+      && old.txHash === prior.txHash && request.txHash === prior.txHash && attempt.requestId === old.id
+      && (request.state === 'succeeded' || request.state === 'failed') && attempt.status === request.state
+      && attempt.gasBurnt !== null && attempt.tokensBurnt !== null
+      && request.gasBurnt === attempt.gasBurnt && request.tokensBurnt === attempt.tokensBurnt
+      && (hold.status === 'active' || hold.status === 'released'));
+    const immutableRequest = ['id', 'agentId', 'idempotencyKey', 'requestDigest', 'receiverId', 'amount', 'memo', 'createdAt',
+      'approvalRef', 'policyRevision', 'reasons', 'expiresAt', 'signedAt', 'submittedAt'] as const;
+    const immutableAttempt = ['id', 'requestId', 'nonce', 'publicKey', 'blockHash', 'signedTxBase64', 'txHash', 'createdAt', 'lastOfferedAt', 'offerCount', 'firstRejection', 'nonExecutionEvidence'] as const;
+    requireThat(immutableRequest.every((key) => same(old[key], request[key]))
+      && immutableAttempt.every((key) => prior[key] === attempt[key]));
+    // The sole terminal-resolution correction seam; generic state/hold updates
+    // still cannot reopen failed work or resurrect released reservations.
+    this.exec('UPDATE attempts SET status = ?, data = ? WHERE id = ?', attempt.status, encode(attempt), attempt.id);
+    this.exec('UPDATE requests SET state = ?, data = ? WHERE id = ?', request.state, encode(request), request.id);
+    this.exec("UPDATE holds SET status = 'committed' WHERE request_id = ?", request.id);
   }
   replaceUnexecutedAttempt(requestId: string, previousAttemptId: string, input: TxAttempt): void {
     const replacement = TxAttemptSchema.parse(input); const request = this.getRequest(requestId);
