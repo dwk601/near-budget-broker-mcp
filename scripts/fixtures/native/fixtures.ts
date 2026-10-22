@@ -165,6 +165,9 @@ async function inspect(dir: string, chain: FixtureNetwork, out: (line: string) =
   ] as const) {
     const state = await chain.account(id);
     out(`${role}: ${id} balance_yoctoNEAR=${state?.balance.toString() ?? 'missing'}`);
+    // Presence check, not a dispatch-capacity guarantee: any positive balance
+    // qualifies. Required keys must exist; additional owner-managed keys are
+    // intentionally allowed. Broker admission enforces its own balance reserve.
     if (!state || state.balance <= 0n) valid = false;
     for (const [label, key] of expected) {
       const present = state?.keys[key] === true;
@@ -183,13 +186,20 @@ export async function runFixtures(options: Options, dependencies: Dependencies =
     await assertExternal(dir);
     const chain = dependencies.chain ?? new TestnetNetwork(options.rpcUrl);
     if (options.mode === 'check') return await inspect(dir, chain, out) ? 0 : 1;
+    const directoryStatus = await permissionStatus(dir, true);
+    if (directoryStatus === 'unsafe') throw new FixtureFailure('Unsafe fixture directory permissions');
     // Attest before writing even local secrets, and again at every chain mutation.
     await chain.verifyNetwork();
-    if (await permissionStatus(dir, true) === 'missing') await mkdir(dir, { recursive: true, mode: 0o700 });
+    if (directoryStatus === 'missing') await mkdir(dir, { recursive: true, mode: 0o700 });
     if (await permissionStatus(dir, true) !== 'ok') throw new FixtureFailure('Unsafe fixture directory permissions');
     await assertExternal(dir);
     const lockPath = join(dir, '.apply.lock');
-    const lock = await open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    const lock = await open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new FixtureFailure('Existing or stale .apply.lock; delete it only if no other apply is running');
+      }
+      throw error;
+    });
     try {
       if (await permissionStatus(join(dir, 'manifest.json')) === 'missing') await initialize(dir);
       for (const name of FILES) if (await permissionStatus(join(dir, name)) !== 'ok') throw new FixtureFailure('Unsafe or missing fixture file');
