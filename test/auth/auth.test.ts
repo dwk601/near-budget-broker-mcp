@@ -1,5 +1,5 @@
 import {
-  createHash, createPublicKey, randomBytes, sign, timingSafeEqual, verify,
+  createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign, timingSafeEqual, verify,
 } from 'node:crypto';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -16,6 +16,7 @@ import {
   ownerRequestFromHeaders, revokeAgentToken, rotateAgentToken, signOwnerRequest,
 } from '../../src/auth/index.js';
 import { SqliteStore } from '../../src/storage/index.js';
+import { encodePublicKey } from '../../src/auth/owner-key.js';
 
 vi.mock('node:crypto', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:crypto')>();
@@ -221,6 +222,35 @@ describe('agent credentials', () => {
     await rejected(auth.authenticateAgent(a.token));
   });
 
+  test('unknown agent or credential IDs return NOT_FOUND on issue, rotate and revoke', () => {
+    for (const operation of [issueAgentToken, rotateAgentToken, revokeAgentToken]) {
+      expect(() => store.withImmediateTransaction((tx) => operation(tx, 'unknown', now)))
+        .toThrowError(new BrokerError('NOT_FOUND'));
+    }
+  });
+
+  test('all token lifecycle helpers reject invalid IDs and timestamps as FORBIDDEN before mutation', () => {
+    const original = issue();
+    for (const operation of [issueAgentToken, rotateAgentToken, revokeAgentToken]) {
+      for (const id of ['', 'x'.repeat(129), undefined as unknown as string]) {
+        expect(() => store.withImmediateTransaction((tx) => operation(tx, id, now)))
+          .toThrowError(new BrokerError('FORBIDDEN'));
+      }
+      const id = operation === issueAgentToken ? 'a' : original.credential.id;
+      for (const at of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, undefined as unknown as number]) {
+        expect(() => store.withImmediateTransaction((tx) => operation(tx, id, at)))
+          .toThrowError(new BrokerError('FORBIDDEN'));
+      }
+    }
+    // Validation is also mandatory when revocation would otherwise be a no-op.
+    store.withImmediateTransaction((tx) => revokeAgentToken(tx, original.credential.id, now));
+    expect(() => store.withImmediateTransaction((tx) => revokeAgentToken(tx, original.credential.id, -1)))
+      .toThrowError(new BrokerError('FORBIDDEN'));
+    expect(store.read((view) => view.listCredentials('a', { limit: 100 }).items)).toEqual([
+      { ...original.credential, revokedAt: NOW },
+    ]);
+  });
+
   test('freeze does not remove authenticated read access', async () => {
     const a = issue();
     store.withImmediateTransaction((tx) => {
@@ -256,7 +286,7 @@ describe('owner verification', () => {
     await rejected(makeAuth().verifyOwnerRequest(input));
   });
 
-  test('one concurrent verifier wins across separate database connections', async () => {
+  test('replay is rejected across separate database connections (calls execute synchronously)', async () => {
     const secondStore = new SqliteStore(filename, { accountId: 'custody.testnet' });
     try {
       const input = request();
@@ -289,6 +319,17 @@ describe('owner verification', () => {
     await rejected(makeAuth().verifyOwnerRequest(input)); // now expired too
   });
 
+  test('nonce retention ends at issuedAt + 60 seconds, not a longer interval', async () => {
+    const first = request();
+    await auth.verifyOwnerRequest(first);
+    now = NOW + 60_001;
+    // A new signature is not the expired request: using the same nonce after its
+    // retention window exercises Store cleanup without accepting an old replay.
+    const fresh = request({ issuedAt: now, nonce: first.signed.payload.nonce });
+    expect(await auth.verifyOwnerRequest(fresh)).toEqual({ kind: 'owner' });
+    await rejected(auth.verifyOwnerRequest(first));
+  });
+
   test('old boundary nonce survives cleanup at expiry inclusive', async () => {
     const input = request({ issuedAt: NOW - 60_000 });
     await auth.verifyOwnerRequest(input);
@@ -305,6 +346,12 @@ describe('owner verification', () => {
     if (field === 'query') bad.path = '/admin/agents/a?mode=x/y&b=2';
     await rejected(auth.verifyOwnerRequest(bad));
     expect(await auth.verifyOwnerRequest(good)).toEqual({ kind: 'owner' });
+  });
+
+  test('lowercase transport method is not normalized to the signed uppercase method', async () => {
+    const input = request();
+    await rejected(auth.verifyOwnerRequest({ ...input, method: 'post' }));
+    expect(await auth.verifyOwnerRequest(input)).toEqual({ kind: 'owner' });
   });
 
   test('changing signed fields or signature cannot authenticate, even when actual values also change', async () => {
@@ -352,6 +399,61 @@ describe('owner verification', () => {
     expect(await auth.verifyOwnerRequest(input)).toEqual({ kind: 'owner' });
   });
 
+  test.each([
+    { seed: '1f96f20eb88232351de14cb94c52431ad6a1e113965847dff3004d60fa6ea4ac',
+      hex: '003721221c4b8b9118e4ef0e3f29bb717d16b1e704efeb994a457c88cc436c9a',
+      publicKey: 'ed25519:1qktgvqxgNmwhgi7kzp8FNjDyQRg3Um6eBTkjKC5Pku' },
+    { seed: '466eb537969bf24b4a43b8c9441719171ffec4c5ab95860cac5779aa5574b1d3',
+      hex: '00000630338ec930e0ae0092d7b301f2cb02f34c9bcd6f20e7c732a44eb72ef2',
+      publicKey: 'ed25519:112EvFC6KytVp5zjJ5kPZcimJ9LeEWfMN7YRrnZEK9s' },
+  ])('round trips fixed leading-zero public key $publicKey and verifies a signature', async (vector) => {
+    // Public test seeds, not deployment secrets. Literal base58 values prevent
+    // encoder/decoder defects from masking each other or relying on randomness.
+    const privateKey = createPrivateKey({ format: 'der', type: 'pkcs8',
+      key: Buffer.from('302e020100300506032b657004220420' + vector.seed, 'hex') });
+    const bytes = Buffer.from(createPublicKey(privateKey).export({ format: 'jwk' }).x!, 'base64url');
+    expect(bytes.toString('hex')).toBe(vector.hex);
+    expect(encodePublicKey(bytes)).toBe(vector.publicKey);
+    const verifier = new RequestAuthenticator({ store, clock: { now: () => now }, ownerPublicKey: vector.publicKey });
+    const input = request({}, privateKey.export({ type: 'pkcs8', format: 'pem' }).toString());
+    expect(await verifier.verifyOwnerRequest(input)).toEqual({ kind: 'owner' });
+  });
+
+  test('rejects the small-order identity config key before a forged owner signature can authenticate', async () => {
+    const input = request();
+    // R = identity, S = 0: OpenSSL alone accepts this for the identity key for
+    // arbitrary payloads. The constructor must reject that misconfiguration.
+    input.signed.signature = Buffer.concat([Buffer.from('01' + '00'.repeat(31), 'hex'), Buffer.alloc(32)]).toString('base64');
+    await rejected((async () => {
+      const verifier = new RequestAuthenticator({ store, clock: { now: () => now },
+        ownerPublicKey: 'ed25519:4uQeVj5tqViQh7yWWGStvkEG1Zmhx6uasJtWCJziofM' });
+      return verifier.verifyOwnerRequest(input);
+    })(), 'FORBIDDEN');
+  });
+
+  test.each([
+    // The full canonical eight-torsion subgroup (orders 1, 2, 4 and 8).
+    'ed25519:4uQeVj5tqViQh7yWWGStvkEG1Zmhx6uasJtWCJziofM',
+    'ed25519:EQAqmjhcsBQhpBv5GJkYgEB7emGHZNoo1j1yAjiFLNvD',
+    'ed25519:11111111111111111111111111111113D',
+    'ed25519:3ctC68zTqpRDQShoondiQKDHwZDAUjRyxiPNdg8cD6Pe',
+    'ed25519:Gx9dDNxzpALCowVuZb7pBceBLJugLA8sPa6TJDXrpfeW',
+    'ed25519:3ctC68zTqpRDQShoondiQKDHwZDAUjRyxiPNdg8cD6Rr',
+    'ed25519:11111111111111111111111111111111',
+    'ed25519:EQAqmjhcsBQhpBv5GJkYgEB7emGHZNoo1j1yAjiFLNxR',
+    // y = p, p+1, and p+3. The last aliases a NON-small-order point,
+    // so small-order rejection alone cannot substitute for canonical decoding.
+    'ed25519:H242rsh5hzpvDdct56PG5YPQbKUT37EmySQLoQqrYUJr',
+    'ed25519:H5xSWNRAbqKddKjrabehyU8drL3Dk4LgZJiEJc9rGGyC',
+    'ed25519:HDmFoMsLPWK4ShyobcBbmKd6NMAm9xYVj3L1JzmqhtHt',
+    // x = 0 with sign bit 1, and y = 2 (not on curve).
+    'ed25519:4uQeVj5tqViQh7yWWGStvkEG1Zmhx6uasJtWCJziohZ',
+    'ed25519:8opHzTAnfzRpPEx21XtnrVTX28YQuCpAjcn1PczScKh',
+  ])('rejects small-order, noncanonical and off-curve config points: %s', (publicKey) => {
+    expect(() => new RequestAuthenticator({ store, clock: { now: () => now }, ownerPublicKey: publicKey }))
+      .toThrowError(new BrokerError('FORBIDDEN'));
+  });
+
   test('requires a 32-byte ed25519 config key, not just schema-valid base58 shape', () => {
     for (const publicKey of ['ed25519:' + 'z'.repeat(44), 'ed25519:' + '1'.repeat(33),
       'secp256k1:' + keys.publicKey.slice(8), keys.secretKey]) {
@@ -365,7 +467,9 @@ describe('owner client helpers', () => {
   test('headers interoperate with verifier, signing raw UTF8/empty/binary bodies without reserialization', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(NOW);
     const nonces = new Set<string>();
-    for (const body of ['', canonicalJson({ z: '☃', a: 1 }), new Uint8Array([0, 255, 128, 1])]) {
+    const noncanonical = '{ "z": 1,\r\n "a": "☃" }\n';
+    for (const body of ['', canonicalJson({ z: '☃', a: 1 }), noncanonical,
+      Buffer.from(noncanonical, 'utf8'), new Uint8Array([0, 255, 128, 1])]) {
       const bytes = typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
       const headers = signOwnerRequest(keys.secretKey, METHOD, PATH, body);
       nonces.add(headers['x-bb-owner-nonce']);
@@ -380,7 +484,7 @@ describe('owner client helpers', () => {
       expect(await auth.verifyOwnerRequest(ownerRequestFromHeaders(headers, METHOD, PATH, bytes)))
         .toEqual({ kind: 'owner' });
     }
-    expect(nonces.size).toBe(3);
+    expect(nonces.size).toBe(5);
   });
 
   test('key generation is independent; client errors do not include private key or input', () => {
@@ -390,6 +494,17 @@ describe('owner client helpers', () => {
     for (const [secret, method, path] of [[keys.secretKey, 'post', PATH], [keys.secretKey, METHOD, '//bad'],
       [keys.secretKey + 'private-marker', METHOD, '/bad#fragment'], ['secret-marker', METHOD, PATH]]) {
       expect(() => signOwnerRequest(secret!, method!, path!, 'sensitive-body')).toThrowError(new BrokerError('FORBIDDEN'));
+    }
+  });
+
+  test('signing rejects RSA, EC and public-only PEM keys with safe FORBIDDEN errors', () => {
+    const rsa = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey;
+    const ec = generateKeyPairSync('ec', { namedCurve: 'prime256v1' }).privateKey;
+    const pemInputs = [rsa.export({ type: 'pkcs8', format: 'pem' }).toString(),
+      ec.export({ type: 'pkcs8', format: 'pem' }).toString(),
+      createPublicKey(keys.secretKey).export({ type: 'spki', format: 'pem' }).toString()];
+    for (const key of pemInputs) {
+      expect(() => signOwnerRequest(key, METHOD, PATH, BODY)).toThrowError(new BrokerError('FORBIDDEN'));
     }
   });
 

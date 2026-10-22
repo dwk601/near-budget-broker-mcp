@@ -1,6 +1,7 @@
 import { createPublicKey } from 'node:crypto';
 import type { KeyObject } from 'node:crypto';
 import { BrokerError, Ed25519PublicKeySchema } from '../contracts/index.js';
+import { assertOwnerPoint } from './owner-point.js';
 
 const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
@@ -30,6 +31,7 @@ export function decodeOwnerPublicKey(publicKey: string): KeyObject {
     const nonzero = value === 0n ? Buffer.alloc(0) : Buffer.from(hex, 'hex');
     const bytes = Buffer.concat([Buffer.alloc(text.match(/^1*/)?.[0].length ?? 0), nonzero]);
     if (bytes.length !== 32 || encodePublicKey(bytes) !== publicKey) throw new Error();
+    assertOwnerPoint(bytes);
     return createPublicKey({ format: 'jwk', key: { kty: 'OKP', crv: 'Ed25519', x: bytes.toString('base64url') } });
   } catch { throw new BrokerError('FORBIDDEN'); }
 }
