@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import {
   AppendReceiptSchema, BrokerError, GENESIS_PREV_HASH, MAX_U128, ReceiptEventSchema,
   requestDigest, sha256Hex, receiptHashInput, toDecimalText,
@@ -9,7 +9,7 @@ import type {
 } from '../../src/contracts/index.js';
 import {
   TransactionalApprovalService, consumeStandingApproval, listStandingApprovals,
-  matchStandingApproval, reserveStandingApproval, selectStandingApproval,
+  expirePending, matchStandingApproval, reserveStandingApproval, selectStandingApproval,
 } from '../../src/approvals/index.js';
 import { SqliteStore } from '../../src/storage/index.js';
 import { PurePolicyEvaluator } from '../../src/policy/index.js';
@@ -97,6 +97,13 @@ function events(store: SqliteStore, chainId = 'owner') {
 }
 function expectCode(operation: () => unknown, code = 'FORBIDDEN') {
   expect(operation).toThrowError(expect.objectContaining({ code }));
+}
+function overrideTx(tx: StoreTransaction, overrides: Partial<StoreTransaction>): StoreTransaction {
+  return new Proxy(tx, { get(target, key) {
+    if (Object.hasOwn(overrides, key)) return Reflect.get(overrides, key);
+    const value: unknown = Reflect.get(target, key);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
 }
 
 describe('owner-bound pending approval', () => {
@@ -227,6 +234,9 @@ describe('owner-bound pending approval', () => {
     const { store, service } = fixture();
     store.withImmediateTransaction((tx) => service.approve(tx, { ...approveCommand(), expiresAt: 2000 }));
     expect(store.read((view) => view.getRequestApproval('request-1')?.expiresAt)).toBe(1000);
+    for (const chainId of ['owner', `agent:${agentId}`]) {
+      expect(events(store, chainId)).toMatchObject([{ type: 'approved', payload: { expiresAt: 1000 } }]);
+    }
     for (const command of [{ ...approveCommand(), expiresAt: 200 }, { ...approveCommand(), now: 99 },
       { ...approveCommand(), expiresAt: NaN }]) {
       const fresh = fixture();
@@ -252,6 +262,91 @@ describe('owner-bound pending approval', () => {
     expect(store.read((view) => view.listAccounting({}, { limit: 100 }).items)).toEqual([]);
     expect(events(store)).toEqual([]);
     expect(events(store, `agent:${agentId}`)).toEqual([]);
+  });
+});
+
+describe('validation and owner-independent expiry regressions', () => {
+  test('reject maps lone-surrogate reason to stable FORBIDDEN before writes', () => {
+    const { store, service, receipts } = fixture();
+    expectCode(() => store.withImmediateTransaction((tx) => service.reject(tx,
+      { requestId: 'request-1', reason: '\ud800', now: 200 })));
+    expect(receipts.calls).toBe(0);
+    expect(store.read((view) => view.getRequest('request-1'))).toEqual(request());
+    expect(store.read((view) => view.getHold('request-1')?.status)).toBe('active');
+  });
+
+  test('reserve validates time, request and approval ID before touching storage', () => {
+    const { store } = fixture(false);
+    const getStandingApproval = vi.fn(() => grant());
+    store.withImmediateTransaction((tx) => {
+      const view = overrideTx(tx, { getStandingApproval });
+      for (const invalid of [NaN, -1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+        expectCode(() => reserveStandingApproval(view, request(), 'grant-a', invalid));
+      }
+      for (const id of ['', '\ud800', 'x'.repeat(129)]) {
+        expectCode(() => reserveStandingApproval(view, request(), id, now));
+        expectCode(() => reserveStandingApproval(view, { ...request(), id }, 'grant-a', now));
+      }
+      expectCode(() => reserveStandingApproval(view, { ...request(), agentId: '' }, 'grant-a', now));
+      expectCode(() => reserveStandingApproval(view, { ...request(), receiverId: 'bad account' }, 'grant-a', now));
+      expectCode(() => reserveStandingApproval(view, { ...request(), amount: 0n }, 'grant-a', now), 'INVALID_AMOUNT');
+      expectCode(() => reserveStandingApproval(view, { ...request(), amount: MAX_U128 + 1n }, 'grant-a', now), 'INVALID_AMOUNT');
+    });
+    expect(getStandingApproval).not.toHaveBeenCalled();
+  });
+
+  test('reserve reports missing standing approval as NOT_FOUND', () => {
+    const { store } = fixture(false);
+    expectCode(() => store.withImmediateTransaction((tx) => reserveStandingApproval(tx, request(), 'absent', now)), 'NOT_FOUND');
+  });
+
+  test('sweeper expires at the exact boundary without owner, releases both budgets and emits both receipts only once', () => {
+    const { store, receipts } = fixture();
+    expect(store.withImmediateTransaction((tx) => expirePending(tx, 'request-1', 999, receipts))).toEqual(request());
+    expect(receipts.calls).toBe(0);
+    // Expiry remains possible after revocation; there is no new spending.
+    store.withImmediateTransaction((tx) => tx.putAgent({ ...tx.getAgent(agentId)!, status: 'revoked' }));
+    const expired = store.withImmediateTransaction((tx) => expirePending(tx, 'request-1', 1000, receipts));
+    expect(expired).toEqual({ ...request(), state: 'expired', updatedAt: 1000, completedAt: 1000 });
+    expect(store.read((view) => view.getHold('request-1')?.status)).toBe('released');
+    expect(store.read((view) => view.getUsageSnapshot(agentId, 1000))).toMatchObject({ outstandingHolds: 0n, agentOutstanding: 0 });
+    const entries = store.read((view) => view.listAccounting({}, { limit: 100 }).items);
+    expect(entries).toHaveLength(2);
+    expect(entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'principal_released', amount: 10n, at: 1000 }),
+      expect.objectContaining({ kind: 'fee_released', amount: 2n, at: 1000 }),
+    ]));
+    for (const chainId of ['owner', `agent:${agentId}`]) {
+      expect(events(store, chainId)).toMatchObject([{ type: 'expired', at: 1000,
+        payload: { requestId: 'request-1', agentId, reason: 'Pending approval expired' } }]);
+    }
+    expect(store.withImmediateTransaction((tx) => expirePending(tx, 'request-1', 1001, receipts))).toEqual(expired);
+    expect(receipts.calls).toBe(2);
+    expect(store.read((view) => view.listAccounting({}, { limit: 100 }).items)).toHaveLength(2);
+  });
+
+  test('sweeper leaves no-expiry/nonpending work alone, validates inputs and rolls back on audit failure', () => {
+    const { store, receipts } = fixture(false);
+    store.withImmediateTransaction((tx) => {
+      insert(tx, request('no-expiry', { expiresAt: null }));
+      insert(tx, request('queued', { state: 'queued', reasons: [] }));
+      for (const id of ['no-expiry', 'queued']) {
+        expect(expirePending(tx, id, 2000, receipts)).toEqual(tx.getRequest(id));
+        expect(tx.getHold(id)?.status).toBe('active');
+      }
+      expectCode(() => expirePending(tx, 'missing', now, receipts), 'NOT_FOUND');
+      expectCode(() => expirePending(tx, '', now, receipts));
+      expectCode(() => expirePending(tx, 'no-expiry', NaN, receipts));
+    });
+    expect(receipts.calls).toBe(0);
+    const due = fixture();
+    due.receipts.failOn = 2;
+    expectCode(() => due.store.withImmediateTransaction((tx) => expirePending(tx, 'request-1', 1000, due.receipts)), 'AUDIT_UNAVAILABLE');
+    expect(due.store.read((view) => view.getRequest('request-1'))).toEqual(request());
+    expect(due.store.read((view) => view.getHold('request-1')?.status)).toBe('active');
+    expect(due.store.read((view) => view.listAccounting({}, { limit: 100 }).items)).toEqual([]);
+    expect(events(due.store)).toEqual([]);
+    expect(events(due.store, `agent:${agentId}`)).toEqual([]);
   });
 });
 
@@ -301,6 +396,39 @@ describe('pure standing approval bounds and settlement debit', () => {
     }
   });
 
+  test('selection isolates the requesting agent even if another agent has the smallest grant ID', () => {
+    const input = { approvals: [grant({ id: 'a', agentId: 'other' }), grant({ id: 'z' })],
+      standingReserved: {}, agentId, receiverId: 'recipient.testnet', amount: 10n, now };
+    expect(selectStandingApproval(input)).toEqual({ kind: 'match', approvalId: 'z' });
+    expect(selectStandingApproval({ ...input, approvals: input.approvals.slice(0, 1) })).toEqual({ kind: 'no_match', reasons: ['APPROVAL_REQUIRED'] });
+  });
+
+  test.each([
+    [['a', 'B'], 'B'], [['\u00e9', 'e\u0301'], 'e\u0301'], [['2', '10'], '10'], [['\ue000', '\u{10000}'], '\u{10000}'],
+  ] as const)('selection uses UTF-16 ordering for %j and agrees with B02', (ids, expected) => {
+    const { store, service } = fixture(false);
+    const approvals = ids.map((id) => grant({ id }));
+    for (const ordered of [approvals, [...approvals].reverse()]) {
+      const input = { approvals: ordered, standingReserved: {}, agentId, receiverId: 'recipient.testnet', amount: 10n, now: 200 };
+      expect(selectStandingApproval(input)).toEqual({ kind: 'match', approvalId: expected });
+      for (const evaluator of [new PurePolicyEvaluator(), new PurePolicyEvaluator({ matchStandingApproval: service.matchStandingApproval })]) {
+        expect(evaluator.evaluate({ ...evaluation(store), standingApprovals: ordered })).toEqual({
+          kind: 'allow_via_standing_approval', reasons: [], standingApprovalId: expected,
+        });
+      }
+    }
+  });
+
+  test('instance matcher and consumer ports enforce bounds and debit successful principal', () => {
+    const { service } = fixture(false);
+    expect(service.matchStandingApproval(matchInput())).toEqual({ kind: 'match', approvalId: 'grant-a' });
+    expect(service.matchStandingApproval(matchInput({ reservedTotal: 30n }))).toEqual({ kind: 'no_match', reasons: ['APPROVAL_REQUIRED'] });
+    const approval = grant();
+    expect(service.consumeStandingApproval({ approval, amount: 10n, reservedAmount: 10n })).toEqual({ ...approval, usedTotal: 10n });
+    expect(approval.usedTotal).toBe(0n);
+    expectCode(() => service.consumeStandingApproval({ approval, amount: 10n, reservedAmount: 9n }));
+  });
+
   test('successful debit is monotonic and pure, including expired/revoked grants; requires covered reservation', () => {
     const original = grant({ usedTotal: 10n, expiresAt: 0, revokedAt: 0, recipients: [] });
     const before = structuredClone(original);
@@ -339,6 +467,30 @@ describe('transactional standing grants, derived reservations and receipts', () 
       payload: { agentId, approvalId: 'grant-a', revokedAt: 200 } }]);
     expect(events(store, `agent:${agentId}`).map((event) => event.type)).toEqual(['standing_approval_granted', 'standing_approval_revoked']);
     expectCode(() => store.withImmediateTransaction((tx) => tx.putStandingApproval({ ...revoked, usedTotal: 0n })));
+  });
+
+  test('grant omits explicit undefined recipients from both stored record and canonical receipt payload', () => {
+    const { store, service } = fixture(false);
+    const approval = grantIn(store, service, { recipients: undefined });
+    expect(approval).toEqual(grant());
+    expect(Object.hasOwn(approval, 'recipients')).toBe(false);
+    expect(Object.hasOwn(store.read((view) => view.getStandingApproval(approval.id))!, 'recipients')).toBe(false);
+    for (const chainId of ['owner', `agent:${agentId}`]) {
+      const event = events(store, chainId)[0]!;
+      expect(event.type).toBe('standing_approval_granted');
+      if (event.type !== 'standing_approval_granted') throw new Error('wrong receipt type');
+      expect(Object.hasOwn(event.payload.approval, 'recipients')).toBe(false);
+      expect(event.payload.approval).toEqual({ ...grant(), perTxMax: '10', totalMax: '30', usedTotal: '0' });
+    }
+  });
+
+  test('byte-identical duplicate zero-usage grant is rejected without a second granted receipt', () => {
+    const { store, service } = fixture(false);
+    grantIn(store, service);
+    expectCode(() => grantIn(store, service));
+    expect(store.read((view) => view.getStandingApproval('grant-a'))).toEqual(grant());
+    expect(events(store)).toHaveLength(1);
+    expect(events(store, `agent:${agentId}`)).toHaveLength(1);
   });
 
   test('invalid bounds/expired grants, unknown/revoked agents and missing revoke targets denied', () => {
@@ -387,6 +539,20 @@ describe('transactional standing grants, derived reservations and receipts', () 
     expect(store.read((view) => listStandingApprovals(view, 'other'))).toEqual([]);
   });
 
+  test.each(['empty', 'mismatched', 'repeated'] as const)('paging rejects %s nonprogressing cursors instead of looping or silently accepting', (kind) => {
+    const { store } = fixture(false);
+    store.withImmediateTransaction((tx) => {
+      const pages = vi.fn<StoreTransaction['listStandingApprovals']>();
+      if (kind === 'repeated') pages.mockReturnValueOnce({ items: [grant()], nextCursor: 'grant-a' });
+      pages.mockReturnValueOnce(kind === 'empty' ? { items: [], nextCursor: 'grant-a' }
+        : { items: [grant()], nextCursor: kind === 'mismatched' ? 'not-the-last-id' : 'grant-a' });
+      // Finite fallback ensures a removed guard fails an assertion, not a timeout.
+      pages.mockReturnValue({ items: [], nextCursor: null });
+      expectCode(() => listStandingApprovals(overrideTx(tx, { listStandingApprovals: pages }), agentId));
+      expect(pages).toHaveBeenCalledTimes(kind === 'repeated' ? 2 : 1);
+    });
+  });
+
   test.each(['grant', 'revoke'] as const)('%s rolls back on audit failure', (operation) => {
     const { store, service, receipts } = fixture(false);
     if (operation === 'revoke') grantIn(store, service);
@@ -417,6 +583,41 @@ describe('transactional standing grants, derived reservations and receipts', () 
     });
     return value;
   }
+
+  test.each(['failed', 'cancelled', 'submitted', 'outcome_unknown'] as const)('settlement rejects %s with a standing ref and active hold before any writes', (state) => {
+    const { store, service, receipts } = fixture(false);
+    store.withImmediateTransaction((tx) => {
+      const debit = vi.fn();
+      const holdWrite = vi.fn();
+      const req = request('request-1', { state, approvalRef: { kind: 'standing', id: 'grant-a' } });
+      const view = overrideTx(tx, { getRequest: () => req, getStandingApproval: () => grant(),
+        getHold: () => ({ requestId: req.id, agentId, principal: req.amount, feeReserve: 2n, status: 'active' }),
+        putStandingApproval: debit, putHold: holdWrite });
+      expectCode(() => service.settleStandingApproval(view, req.id, 200));
+      expect(debit).not.toHaveBeenCalled();
+      expect(holdWrite).not.toHaveBeenCalled();
+      expect(receipts.calls).toBe(0);
+    });
+  });
+
+  test.each(['request-ref', 'hold-agent', 'approval-agent'] as const)('settlement rejects mismatched %s before any writes', (mismatch) => {
+    const { store, service, receipts } = fixture(false);
+    store.withImmediateTransaction((tx) => {
+      const debit = vi.fn();
+      const holdWrite = vi.fn();
+      const req = request('request-1', { state: 'succeeded',
+        approvalRef: { kind: mismatch === 'request-ref' ? 'request' : 'standing', id: 'grant-a' } });
+      const view = overrideTx(tx, { getRequest: () => req,
+        getStandingApproval: () => grant({ agentId: mismatch === 'approval-agent' ? 'other' : agentId }),
+        getHold: () => ({ requestId: req.id, agentId: mismatch === 'hold-agent' ? 'other' : agentId,
+          principal: req.amount, feeReserve: 2n, status: 'active' }),
+        putStandingApproval: debit, putHold: holdWrite });
+      expectCode(() => service.settleStandingApproval(view, req.id, 200));
+      expect(debit).not.toHaveBeenCalled();
+      expect(holdWrite).not.toHaveBeenCalled();
+      expect(receipts.calls).toBe(0);
+    });
+  });
 
   test('successful settlement debits expired/revoked grant, removes reservation and emits used exactly once', () => {
     const { store, service } = successfulFixture();

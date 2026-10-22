@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import type { z } from 'zod';
 import {
-  ApproveRequestCommandSchema, BrokerError, GrantStandingApprovalCommandSchema,
+  ApproveRequestCommandSchema, BrokerError, GrantStandingApprovalCommandSchema, IdSchema,
   OwnerPrincipalSchema, RejectRequestCommandSchema, RevokeStandingApprovalCommandSchema,
-  StandingApprovalConsumeInputSchema, StandingApprovalMatchInputSchema, TimestampSchema,
+  StandingApprovalConsumeInputSchema, StandingApprovalMatchInputSchema, TimestampSchema, TransferRequestSchema,
   requestDigest, toDecimalText,
 } from '../contracts/index.js';
 import type {
@@ -16,7 +16,12 @@ import type {
 
 function validate<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
-  if (result.success) return result.data;
+  if (result.success) {
+    // Zod strings allow lone surrogates, but signed canonical JSON does not.
+    // Check schema-parsed values before any storage or receipt side effects.
+    validateStrings(result.data);
+    return result.data;
+  }
   const monetary = new Set(['amount', 'perTxMax', 'totalMax', 'usedTotal', 'reservedTotal', 'reservedAmount']);
   throw new BrokerError(result.error.issues.some((issue) => issue.path.some((key) => monetary.has(String(key))))
     ? 'INVALID_AMOUNT' : 'FORBIDDEN');
@@ -24,6 +29,13 @@ function validate<T>(schema: z.ZodType<T>, value: unknown): T {
 function requireThat(value: unknown): asserts value {
   if (!value) throw new BrokerError('FORBIDDEN');
 }
+
+function validateStrings(value: unknown): void {
+  if (typeof value === 'string') requireThat(value.isWellFormed());
+  else if (value !== null && typeof value === 'object') Object.values(value).forEach(validateStrings);
+}
+
+const ReservationRequestSchema = TransferRequestSchema.pick({ id: true, agentId: true, receiverId: true, amount: true }).strip();
 
 /** Pure grant bounds only, NEVER a policy/freeze/wallet authorization. */
 export function matchStandingApproval(input: StandingApprovalMatchInput): StandingApprovalMatch {
@@ -86,6 +98,9 @@ export function reserveStandingApproval(
   approvalId: string,
   now: number,
 ): ApprovalRef {
+  request = validate(ReservationRequestSchema, request);
+  validate(IdSchema, approvalId);
+  validate(TimestampSchema, now);
   const approval = tx.getStandingApproval(approvalId);
   if (approval === null) throw new BrokerError('NOT_FOUND');
   const usage = tx.getUsageSnapshot(request.agentId, now, request.id);
@@ -93,6 +108,43 @@ export function reserveStandingApproval(
   requireThat(matchStandingApproval({ approval, agentId: request.agentId, receiverId: request.receiverId,
     amount: request.amount, reservedTotal, now }).kind === 'match');
   return { kind: 'standing', id: approvalId };
+}
+
+/** Owner-independent sweeper seam. Uses the caller's transaction and ReceiptLog;
+ * no nested transaction, owner impersonation or separate reservation counter.
+ * Not-yet-due/non-pending requests are unchanged, so repeated sweeps are safe.
+ */
+export function expirePending(tx: StoreTransaction, requestId: string, now: number, receipts: ReceiptLog): TransferRequest {
+  validate(IdSchema, requestId);
+  validate(TimestampSchema, now);
+  const request = tx.getRequest(requestId);
+  if (request === null) throw new BrokerError('NOT_FOUND');
+  if (request.state !== 'pending_approval') return request;
+  requireThat(now >= request.updatedAt);
+  if (request.expiresAt === null || now < request.expiresAt) return request;
+  const hold = tx.getHold(requestId);
+  requireThat(hold?.status === 'active' && hold.agentId === request.agentId && hold.principal === request.amount);
+  return finishPending(tx, request, now, 'expired', 'Pending approval expired', receipts);
+}
+
+function finishPending(tx: StoreTransaction, request: TransferRequest, now: number,
+  state: 'rejected' | 'expired', reason: string, receipts: ReceiptLog): TransferRequest {
+  const hold = tx.getHold(request.id);
+  requireThat(hold?.status === 'active');
+  const finished: TransferRequest = { ...request, state, updatedAt: now, completedAt: now, approvalRef: null };
+  tx.updateRequest(finished, 'pending_approval');
+  tx.putHold({ ...hold, status: 'released' });
+  for (const [kind, amount] of [['principal_released', hold.principal], ['fee_released', hold.feeReserve]] as const) {
+    tx.appendAccounting({ id: randomUUID(), requestId: request.id, agentId: request.agentId, kind, amount, at: now });
+  }
+  appendBoth(tx, { chainId: 'owner', type: state, at: now,
+    payload: { requestId: request.id, agentId: request.agentId, reason } }, request.agentId, receipts);
+  return finished;
+}
+
+function appendBoth(tx: StoreTransaction, event: AppendReceipt, agentId: string, receipts: ReceiptLog): void {
+  receipts.append(tx, event);
+  receipts.append(tx, { ...event, chainId: `agent:${agentId}` });
 }
 
 /** Owner-scoped, synchronous implementation of the frozen port. Its signatures
@@ -113,7 +165,7 @@ export class TransactionalApprovalService implements ApprovalService {
     const command = validate(ApproveRequestCommandSchema, input);
     const request = this.pending(tx, command.requestId, command.now);
     if (request.expiresAt !== null && command.now >= request.expiresAt) {
-      return this.finishPending(tx, request, command.now, 'expired', 'Pending approval expired');
+      return finishPending(tx, request, command.now, 'expired', 'Pending approval expired', this.receipts);
     }
     requireThat(command.expiresAt > command.now);
     const policy = tx.getPolicy(request.agentId);
@@ -143,17 +195,17 @@ export class TransactionalApprovalService implements ApprovalService {
     const command = validate(RejectRequestCommandSchema, input);
     const request = this.pending(tx, command.requestId, command.now);
     return request.expiresAt !== null && command.now >= request.expiresAt
-      ? this.finishPending(tx, request, command.now, 'expired', 'Pending approval expired')
-      : this.finishPending(tx, request, command.now, 'rejected', command.reason);
+      ? finishPending(tx, request, command.now, 'expired', 'Pending approval expired', this.receipts)
+      : finishPending(tx, request, command.now, 'rejected', command.reason, this.receipts);
   }
 
   grantStandingApproval(tx: StoreTransaction, input: GrantStandingApprovalCommand): StandingApproval {
-    const { now, ...grant } = validate(GrantStandingApprovalCommandSchema, input);
+    const { now, recipients, ...grant } = validate(GrantStandingApprovalCommandSchema, input);
     requireThat(grant.expiresAt > now && tx.getStandingApproval(grant.id) === null);
     const agent = tx.getAgent(grant.agentId);
     if (agent === null) throw new BrokerError('NOT_FOUND');
     requireThat(agent.status === 'active');
-    const approval: StandingApproval = { ...grant, usedTotal: 0n };
+    const approval: StandingApproval = { ...grant, ...(recipients === undefined ? {} : { recipients }), usedTotal: 0n };
     tx.putStandingApproval(approval);
     this.appendBoth(tx, { chainId: 'owner', type: 'standing_approval_granted', at: now, payload: {
       agentId: approval.agentId, approval: { ...approval, perTxMax: toDecimalText(approval.perTxMax),
@@ -180,6 +232,7 @@ export class TransactionalApprovalService implements ApprovalService {
    * Repeated calls fail closed rather than debit twice. No debit on failure.
    */
   settleStandingApproval(tx: StoreTransaction, requestId: string, now: number): StandingApproval {
+    validate(IdSchema, requestId);
     validate(TimestampSchema, now);
     const request = tx.getRequest(requestId);
     if (request === null) throw new BrokerError('NOT_FOUND');
@@ -206,23 +259,7 @@ export class TransactionalApprovalService implements ApprovalService {
     return request;
   }
 
-  private finishPending(tx: StoreTransaction, request: TransferRequest, now: number,
-    state: 'rejected' | 'expired', reason: string): TransferRequest {
-    const hold = tx.getHold(request.id);
-    requireThat(hold?.status === 'active');
-    const finished: TransferRequest = { ...request, state, updatedAt: now, completedAt: now, approvalRef: null };
-    tx.updateRequest(finished, 'pending_approval');
-    tx.putHold({ ...hold, status: 'released' });
-    for (const [kind, amount] of [['principal_released', hold.principal], ['fee_released', hold.feeReserve]] as const) {
-      tx.appendAccounting({ id: randomUUID(), requestId: request.id, agentId: request.agentId, kind, amount, at: now });
-    }
-    this.appendBoth(tx, { chainId: 'owner', type: state, at: now,
-      payload: { requestId: request.id, agentId: request.agentId, reason } }, request.agentId);
-    return finished;
-  }
-
   private appendBoth(tx: StoreTransaction, event: AppendReceipt, agentId: string): void {
-    this.receipts.append(tx, event);
-    this.receipts.append(tx, { ...event, chainId: `agent:${agentId}` });
+    appendBoth(tx, event, agentId, this.receipts);
   }
 }
