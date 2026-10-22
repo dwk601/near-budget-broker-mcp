@@ -1,4 +1,4 @@
-import { generateKeyPairSync, sign } from 'node:crypto';
+import { createPrivateKey, createPublicKey, generateKeyPairSync, sign } from 'node:crypto';
 import type { KeyObject } from 'node:crypto';
 import { vi } from 'vitest';
 import { GENESIS_PREV_HASH, checkpointHashInput, receiptHashInput, sha256Hex } from '../../../src/contracts/index.js';
@@ -20,8 +20,12 @@ function base58(bytes: Buffer): string {
 }
 
 export interface TestSigner extends AuditSigner { nodePublicKey: KeyObject }
-export function testSigner(): TestSigner {
-  const keys = generateKeyPairSync('ed25519');
+export function testSigner(seedHex?: string): TestSigner {
+  const privateKey = seedHex === undefined ? undefined : createPrivateKey({
+    key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), Buffer.from(seedHex, 'hex')]),
+    format: 'der', type: 'pkcs8',
+  });
+  const keys = privateKey ? { privateKey, publicKey: createPublicKey(privateKey) } : generateKeyPairSync('ed25519');
   const rawPublicKey = keys.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
   return {
     publicKey: `ed25519:${base58(rawPublicKey)}`, nodePublicKey: keys.publicKey,

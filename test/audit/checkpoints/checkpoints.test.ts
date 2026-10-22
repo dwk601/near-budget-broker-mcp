@@ -95,13 +95,90 @@ describe('transactional checkpoints', () => {
     expect(() => store.withImmediateTransaction((tx) => log.create(tx, 'agent:a', clock.now() + 5))).toThrowError(new BrokerError('AUDIT_UNAVAILABLE'));
     expect(signer.signHash).not.toHaveBeenCalled();
     expect(log.list('agent:a', 0, 10)).toEqual([first]);
-    for (const time of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN]) {
-      expect(() => store.withImmediateTransaction((tx) => log.create(tx, 'agent:a', time))).toThrowError(new BrokerError('AUDIT_UNAVAILABLE'));
-    }
-    expect(() => log.list('bad-chain', 0, 10)).toThrow();
+    const forbidden = expect.objectContaining({ name: 'BrokerError', code: 'FORBIDDEN', message: 'FORBIDDEN' });
+    const readSpy = vi.spyOn(store, 'read');
+    expect(() => log.list('bad-chain', 0, 10)).toThrowError(forbidden);
     for (const [after, limit] of [[-1, 1], [0.5, 1], [0, 0], [0, 1001], [0, 1.5], [NaN, 1]]) {
-      expect(() => log.list('agent:a', after!, limit!)).toThrow();
+      expect(() => log.list('agent:a', after!, limit!)).toThrowError(forbidden);
     }
+    expect(() => exportReceiptChain(store, 'bad-chain')).toThrowError(forbidden);
+    expect(readSpy).not.toHaveBeenCalled();
+  });
+
+  test.each([-1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN])('rejects invalid at %s on a fresh nonempty chain before signing', (at) => {
+    const store = database();
+    const signer = testSigner();
+    const log = new CheckpointLog(store, signer);
+    store.withImmediateTransaction((tx) => appendReceipt(tx, signer));
+    vi.mocked(signer.signHash).mockClear();
+    expect(() => store.withImmediateTransaction((tx) => log.create(tx, 'agent:a', at)))
+      .toThrowError(expect.objectContaining({ name: 'BrokerError', code: 'AUDIT_UNAVAILABLE' }));
+    expect(signer.signHash).not.toHaveBeenCalled();
+    expect(log.list('agent:a', 0, 10)).toEqual([]);
+  });
+
+  test.each(['other-key', 'tampered-hash', 'tampered-signature'] as const)('rejects a stored %s previous checkpoint before signing', (corruption) => {
+    const store = database();
+    const signer = testSigner();
+    const log = new CheckpointLog(store, signer);
+    const previous = store.withImmediateTransaction((tx) => {
+      const head = appendReceipt(tx, signer);
+      const priorSigner = corruption === 'other-key' ? testSigner() : signer;
+      const checkpoint = signCheckpoint(priorSigner, {
+        version: 1, chainId: 'agent:a', seq: head.seq, headHash: head.hash,
+        previousCheckpointHash: null, at: clock.now(), auditPublicKey: priorSigner.publicKey,
+      });
+      if (corruption === 'tampered-hash') checkpoint.hash = 'f'.repeat(64);
+      if (corruption === 'tampered-signature') checkpoint.signature = Buffer.alloc(64).toString('base64');
+      // Storage enforces CAS, not authenticity. Model a corrupted/restored DB.
+      tx.insertCheckpoint(checkpoint);
+      appendReceipt(tx, signer);
+      return checkpoint;
+    });
+    vi.mocked(signer.signHash).mockClear();
+    expect(() => store.withImmediateTransaction((tx) => log.create(tx, 'agent:a', clock.now())))
+      .toThrowError(expect.objectContaining({ name: 'BrokerError', code: 'AUDIT_UNAVAILABLE' }));
+    expect(signer.signHash).not.toHaveBeenCalled();
+    expect(log.list('agent:a', 0, 10)).toEqual([previous]);
+  });
+
+  test('rejects an authenticated previous checkpoint from another chain before signing or inserting', () => {
+    const store = database();
+    const signer = testSigner();
+    const log = new CheckpointLog(store, signer);
+    const previous = store.withImmediateTransaction((tx) => {
+      appendReceipt(tx, signer, 'owner');
+      const checkpoint = log.create(tx, 'owner', clock.now());
+      appendReceipt(tx, signer);
+      appendReceipt(tx, signer);
+      return checkpoint;
+    });
+    vi.mocked(signer.signHash).mockClear();
+    store.withImmediateTransaction((tx) => {
+      vi.spyOn(tx, 'getCheckpointHead').mockReturnValue(previous);
+      // Deliberately permissive port: do not let SQLite's CAS mask the guard.
+      const insert = vi.spyOn(tx, 'insertCheckpoint').mockImplementation(() => {});
+      expect(() => log.create(tx, 'agent:a', clock.now()))
+        .toThrowError(expect.objectContaining({ name: 'BrokerError', code: 'AUDIT_UNAVAILABLE' }));
+      expect(insert).not.toHaveBeenCalled();
+    });
+    expect(signer.signHash).not.toHaveBeenCalled();
+  });
+
+  test('rejects a receipt head from another chain before signing or inserting', () => {
+    const store = database();
+    const signer = testSigner();
+    const log = new CheckpointLog(store, signer);
+    const wrongHead = store.withImmediateTransaction((tx) => appendReceipt(tx, signer, 'owner'));
+    vi.mocked(signer.signHash).mockClear();
+    store.withImmediateTransaction((tx) => {
+      vi.spyOn(tx, 'getReceiptHead').mockReturnValue(wrongHead);
+      const insert = vi.spyOn(tx, 'insertCheckpoint').mockImplementation(() => {});
+      expect(() => log.create(tx, 'agent:a', clock.now()))
+        .toThrowError(expect.objectContaining({ code: 'AUDIT_UNAVAILABLE' }));
+      expect(insert).not.toHaveBeenCalled();
+    });
+    expect(signer.signHash).not.toHaveBeenCalled();
   });
 
   test.each(['throw', 'short', 'wrong-key'] as const)('signer %s failure rolls back receipt and caller state', (failure) => {
@@ -160,6 +237,32 @@ describe('transactional checkpoints', () => {
 });
 
 describe('trusted-key checkpoint verification', () => {
+  test('returns structured failures for non-array inputs rather than throwing', () => {
+    const { log, signer } = fixture();
+    for (const input of [null, undefined, {}, { length: 0 }, 'invalid', 42]) {
+      const checkpoints = input as unknown as readonly Checkpoint[];
+      const expected = { valid: false, chainId: 'owner', checked: 0, firstInvalidSeq: null, reason: expect.any(String) };
+      expect(verifyCheckpoints(checkpoints, signer.publicKey)).toEqual(expected);
+      expect(log.verify(checkpoints, signer.publicKey)).toEqual(expected);
+    }
+  });
+
+  test('deterministic pinned key with two leading zero bytes verifies checkpoints and exports', () => {
+    const signer = testSigner('0000000000000000000000000000000000000000000000000000000000000024');
+    const raw = signer.nodePublicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
+    expect(raw.toString('hex')).toBe('00001f8bea42b3c74c50aa3589b1aa065f196857db97a75e4a54953f093e6772');
+    expect(signer.publicKey.startsWith('ed25519:11')).toBe(true);
+    const store = database();
+    const log = new CheckpointLog(store, signer);
+    const checkpoint = store.withImmediateTransaction((tx) => {
+      appendReceipt(tx, signer);
+      return log.create(tx, 'agent:a', clock.now());
+    });
+    expect(nodeVerify(null, Buffer.from(checkpoint.hash, 'hex'), signer.nodePublicKey, Buffer.from(checkpoint.signature, 'base64'))).toBe(true);
+    expect(log.verify([checkpoint], signer.publicKey).valid).toBe(true);
+    expect(verifyExportedChain(exportReceiptChain(store, 'agent:a'), checkpoint, signer.publicKey).valid).toBe(true);
+  });
+
   test('rejects signed but broken ancestry, nonmonotonic seq and a partial checkpoint page', () => {
     const { log, signer, first, second } = fixture();
     const wrongLink = signCheckpoint(signer, preimage(second, { previousCheckpointHash: 'f'.repeat(64) }));
@@ -210,6 +313,21 @@ describe('export verification with independently retained checkpoint', () => {
     expect(verifyExportedChain(exported, first, signer.publicKey).valid).toBe(true);
     expect(log.verify([retained], signer.publicKey).valid).toBe(false); // Not the complete checkpoint history.
     expectInvalid(verifyExportedChain(exported, retained, testSigner().publicKey));
+  });
+
+  test('rejects a validly signed sequence-one receipt with a non-genesis previous hash', () => {
+    const signer = testSigner();
+    const receipt = signReceipt(signer, {
+      chainId: 'agent:a', seq: 1, prevHash: 'f'.repeat(64), type: 'queued', at: clock.now(),
+      payload: { requestId: 'r', agentId: 'a' },
+    });
+    const retained = signCheckpoint(signer, {
+      version: 1, chainId: 'agent:a', seq: 1, headHash: receipt.hash,
+      previousCheckpointHash: null, at: clock.now(), auditPublicKey: signer.publicKey,
+    });
+    expect(nodeVerify(null, Buffer.from(receipt.hash, 'hex'), signer.nodePublicKey, Buffer.from(receipt.signature, 'base64'))).toBe(true);
+    expect(verifyCheckpoints([retained], signer.publicKey).valid).toBe(true);
+    expectInvalid(verifyExportedChain([receipt], retained, signer.publicKey), 1);
   });
 
   test('detects removed suffix, an empty export, omitted interior receipt and wrong chain', () => {
@@ -289,6 +407,11 @@ describe('export verification with independently retained checkpoint', () => {
     expectInvalid(verifyExportedChain(receipts, foreignCheckpoint, signer.publicKey), 3);
     const wrongSignature = { ...second, signature: Buffer.alloc(64).toString('base64') };
     expectInvalid(verifyExportedChain(receipts, wrongSignature, signer.publicKey), 3);
+    // Node's base64 decoder accepts whitespace; the wire schemas must not.
+    expectInvalid(verifyExportedChain(receipts, { ...second, signature: `${second.signature}\n` }, signer.publicKey), 3);
+    const noncanonicalSignature = receipts.map((receipt, index) => index === 0
+      ? { ...receipt, signature: `${receipt.signature}\n` } : receipt);
+    expectInvalid(verifyExportedChain(noncanonicalSignature, second, signer.publicKey), 1);
     expectInvalid(verifyExportedChain(receipts, second, `ed25519:${'z'.repeat(44)}`));
   });
 
@@ -302,6 +425,27 @@ describe('export verification with independently retained checkpoint', () => {
       });
       expectInvalid(verifyExportedChain([genesis, extension], first, signer.publicKey), 2);
     }
+  });
+
+  test.each(['wrong-chain', 'repeated-seq', 'backwards-seq'] as const)('export rejects a %s result from a permissive reader port', (fault) => {
+    const { store, signer } = fixture();
+    const receipts = exportReceiptChain(store, 'agent:a');
+    const wrongChain = signReceipt(signer, {
+      chainId: 'owner', seq: 1, prevHash: GENESIS_PREV_HASH, type: 'queued', at: clock.now(),
+      payload: { requestId: 'r', agentId: 'a' },
+    });
+    vi.spyOn(store, 'read').mockImplementation((operation) => {
+      // Keep SQLite's scope/order checks from masking the export helper guard.
+      return store.withImmediateTransaction((tx) => {
+        vi.spyOn(tx, 'listReceipts')
+          .mockReturnValueOnce(fault === 'wrong-chain' ? [wrongChain]
+            : fault === 'repeated-seq' ? [receipts[0]!, receipts[0]!] : [receipts[1]!, receipts[0]!])
+          .mockReturnValue([]);
+        return operation(tx);
+      });
+    });
+    expect(() => exportReceiptChain(store, 'agent:a'))
+      .toThrowError(expect.objectContaining({ name: 'BrokerError', code: 'AUDIT_UNAVAILABLE' }));
   });
 
   test('export reads beyond the 1000-item page limit within a single snapshot', () => {

@@ -17,6 +17,7 @@ function result(chainId: ChainId, checked: number, reason: string | null = null,
  * Verification requires a complete, single-chain checkpoint history from its
  * first checkpoint (not an arbitrary list page). No local list proves freshness. */
 export function verifyCheckpoints(checkpoints: readonly Checkpoint[], pinned: Ed25519PublicKey): CheckpointVerification {
+  if (!Array.isArray(checkpoints)) return result('owner', 0, 'Expected checkpoint array');
   const chainId = ChainIdSchema.safeParse(checkpoints[0]?.chainId).data ?? 'owner';
   if (checkpoints.length === 0) return result(chainId, 0, 'No checkpoints');
   let checked = 0;
@@ -75,9 +76,13 @@ export class CheckpointLog implements CheckpointLogPort {
   }
 
   list(chainId: ChainId, afterSeq: number, limit: number): Checkpoint[] {
-    ChainIdSchema.parse(chainId);
-    CountSchema.parse(afterSeq);
-    CountSchema.min(1).max(1000).parse(limit);
+    try {
+      ChainIdSchema.parse(chainId);
+      CountSchema.parse(afterSeq);
+      CountSchema.min(1).max(1000).parse(limit);
+    } catch {
+      throw new BrokerError('FORBIDDEN');
+    }
     return this.store.read((view) => view.listCheckpoints(chainId, afterSeq, limit));
   }
 
@@ -89,7 +94,7 @@ export class CheckpointLog implements CheckpointLogPort {
 /** Internal/owner export: all pages share one read snapshot. Authorization is
  * the caller's responsibility; do not expose arbitrary chain IDs to agents. */
 export function exportReceiptChain(store: Store, chainId: ChainId): ReceiptEvent[] {
-  ChainIdSchema.parse(chainId);
+  if (!ChainIdSchema.safeParse(chainId).success) throw new BrokerError('FORBIDDEN');
   return store.read((view) => {
     const receipts: ReceiptEvent[] = [];
     let afterSeq = 0;
