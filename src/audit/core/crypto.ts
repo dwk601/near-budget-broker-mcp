@@ -6,7 +6,7 @@ const BASE58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 
 /** Public-key encoding only; no custody/NEAR key material is involved. */
 export function encodeAuditPublicKey(key: KeyObject): string {
-  const jwk = createPublicKey(key).export({ format: 'jwk' });
+  const jwk = (key.type === 'public' ? key : createPublicKey(key)).export({ format: 'jwk' });
   if (jwk.crv !== 'Ed25519' || !jwk.x) throw new TypeError('Expected Ed25519');
   const bytes = Buffer.from(jwk.x, 'base64url');
   let value = BigInt(`0x${bytes.toString('hex')}`);

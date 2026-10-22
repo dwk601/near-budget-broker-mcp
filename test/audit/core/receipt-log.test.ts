@@ -101,7 +101,67 @@ describe('transactional receipt log', () => {
     expect(read).not.toHaveBeenCalled();
     // Relabelling another agent's receipt does not make it a valid own receipt.
     expect(scoped.verifyReceipt({ ...other!, chainId: 'agent:a1' }).valid).toBe(false);
-    expect(() => store.withImmediateTransaction((tx) => scoped.append(tx, queued('a2')))).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }));
+    expect(() => store.withImmediateTransaction((tx) => scoped.append(tx, queued('a2')))).toThrow(expect.objectContaining({ code: 'AUDIT_UNAVAILABLE' }));
+  });
+
+  it.each(['a10', 'a1x'])('denies prefix-collision chain %s across every scoped operation', (agentId) => {
+    const { store, log } = setup();
+    const receipt = store.withImmediateTransaction((tx) => log.append(tx, queued(agentId, 'secret-req')));
+    const scoped = log.forAgent(principal('a1'));
+    const read = vi.spyOn(store, 'read');
+    expect(() => scoped.list(receipt.chainId, 0, 100)).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }));
+    expect(() => scoped.verify(receipt.chainId)).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }));
+    expect(() => scoped.verifyReceipt(receipt)).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }));
+    expect(() => scoped.forAgent(principal(agentId))).toThrow(expect.objectContaining({ code: 'FORBIDDEN' }));
+    expect(read).not.toHaveBeenCalled();
+    store.withImmediateTransaction((tx) => {
+      const head = vi.spyOn(tx, 'getReceiptHead');
+      expect(() => scoped.append(tx, queued(agentId, 'blocked'))).toThrow(expect.objectContaining({ code: 'AUDIT_UNAVAILABLE' }));
+      expect(head).not.toHaveBeenCalled();
+    });
+    expect(log.list(receipt.chainId, 0, 100)).toEqual([receipt]);
+  });
+
+  it.each([false, true])('rejects rolled-back receipts and same-parent signed forks (existing genesis=%s)', (hasGenesis) => {
+    const { store, log, signer } = setup();
+    if (hasGenesis) store.withImmediateTransaction((tx) => log.append(tx, queued()));
+    let ghost!: ReceiptEvent;
+    expect(() => store.withImmediateTransaction((tx) => {
+      ghost = log.append(tx, queued('a1', 'ghost'));
+      throw new Error('rollback');
+    })).toThrow('rollback');
+    expect(log.list('agent:a1', 0, 100)).toHaveLength(hasGenesis ? 1 : 0);
+    expect(verifyReceipt(ghost, signer.publicKey).valid).toBe(true); // Authentic, but not committed.
+    expect(log.verifyReceipt(ghost)).toMatchObject({ valid: false, checked: 0, firstInvalidSeq: ghost.seq });
+    const committed = store.withImmediateTransaction((tx) => log.append(tx, queued('a1', 'committed')));
+    expect(committed.seq).toBe(ghost.seq);
+    expect(committed.prevHash).toBe(ghost.prevHash);
+    expect(committed.hash).not.toBe(ghost.hash);
+    expect(log.verifyReceipt(ghost).valid).toBe(false);
+    expect(log.verifyReceipt(committed).valid).toBe(true);
+  });
+
+  it('normalizes hostile append failures and returns structured invalid verification results', () => {
+    const { store, log, signer } = setup();
+    let getterCalls = 0;
+    const accessor = Object.defineProperty({}, 'chainId', { get() { getterCalls++; throw new Error('hostile getter'); } });
+    const hostile: unknown[] = [null, undefined, 0, 'receipt', [], {}, accessor,
+      { ...queued(), chainId: 'invalid' }, { ...queued(), chainId: 1 }, { ...queued(), chainId: null }];
+    for (const input of hostile) {
+      expect(() => store.withImmediateTransaction((tx) => log.append(tx, input as AppendReceipt)))
+        .toThrow(expect.objectContaining({ code: 'AUDIT_UNAVAILABLE', message: 'AUDIT_UNAVAILABLE' }));
+      for (const result of [verifyReceipt(input, signer.publicKey), log.verifyReceipt(input as ReceiptEvent),
+        log.forAgent(principal()).verifyReceipt(input as ReceiptEvent)]) {
+        expect(ReceiptVerificationSchema.parse(result).valid).toBe(false);
+        expect(result.checked).toBe(0);
+      }
+    }
+    for (const chain of ['invalid', null, undefined, 1]) {
+      expect(ReceiptVerificationSchema.parse(verifyReceiptChain([], chain as string, signer.publicKey)).valid).toBe(false);
+      expect(ReceiptVerificationSchema.parse(log.verify(chain as string)).valid).toBe(false);
+    }
+    expect(getterCalls).toBe(0);
+    expect(log.list('agent:a1', 0, 100)).toEqual([]);
   });
 
   it('rolls back receipts and state on caller abort; retry starts at the unchanged head', () => {
@@ -207,6 +267,7 @@ describe('tamper detection and independent exports', () => {
       }
     } finally { db.close(); }
     expect(log.verify('agent:a1')).toMatchObject({ valid: false, checked: 1, firstInvalidSeq: 2 });
+    expect(log.verifyReceipt(receipts[1]!).valid).toBe(false); // Content and membership, not only the supplied signature.
     expect(log.verifyReceipt(receipts[2]!).valid).toBe(false);
   });
 

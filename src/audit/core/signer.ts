@@ -1,6 +1,7 @@
-import { createPrivateKey, generateKeyPairSync, sign } from 'node:crypto';
+import { createPrivateKey, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import type { KeyObject } from 'node:crypto';
-import { closeSync, constants, fstatSync, fsyncSync, openSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fchmodSync, fstatSync, fsyncSync, linkSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { BrokerError } from '../../contracts/index.js';
 import type { AuditSigner as AuditSignerPort, Config } from '../../contracts/index.js';
 import { encodeAuditPublicKey } from './crypto.js';
@@ -22,12 +23,36 @@ export class AuditSigner implements AuditSignerPort {
     try {
       const signer = new AuditSigner(generateKeyPairSync('ed25519').privateKey);
       if (location !== undefined) {
-        // Exclusive creation: never overwrite/rotate an existing chain's trust root.
-        const fd = openSync(pathOf(location), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+        // Publish a complete durable file atomically and exclusively. A failed
+        // write must not strand a corrupt trust root; a restrictive umask must
+        // not make the next daemon restart unable to load its own key.
+        const target = pathOf(location);
+        const temporary = join(dirname(target), `.${basename(target)}.${randomUUID()}.tmp`);
+        const directory = openSync(dirname(target), constants.O_RDONLY | constants.O_DIRECTORY);
+        let fd: number | undefined;
+        let created = false;
+        let published = false;
         try {
+          fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+          created = true;
+          fchmodSync(fd, 0o600);
           writeFileSync(fd, signer.key.export({ format: 'pem', type: 'pkcs8' }));
           fsyncSync(fd);
-        } finally { closeSync(fd); }
+          closeSync(fd);
+          fd = undefined;
+          linkSync(temporary, target); // EEXIST never overwrites another trust root.
+          published = true;
+          unlinkSync(temporary);
+          created = false;
+          fsyncSync(directory);
+        } catch (error) {
+          if (published) { try { unlinkSync(target); } catch { /* preserve original failure */ } }
+          throw error;
+        } finally {
+          if (fd !== undefined) { try { closeSync(fd); } catch { /* preserve original failure */ } }
+          if (created) { try { unlinkSync(temporary); } catch { /* preserve original failure */ } }
+          closeSync(directory);
+        }
       }
       return signer;
     } catch { throw new BrokerError('AUDIT_UNAVAILABLE'); }

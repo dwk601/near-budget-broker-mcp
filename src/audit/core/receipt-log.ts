@@ -7,7 +7,7 @@ import type {
   ReceiptLog as ReceiptLogPort, ReceiptVerification, Store, StoreTransaction,
 } from '../../contracts/index.js';
 import { decodeAuditPublicKey } from './crypto.js';
-import { receiptProblem, verificationResult, verifyReceipt, verifyReceiptChain } from './verification.js';
+import { receiptChainId, receiptProblem, verificationResult, verifyReceipt, verifyReceiptChain } from './verification.js';
 
 /** Trusted in-process port, not an authentication boundary. Use forAgent with an
  * authenticated principal before handing reads/verification to agent operations.
@@ -39,8 +39,10 @@ export class ReceiptLog implements ReceiptLogPort {
   }
 
   append(tx: StoreTransaction, event: AppendReceipt): ReceiptEvent {
-    this.authorize(event.chainId);
     try {
+      const chainId = receiptChainId(event);
+      if (chainId === null) throw new Error('Invalid receipt chain');
+      this.authorize(chainId);
       canonicalJson(event);
       const input = AppendReceiptSchema.parse(event);
       const head = tx.getReceiptHead(input.chainId);
@@ -72,6 +74,7 @@ export class ReceiptLog implements ReceiptLogPort {
   }
 
   verify(chainId: ChainId): ReceiptVerification {
+    if (receiptChainId({ chainId }) === null) return verifyReceiptChain([], chainId, this.publicKey);
     this.authorize(chainId);
     return this.store.read((view) => {
       function* pages(): Generator<ReceiptEvent> {
@@ -98,21 +101,28 @@ export class ReceiptLog implements ReceiptLogPort {
   }
 
   verifyReceipt(receipt: ReceiptEvent): ReceiptVerification {
-    this.authorize(receipt.chainId);
+    const chainId = receiptChainId(receipt);
+    if (chainId !== null) this.authorize(chainId);
     const result = verifyReceipt(receipt, this.publicKey);
-    if (!result.valid || receipt.seq === 1) return result;
-    // A single local receipt must also link to its stored predecessor. Offline
-    // signature-only verification is exported separately; neither proves that
-    // an unpinned suffix has not been removed.
-    return this.store.read((view) => {
-      try {
-        const previous = view.listReceipts(receipt.chainId, receipt.seq - 2, 1)[0];
-        if (previous === undefined || previous.chainId !== receipt.chainId || previous.seq !== receipt.seq - 1
-          || previous.hash !== receipt.prevHash || receiptProblem(previous, decodeAuditPublicKey(this.publicKey)) !== null) {
-          return verificationResult(receipt.chainId, 0, 'Receipt predecessor unavailable or invalid', receipt.seq);
+    if (!result.valid) return result;
+    // Log-bound verification asserts membership, not just a valid signature.
+    // Rolled-back appends and signed forks must not pass, even at genesis.
+    try {
+      return this.store.read((view) => {
+        const stored = view.listReceipts(receipt.chainId, receipt.seq - 1, 1)[0];
+        if (stored === undefined || stored.seq !== receipt.seq || stored.hash !== receipt.hash
+          || canonicalJson(stored) !== canonicalJson(receipt)) {
+          return verificationResult(receipt.chainId, 0, 'Receipt is not in the stored chain', receipt.seq);
+        }
+        if (receipt.seq > 1) {
+          const previous = view.listReceipts(receipt.chainId, receipt.seq - 2, 1)[0];
+          if (previous === undefined || previous.chainId !== receipt.chainId || previous.seq !== receipt.seq - 1
+            || previous.hash !== receipt.prevHash || receiptProblem(previous, decodeAuditPublicKey(this.publicKey)) !== null) {
+            return verificationResult(receipt.chainId, 0, 'Receipt predecessor unavailable or invalid', receipt.seq);
+          }
         }
         return result;
-      } catch { return verificationResult(receipt.chainId, 0, 'Receipt predecessor unavailable or invalid', receipt.seq); }
-    });
+      });
+    } catch { return verificationResult(receipt.chainId, 0, 'Stored receipt unavailable or invalid', receipt.seq); }
   }
 }

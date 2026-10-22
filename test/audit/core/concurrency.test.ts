@@ -8,7 +8,7 @@ import { AuditSigner, ReceiptLog } from '../../../src/audit/core/index.js';
 import { SqliteStore } from '../../../src/storage/index.js';
 
 function startWorker(filename: string, keyPath: string, prefix: string) {
-  const child = fork(fileURLToPath(new URL('./append-worker.ts', import.meta.url)), [filename, keyPath, prefix, '60'], {
+  const child = fork(fileURLToPath(new URL('./append-worker.ts', import.meta.url)), [filename, keyPath, prefix], {
     execArgv: ['--import', 'tsx'], stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
   });
   let stderr = '';
@@ -27,10 +27,17 @@ function startWorker(filename: string, keyPath: string, prefix: string) {
     child.once('message', (message) => message === 'ready' ? resolve() : reject(new Error('Unexpected worker message')));
     void done.then(() => reject(new Error('Worker exited before ready')), reject);
   });
-  return { child, ready, done };
+  function append(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      child.once('message', (message) => message === 'appended' ? resolve() : reject(new Error('Unexpected append result')));
+      void done.then(() => reject(new Error('Worker exited before append')), reject);
+      child.send('append', (error) => { if (error) reject(error); });
+    });
+  }
+  return { child, ready, done, append };
 }
 
-it('concurrent appends from independent connections keep one unique contiguous chain and survive reopen', async () => {
+it('interleaved appends from two live independent connections remain unique, contiguous and durable', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'bb-audit-concurrent-'));
   const filename = join(dir, 'audit.sqlite');
   const keyPath = join(dir, 'audit.pem');
@@ -40,7 +47,12 @@ it('concurrent appends from independent connections keep one unique contiguous c
   const workers = [startWorker(filename, keyPath, 'left'), startWorker(filename, keyPath, 'right')];
   try {
     await Promise.all(workers.map((worker) => worker.ready));
-    for (const worker of workers) worker.child.send('append');
+    // Explicit turns avoid a vacuous all-left-then-all-right schedule. Each
+    // process keeps its ReceiptLog alive while the other commits between calls.
+    for (let round = 0; round < 60; round++) {
+      for (const worker of workers) await worker.append();
+    }
+    for (const worker of workers) worker.child.send('stop');
     await Promise.all(workers.map((worker) => worker.done));
     const store = new SqliteStore(filename, { accountId: 'broker.testnet' });
     try {
@@ -49,8 +61,10 @@ it('concurrent appends from independent connections keep one unique contiguous c
       expect(receipts).toHaveLength(120);
       expect(receipts.map((r) => r.seq)).toEqual(Array.from({ length: 120 }, (_, i) => i + 1));
       expect(new Set(receipts.map((r) => r.hash)).size).toBe(120);
-      const ids = receipts.map((r) => (r.payload as { requestId: string }).requestId).sort();
-      expect(ids).toEqual(['left', 'right'].flatMap((side) => Array.from({ length: 60 }, (_, i) => `${side}-${i}`)).sort());
+      const ids = receipts.map((r) => (r.payload as { requestId: string }).requestId);
+      expect(ids).toEqual(Array.from({ length: 60 }, (_, i) => [`left-${i}`, `right-${i}`]).flat());
+      const sides = ids.map((id) => id.split('-')[0]);
+      expect(sides.slice(1).filter((side, i) => side !== sides[i])).toHaveLength(119);
       expect(log.auditPublicKey()).toBe(signer.publicKey);
       expect(log.verify('agent:a1')).toEqual({ valid: true, chainId: 'agent:a1', checked: 120, firstInvalidSeq: null, reason: null });
     } finally { store.close(); }

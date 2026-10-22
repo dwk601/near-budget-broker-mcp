@@ -1,11 +1,17 @@
-import { createPrivateKey, createPublicKey, generateKeyPairSync, verify } from 'node:crypto';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createPrivateKey, createPublicKey, generateKeyPairSync, verify, type KeyObject } from 'node:crypto';
+import { chmodSync, existsSync, fsyncSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { AuditSigner, ReceiptLog, verifyReceipt } from '../../../src/audit/core/index.js';
+import { dirname, join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { AuditSigner, ReceiptLog, decodeAuditPublicKey, encodeAuditPublicKey, verifyReceipt } from '../../../src/audit/core/index.js';
+import { SqliteStore } from '../../../src/storage/index.js';
 import { sha256Hex } from '../../../src/contracts/index.js';
 import type { Store } from '../../../src/contracts/index.js';
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, writeFileSync: vi.fn(actual.writeFileSync), fsyncSync: vi.fn(actual.fsyncSync) };
+});
 
 const dirs: string[] = [];
 function location(): { auditKeyPath: string } {
@@ -13,7 +19,12 @@ function location(): { auditKeyPath: string } {
   dirs.push(dir);
   return { auditKeyPath: join(dir, 'audit.pem') };
 }
-afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.mocked(writeFileSync).mockReset();
+  vi.mocked(fsyncSync).mockReset();
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 describe('AuditSigner', () => {
   it('creates a persistent 0600 Ed25519 key at auditKeyPath and reloads the same trust root', () => {
@@ -51,12 +62,72 @@ describe('AuditSigner', () => {
     'ed25519:FVen3X669xLzsi6N2V91DoiyzHzg1uAgqiT8jZ9nS96Z').valid).toBe(true);
   });
 
+  it('loads and signs with a generated key whose public bytes start with zero', () => {
+    const config = location();
+    let zeroKey: { publicKey: KeyObject; privateKey: KeyObject } | undefined;
+    for (let i = 0; i < 16384; i++) {
+      const pair = generateKeyPairSync('ed25519');
+      const raw = Buffer.from(pair.publicKey.export({ format: 'jwk' }).x!, 'base64url');
+      if (raw[0] === 0) { zeroKey = pair; break; }
+    }
+    expect(zeroKey, 'could not find a leading-zero Ed25519 key').toBeDefined();
+    const original = zeroKey!.publicKey.export({ format: 'der', type: 'spki' });
+    writeFileSync(config.auditKeyPath, zeroKey!.privateKey.export({ format: 'pem', type: 'pkcs8' }), { mode: 0o600 });
+    const signer = AuditSigner.load(config);
+    expect(signer.publicKey.startsWith('ed25519:1')).toBe(true);
+    expect(encodeAuditPublicKey(zeroKey!.privateKey)).toBe(signer.publicKey);
+    expect(decodeAuditPublicKey(signer.publicKey).export({ format: 'der', type: 'spki' })).toEqual(original);
+    const store = new SqliteStore(':memory:', { accountId: 'broker.testnet' });
+    try {
+      const log = new ReceiptLog(store, signer);
+      const receipt = store.withImmediateTransaction((tx) => log.append(tx, { chainId: 'agent:a1', type: 'queued', at: 1,
+        payload: { agentId: 'a1', requestId: 'zero-key' } }));
+      expect(log.verifyReceipt(receipt).valid).toBe(true);
+      expect(log.verify('agent:a1').valid).toBe(true);
+    } finally { store.close(); }
+  });
+
+  it('rejects a mismatched file owner without requiring root', () => {
+    const config = location();
+    AuditSigner.generate(config);
+    const before = readFileSync(config.auditKeyPath);
+    vi.spyOn(process, 'getuid').mockReturnValue(statSync(config.auditKeyPath).uid + 1);
+    expect(() => AuditSigner.load(config)).toThrow(expect.objectContaining({ code: 'AUDIT_UNAVAILABLE' }));
+    expect(() => AuditSigner.loadOrCreate(config)).toThrow(expect.objectContaining({ code: 'AUDIT_UNAVAILABLE' }));
+    expect(readFileSync(config.auditKeyPath)).toEqual(before);
+  });
+
+  it.each([0o277, 0o377])('creates reloadable 0600 keys even with restrictive umask %s', (mask) => {
+    const config = location();
+    const original = process.umask(mask);
+    try {
+      const signer = AuditSigner.generate(config);
+      expect(statSync(config.auditKeyPath).mode & 0o7777).toBe(0o600);
+      expect(AuditSigner.load(config).publicKey).toBe(signer.publicKey);
+    } finally { process.umask(original); }
+  });
+
+  it.each(['write', 'file fsync', 'directory fsync'])('cleans up failed key creation (%s) and permits a clean retry', (failure) => {
+    const config = location();
+    const full = Object.assign(new Error('secret ENOSPC diagnostic'), { code: 'ENOSPC' });
+    if (failure === 'write') vi.mocked(writeFileSync).mockImplementationOnce(() => { throw full; });
+    if (failure === 'file fsync') vi.mocked(fsyncSync).mockImplementationOnce(() => { throw full; });
+    if (failure === 'directory fsync') vi.mocked(fsyncSync).mockImplementationOnce(() => {}).mockImplementationOnce(() => { throw full; });
+    expect(() => AuditSigner.generate(config)).toThrow(expect.objectContaining({ code: 'AUDIT_UNAVAILABLE', message: 'AUDIT_UNAVAILABLE' }));
+    expect(existsSync(config.auditKeyPath)).toBe(false);
+    expect(readdirSync(dirname(config.auditKeyPath))).toEqual([]);
+    const signer = AuditSigner.loadOrCreate(config);
+    expect(AuditSigner.load(config).publicKey).toBe(signer.publicKey);
+    expect(readdirSync(dirname(config.auditKeyPath))).toEqual(['audit.pem']);
+  });
+
   it('generation is exclusive and never replaces an existing key', () => {
     const config = location();
     const signer = AuditSigner.generate(config);
     const original = readFileSync(config.auditKeyPath);
     expect(() => AuditSigner.generate(config)).toThrow(expect.objectContaining({ code: 'AUDIT_UNAVAILABLE' }));
     expect(readFileSync(config.auditKeyPath)).toEqual(original);
+    expect(readdirSync(dirname(config.auditKeyPath))).toEqual(['audit.pem']);
     expect(AuditSigner.load(config).publicKey).toBe(signer.publicKey);
   });
 

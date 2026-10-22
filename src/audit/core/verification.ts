@@ -1,6 +1,6 @@
 import type { KeyObject } from 'node:crypto';
 import {
-  ChainIdSchema, GENESIS_PREV_HASH, ReceiptEventSchema, canonicalJson, receiptHashInput, sha256Hex,
+  ChainIdSchema, GENESIS_PREV_HASH, OWNER_CHAIN_ID, ReceiptEventSchema, canonicalJson, receiptHashInput, sha256Hex,
 } from '../../contracts/index.js';
 import type { ChainId, Ed25519PublicKey, ReceiptEvent, ReceiptVerification } from '../../contracts/index.js';
 import { decodeAuditPublicKey, verifyHashSignature } from './crypto.js';
@@ -23,15 +23,34 @@ export function receiptProblem(receipt: ReceiptEvent, key: KeyObject): string | 
   } catch { return 'Malformed receipt'; }
 }
 
+/** Read identity without invoking hostile accessors; authorization precedes crypto. */
+export function receiptChainId(receipt: unknown): ChainId | null {
+  try {
+    if (receipt === null || typeof receipt !== 'object') return null;
+    const field = Object.getOwnPropertyDescriptor(receipt, 'chainId');
+    if (field === undefined || !('value' in field)) return null;
+    const parsed = ChainIdSchema.safeParse(field.value);
+    return parsed.success ? parsed.data : null;
+  } catch { return null; }
+}
+
 /** Offline verification uses an explicitly trusted key, never key material in an event.
- * A valid single receipt is not proof of history completeness. */
-export function verifyReceipt(receipt: ReceiptEvent, trustedAuditPublicKey: Ed25519PublicKey): ReceiptVerification {
-  const chainId = ChainIdSchema.parse(receipt.chainId);
-  const seq = Number.isSafeInteger(receipt.seq) && receipt.seq >= 1 ? receipt.seq : 1;
+ * A valid single receipt is not proof of history completeness or committed membership.
+ * Malformed identities use owner solely as a schema-valid error sentinel (valid=false).
+ */
+export function verifyReceipt(receipt: unknown, trustedAuditPublicKey: Ed25519PublicKey): ReceiptVerification {
+  const chainId = receiptChainId(receipt);
+  if (chainId === null) return verificationResult(OWNER_CHAIN_ID, 0, 'Malformed receipt identity', 1);
+  let event: ReceiptEvent;
+  try {
+    canonicalJson(receipt);
+    event = ReceiptEventSchema.parse(receipt);
+  } catch { return verificationResult(chainId, 0, 'Malformed receipt', 1); }
+  const seq = event.seq;
   let key: KeyObject;
   try { key = decodeAuditPublicKey(trustedAuditPublicKey); }
   catch { return verificationResult(chainId, 0, 'Invalid audit public key', seq); }
-  const reason = receiptProblem(receipt, key);
+  const reason = receiptProblem(event, key);
   return verificationResult(chainId, reason === null ? 1 : 0, reason, reason === null ? null : seq);
 }
 
@@ -42,7 +61,9 @@ export function verifyReceipt(receipt: ReceiptEvent, trustedAuditPublicKey: Ed25
 export function verifyReceiptChain(
   receipts: Iterable<ReceiptEvent>, chainId: ChainId, trustedAuditPublicKey: Ed25519PublicKey,
 ): ReceiptVerification {
-  ChainIdSchema.parse(chainId);
+  try {
+    if (!ChainIdSchema.safeParse(chainId).success) return verificationResult(OWNER_CHAIN_ID, 0, 'Malformed chain identity', 1);
+  } catch { return verificationResult(OWNER_CHAIN_ID, 0, 'Malformed chain identity', 1); }
   let key: KeyObject;
   try { key = decodeAuditPublicKey(trustedAuditPublicKey); }
   catch { return verificationResult(chainId, 0, 'Invalid audit public key', 1); }
