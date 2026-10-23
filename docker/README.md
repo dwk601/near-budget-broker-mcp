@@ -24,8 +24,13 @@ metadata. Unlock uses a non-echoing TTY prompt, or **weaker**
 random passphrase. Output contains only the file path and public key. The daemon
 receives only that public key. Keep an independent backup of the encrypted file.
 
-Create a random master secret of at least 32 bytes (maximum 4096). Files use
-verbatim bytes: a newline changes the secret. In a protected operator environment:
+Create a random master secret of at least 32 bytes (maximum 4096). The master
+file must be a regular file (not a symlink), owned by the user running
+`init-custody`, mode **0600** or **0400**, in a protected 0700 directory. Group,
+other, execute and special permission bits are refused with `BROKER_UNAVAILABLE`;
+check ownership and permissions if provisioning fails with that redacted code.
+Files use verbatim bytes: a newline changes the secret. In a protected operator
+environment:
 
 ```
 budget-broker init-custody --key-file /protected/native-key --master-file /protected/master --out /protected/custody.json

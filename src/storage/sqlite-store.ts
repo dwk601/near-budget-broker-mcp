@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { closeSync, constants, fchmodSync, openSync, chmodSync } from 'node:fs';
+import { closeSync, constants, fchmodSync, fstatSync, lstatSync, openSync } from 'node:fs';
 import type { SQLInputValue } from 'node:sqlite';
 import type { z } from 'zod';
 import {
@@ -83,15 +83,28 @@ export class SqliteStore implements Store {
         // Pre-create before SQLite can write anything. SQLite derives new WAL/SHM
         // permissions from the main DB, not the process's (possibly loose) umask.
         const fd = openSync(filename, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
-        try { fchmodSync(fd, 0o600); } finally { closeSync(fd); }
-        // Also tighten sidecars left by an older deployment/crash before opening.
+        try {
+          if (!fstatSync(fd).isFile()) throw new Error();
+          fchmodSync(fd, 0o600);
+        } finally { closeSync(fd); }
+        // Never follow sidecar symlinks, including dangling ones. Check the
+        // opened inode too: lstat alone would leave a path-replacement race.
         for (const suffix of ['-wal', '-shm']) {
-          try { chmodSync(`${filename}${suffix}`, 0o600); }
-          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+          const path = `${filename}${suffix}`;
+          let stat;
+          try { stat = lstatSync(path); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
+          if (!stat.isFile()) throw new Error();
+          const sidecar = openSync(path, constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+          try {
+            const opened = fstatSync(sidecar);
+            if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) throw new Error();
+            fchmodSync(sidecar, 0o600);
+          } finally { closeSync(sidecar); }
         }
       }
-      this.db = new DatabaseSync(filename);
-    } catch (error) { throw storageError(error); }
+    } catch { throw new BrokerError('BROKER_UNAVAILABLE', 'Storage unavailable'); }
+    try { this.db = new DatabaseSync(filename); } catch (error) { throw storageError(error); }
     try {
       this.db.exec(`PRAGMA busy_timeout = ${timeout}; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;`);
       migrate(this.db, options.accountId);

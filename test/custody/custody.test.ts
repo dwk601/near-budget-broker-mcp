@@ -1,4 +1,5 @@
 import { createDecipheriv, createHash, scryptSync } from 'node:crypto';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -188,8 +189,9 @@ describe('daemon encrypted file and master-secret sources', () => {
       const bytes = await readMasterSecret({ BB_MASTER_SECRET_FILE: path });
       expect(bytes).toEqual(master); bytes.fill(0);
     }
-    for (const mode of [0o644, 0o640, 0o604, 0o700]) {
+    for (const mode of [0o644, 0o640, 0o604, 0o700, 0o610, 0o1600, 0o2600, 0o4600]) {
       await chmod(path, mode);
+      expect((await stat(path)).mode & 0o7777).toBe(mode);
       await safeError(readMasterSecret({ BB_MASTER_SECRET_FILE: path }));
     }
     await chmod(path, 0o600);
@@ -197,6 +199,21 @@ describe('daemon encrypted file and master-secret sources', () => {
     await safeError(readMasterSecret({ BB_MASTER_SECRET_FILE: link }));
     const directory = join(dir, 'directory'); await mkdir(directory, { mode: 0o700 });
     await safeError(readMasterSecret({ BB_MASTER_SECRET_FILE: directory }));
+  });
+  it('rejects a FIFO master without waiting for a writer', async () => {
+    const path = join(await temp(), 'fifo');
+    execFileSync('mkfifo', ['-m', '600', path], { timeout: 5000 });
+    // A child gives a hard SIGKILL bound: a blocking fs.open cannot be cancelled
+    // by an in-process Promise timeout and would otherwise strand a worker.
+    const result = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `
+      import assert from 'node:assert/strict';
+      import { readMasterSecret } from ${JSON.stringify(new URL('../../src/custody/index.ts', import.meta.url).href)};
+      await assert.rejects(readMasterSecret({ BB_MASTER_SECRET_FILE: ${JSON.stringify(path)} }),
+        { code: 'BROKER_UNAVAILABLE' });
+    `], { timeout: 5000, killSignal: 'SIGKILL', encoding: 'utf8' });
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.status).toBe(0);
   });
   it('rejects a master file owned by another uid', async () => {
     const path = join(await temp(), 'master'); await writeFile(path, master, { mode: 0o600 });
