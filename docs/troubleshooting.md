@@ -16,7 +16,7 @@ Never print keys/tokens, enable protocol logging on stdout, delete accounting ho
 | `INVALID_AMOUNT` | MCP/config/wire use integer yocto strings; policy/grant CLI files use human NEAR strings; never numbers/exponents/whitespace; transfer >0 and u128-bounded |
 | `WALLET_CAPACITY` despite positive balance | Storage/locked/safety reserve and all holds reduce spendable; stale/failed RPC fails closed; fixture positive-balance check isn't available-capacity validation |
 | `GAS_BUDGET_EXCEEDED` | Own actual burnt tokens plus fee holds count, including failed transfers; actual overages cannot be hidden/refunded |
-| `APPROVAL_REQUIRED` / pending | Inspect existing request, ask owner to approve/reject or grant scoped standing approval; do not repeat with new keys; hard caps still apply |
+| `APPROVAL_REQUIRED` / pending | Inspect existing request, ask owner to approve/reject; do not repeat with new keys. Queued/approved work cannot adopt a standing grant it was never bound to: it returns to pending owner approval instead. Hard caps still apply |
 | `POLICY_CHANGED` on approval | Reread request/policy and review current digest/revision; do not blindly approve stale work |
 | `IDEMPOTENCY_CONFLICT` | Same agent/key had another payload; inspect original request and reconcile before any genuinely new intent |
 | Submitted/unknown is stuck | Preserve ID/key/holds; owner reconcile polls existing attempts/watches only; missing history isn't proof; no fresh-key duplicate payment |
@@ -24,13 +24,14 @@ Never print keys/tokens, enable protocol logging on stdout, delete accounting ho
 | Queued/approved work expired while frozen | The fixed **300 s** TTL from creation also covers queued/approved work before signing. Freeze does not pause it; the next dispatch processing at/after the deadline expires the request and releases principal+fees. Unfreeze cannot revive it or free its consumed key; any new key/request requires owner authorization. Never retry after rejection |
 | Force resolution did not restore budget | For **offered uncertain bytes**, `--force` retires the lane item but retains principal+fees until fresh exclusion or actual execution. For **never-offered signed bytes**, force instead abandons the request and releases both holds with no watch. Pending/final execution evidence vetoes either force path; failed alone does not prove release |
 | Agent unfreeze did not restart failed work | Never-offered signed requests may have been abandoned permanently; owner must authorize a genuinely new intent/key, never revive signed history |
+| Global freeze after standing overrun | Actual executed principal/gas are still recorded; the grant is revoked, preserving other reservations. Review accounting/receipts before owner unfreeze; never erase the executed payment |
 | Global freeze after late execution | Review signed lateResolution on both chains, actual principal/gas/standing overrun, reconcile before owner unfreeze |
 | `AUDIT_UNAVAILABLE` from daemon/MCP | Stop spending; check protected volume capacity/integrity and retained audit root; restore a coherent backup, not a fresh audit key beside old history. For offline `owner receipts verify`, see the local-input row below instead |
 | `BROKER_UNAVAILABLE` at startup | Check its separate redacted diagnostic reason below; do not expose raw config/environment/keys |
 | Lock file remains after crash | **Expected**: SQLite kernel locks release automatically; retain files, never unlink/replace them. Same-key locks use stable OS-account home, not HOME/TMPDIR. Old text O_EXCL format alone needs migration after old daemon stops; see operator guide |
 | Fixture faucet outage | Rerun apply using same external directory; no account/key regeneration; --check alone never provisions missing state |
 | Fixture envelope won't init-custody | Already encrypted; reuse broker-key.json and binary master.secret; init-custody accepts raw ed25519 text only |
-| Compose secret decrypt fails | Base uses file secrets: set BB_MASTER_FILE to exact binary master.secret and BB_CONFIG_FILE to edited config; absolute paths outside repo, 0600 files, 0700 parent. Ensure mapped uid 1000 can read, without relaxing permissions. No environment/content secret override needed |
+| Compose secret decrypt fails | Base uses file secrets: set BB_MASTER_FILE to exact binary master.secret and BB_CONFIG_FILE to edited config; absolute paths outside repo, 0600 files, 0700 parent. Master must be a regular non-symlink file owned by mapped daemon uid 1000, mode 0600 or 0400; config must be readable by that uid. Do not relax permissions. No environment/content secret override needed |
 | Compose override tag error | Compose >=2.24.4 needed for prebuilt !reset; set BB_IMAGE consistently, validate config --quiet without logging secrets |
 | Docker build from tarball fails | Tarball intentionally excludes src/lock/tsconfig; build image from source checkout or use trusted prebuilt override |
 | Containerized agent cannot reach localhost | Its localhost is not host loopback; arrange restricted route in deployment, never publish admin publicly |
@@ -43,12 +44,12 @@ These allowlisted reasons accompany domain `BROKER_UNAVAILABLE` and exit **1**. 
 | Reason | Safe action |
 | --- | --- |
 | `BAD_CONFIG` | Check file existence, JSON/config shape and internal paths; no secret values in config |
-| `BAD_MASTER_SECRET` | Check daemon BB_MASTER_SECRET_FILE permissions/ownership/length and exact encryption bytes/envelope; do not trim or re-encode |
+| `BAD_MASTER_SECRET` | BB_MASTER_SECRET_FILE must be a regular non-symlink file, 0600 or 0400, owned by the daemon uid. Check 32..4096-byte length and exact encryption bytes/envelope; do not trim or re-encode |
 | `MASTER_SECRET_ENV_REFUSED` | Remove direct BB_MASTER_SECRET entirely, even if BB_MASTER_SECRET_FILE is set; only file-backed unlock allowed |
 | `LISTEN_FAILED` | Port/interface unavailable or already bound; inspect host/config/publications, never publish publicly |
-| `DATA_DIR_UNAVAILABLE` | mkdir/chmod/provisioning ownership failed; keep BB_DATA_VOLUME consistent, create via Compose before provisioning at /var/lib/budget-broker as uid 1000 |
+| `DATA_DIR_UNAVAILABLE` | mkdir/chmod/provisioning ownership failed; usual result for `--user 4242:4242` on a standard image-owned uid-1000 volume (chmod fails before account-home lookup). Keep BB_DATA_VOLUME consistent, create via Compose before provisioning at /var/lib/budget-broker as uid 1000 |
 | `LOCK_HELD` | Another process holds data or same-key lock; stop the real contender, never delete files or switch volumes/HOME to evade fencing |
-| `LOCK_UNAVAILABLE` | Lock path/mode/ownership/symlink/format invalid, or runtime uid has **no OS passwd entry** (e.g. `docker run --user 4242:4242`): OS-account home lookup fails closed. Use the supported image uid 1000 with its passwd entry/home; do not bypass with HOME/TMPDIR or switch trust-root volumes. Check private 0700 directory and uid-owned 0600 SQLite files; no automatic permission repair |
+| `LOCK_UNAVAILABLE` | Lock path/mode/ownership/symlink/format invalid, or runtime uid has **no OS passwd entry**: OS-account home lookup fails closed. For `docker run --user 4242:4242` to reach that lookup, the volume/lock files must belong to uid 4242 and earlier RPC/custody checks must pass (including a uid-4242-owned master); a standard image-owned volume usually yields `DATA_DIR_UNAVAILABLE` first. Use the supported image uid 1000 with its passwd entry/home; do not bypass with HOME/TMPDIR or switch trust-root volumes. Check private 0700 directory and uid-owned 0600 SQLite files; no automatic permission repair |
 | `RPC_UNAVAILABLE` | Startup RPC transport/HTTP unavailable; restore testnet RPC service, never bypass identity attestation |
 
 Reachable wrong/unprovable RPC chain identity or rejected mainnet config reports **MAINNET_REFUSED** (exit 1), not RPC_UNAVAILABLE, and still blocks custody unlock. `BB_IMAGE` is the selected image and `BB_DATA_VOLUME` the sole private trust-root volume; independent containers/hosts/OS users are not distributed fencing. Never fix a running lock by choosing a fresh volume.

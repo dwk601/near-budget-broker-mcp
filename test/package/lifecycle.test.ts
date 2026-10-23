@@ -74,6 +74,36 @@ test.each([60_000, 600_000])('owner approval expiry %i ms is capped at the uncha
   } finally { f.close(); }
 });
 
+test('queued work cannot adopt an unbound standing grant and requires owner approval instead', async () => {
+  const f = new Fixture({ autoDispatch: false });
+  try {
+    await f.init();
+    const agent = await f.agent('unbound-standing', { approvalThreshold: null });
+    const input = f.input('unbound-standing');
+    const queued = await f.broker.requestTransfer(agent, input);
+    expect(queued.state).toBe('queued');
+    expect(queued.approvalRef).toBeNull();
+    const policy = (await f.broker.getPolicy(owner, agent.agentId))!;
+    await f.broker.setPolicy(owner, { ...policy, revision: 2, approvalThreshold: 0n }, 1);
+    const grant = await f.broker.grantStandingApproval(owner, { agentId: agent.agentId,
+      perTxMax: input.amount, totalMax: input.amount, expiresAt: f.now + 600_000 });
+    await f.broker.drain();
+    const pending = await f.broker.getRequest(agent, queued.id);
+    expect(pending).toMatchObject({ state: 'pending_approval', approvalRef: null,
+      reasons: ['APPROVAL_REQUIRED'], expiresAt: queued.expiresAt });
+    expect(f.store.read((r) => r.getHold(queued.id)?.status)).toBe('active');
+    expect(f.store.read((r) => r.getStandingApproval(grant.id)?.usedTotal)).toBe(0n);
+    expect(f.chain.built).toHaveLength(0);
+    expect(f.chain.broadcasts).toHaveLength(0);
+    expect(await f.broker.requestTransfer(agent, input)).toEqual(pending);
+    await f.broker.approve(owner, queued.id, f.now + 60_000);
+    await f.broker.drain();
+    expect((await f.broker.getRequest(agent, queued.id)).state).toBe('succeeded');
+    expect(f.store.read((r) => r.getStandingApproval(grant.id)?.usedTotal)).toBe(0n);
+    expect(f.chain.broadcasts).toHaveLength(1);
+  } finally { f.close(); }
+});
+
 test.each(['rejected', 'cancelled'] as const)('%s unsent requests release holds but permanently retain their keys', async (state) => {
   const f = new Fixture({ autoDispatch: false });
   try {
