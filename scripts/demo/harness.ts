@@ -4,14 +4,14 @@ import { spawn, execFile } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
-import { mkdtemp, mkdir, readFile, writeFile, copyFile, chmod, rm } from 'node:fs/promises';
-import { tmpdir, homedir } from 'node:os';
+import { mkdtemp, mkdir, readFile, writeFile, copyFile, chmod, rm, lstat, unlink } from 'node:fs/promises';
+import { tmpdir, homedir, userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import type { ReceiptEvent } from '../../src/contracts/index.js';
-import { parseNear } from '../../src/contracts/index.js';
+import { parseNear, sha256Hex } from '../../src/contracts/index.js';
 import { permissionStatus } from '../fixtures/native/fixtures.js';
 import { createServer } from 'node:net';
 
@@ -84,15 +84,21 @@ export class Harness {
   child: ChildProcess | undefined;
   diagnostics = '';
   walletRevision = 0;
+  keyLockPath = '';
+  private ownedKeyLock: { dev: number; ino: number } | undefined;
+  private stopping: Promise<void> | undefined;
+  private closing: Promise<void> | undefined;
+  private closed = false;
   constructor(readonly options: HarnessOptions) {}
   get receiver() { return this.options.receiver; }
-  private env(): NodeJS.ProcessEnv {
-    return { PATH: process.env['PATH'], NODE_NO_WARNINGS: '1', BB_OWNER_PASSPHRASE: this.passphrase,
-      BB_MASTER_SECRET_FILE: this.options.master };
+  private env(owner = false): NodeJS.ProcessEnv {
+    // The daemon gets only its unlock FILE and owner PUBLIC key in config.
+    return { PATH: process.env['PATH'], NODE_NO_WARNINGS: '1',
+      ...(owner ? { BB_OWNER_PASSPHRASE: this.passphrase } : { BB_MASTER_SECRET_FILE: this.options.master }) };
   }
   async command(args: string[]): Promise<unknown> {
     try {
-      const { stdout } = await exec(process.execPath, [resolve('dist/main.js'), ...args], { env: this.env(), timeout: 120_000, maxBuffer: 8 * 1024 * 1024 });
+      const { stdout } = await exec(process.execPath, [resolve('dist/main.js'), ...args], { env: this.env(args[0] === 'owner'), timeout: 120_000, maxBuffer: 8 * 1024 * 1024 });
       return JSON.parse(stdout) as unknown;
     } catch (e) {
       // exec errors include environment/argv/output. Never forward the raw object.
@@ -114,6 +120,8 @@ export class Harness {
       await mkdir(this.dataDir, { mode: 0o700 }); this.ownerKey = join(this.dir, 'owner.json');
       const owner = await this.command(['owner', 'init-owner-key', '--out', this.ownerKey, '--json']) as { publicKey: string };
       await copyFile(this.options.envelope, join(this.dataDir, 'custody.json')); await chmod(join(this.dataDir, 'custody.json'), 0o600);
+      const envelope = JSON.parse(await readFile(this.options.envelope, 'utf8')) as { publicKey: string };
+      this.keyLockPath = join(userInfo().homedir, '.budget-broker-locks', `${sha256Hex(envelope.publicKey)}.sqlite`);
       const agentPort = await port(); let adminPort = await port(); while (adminPort === agentPort) adminPort = await port();
       this.agentUrl = `http://127.0.0.1:${agentPort}`; this.adminUrl = `http://127.0.0.1:${adminPort}`;
       this.configPath = await this.file({ network: 'testnet', rpcUrl: this.options.rpcUrl, accountId: this.options.accountId,
@@ -123,6 +131,11 @@ export class Harness {
     } catch (e) { await this.close(); throw e; }
   }
   async start() {
+    assert(!this.closed, 'cannot start a closed harness');
+    const existed = await lstat(this.keyLockPath).then(() => true, (e: NodeJS.ErrnoException) => {
+      if (e.code !== 'ENOENT') throw e; return false;
+    });
+    assert(!this.closed, 'cannot start a closed harness');
     const child = spawn(process.execPath, [resolve('dist/main.js'), 'daemon', '--config', this.configPath], { env: this.env(), stdio: ['ignore', 'pipe', 'pipe'] });
     this.child = child; let diagnostics = ''; this.diagnostics = ''; child.stdout!.resume(); child.stderr!.on('data', (b: Buffer) => { diagnostics += b.toString(); this.diagnostics = (this.diagnostics + b.toString()).slice(-4096); });
     const deadline = Date.now() + 20_000;
@@ -130,21 +143,44 @@ export class Harness {
       assert(child.exitCode === null && child.signalCode === null, `daemon exited: ${diagnostics.trim()}`);
       assert(Date.now() < deadline, 'daemon readiness timeout'); await sleep(25);
     }
+    // Claim only a previously absent file after THIS child acquired the key lock.
+    if (!existed && !this.ownedKeyLock) {
+      const stat = await lstat(this.keyLockPath); assert(stat.isFile() && !stat.isSymbolicLink());
+      this.ownedKeyLock = { dev: stat.dev, ino: stat.ino };
+    }
   }
   async stop() {
-    const p = this.child; this.child = undefined;
-    if (!p || p.exitCode !== null || p.signalCode !== null) return;
-    const closed = once(p, 'close'); p.kill('SIGTERM');
-    const timer = setTimeout(() => p.kill('SIGKILL'), 30_000);
-    try { await closed; } finally { clearTimeout(timer); }
+    if (this.stopping) return this.stopping;
+    const p = this.child;
+    if (!p) return;
+    this.stopping = (async () => {
+      if (p.exitCode === null && p.signalCode === null) {
+        const exited = once(p, 'close'); p.kill('SIGTERM');
+        const timer = setTimeout(() => p.kill('SIGKILL'), 30_000);
+        try { await exited; } finally { clearTimeout(timer); }
+      }
+      this.child = undefined;
+    })();
+    try { await this.stopping; } finally { this.stopping = undefined; }
   }
   async restart() {
     for (const c of this.clients) await c.close(); this.clients.clear();
     await this.stop(); await this.start();
   }
   async close() {
-    for (const c of this.clients) await c.close().catch(() => undefined); this.clients.clear();
-    await this.stop(); if (this.dir) await rm(this.dir, { recursive: true, force: true });
+    this.closed = true;
+    return this.closing ??= (async () => {
+      for (const c of this.clients) await c.close().catch(() => undefined); this.clients.clear();
+      await this.stop();
+      // No wildcard, no pre-existing files, no unlink while the child holds its lock.
+      if (this.ownedKeyLock) {
+        const stat = await lstat(this.keyLockPath);
+        assert.equal(stat.dev, this.ownedKeyLock.dev); assert.equal(stat.ino, this.ownedKeyLock.ino);
+        assert(stat.isFile() && !stat.isSymbolicLink(), 'owned key lock was replaced');
+        await unlink(this.keyLockPath); this.ownedKeyLock = undefined;
+      }
+      if (this.dir) await rm(this.dir, { recursive: true, force: true });
+    })();
   }
   async wallet(rolling24hMax: string) {
     await this.owner('wallet-policy', 'set', '--file', await this.file({ revision: ++this.walletRevision, rolling24hMax, safetyReserve: '0.01' }));
@@ -202,6 +238,10 @@ export async function standing(h: Harness, output = true) {
   const a = await h.agent('standing approval', { approvalThreshold: '0.002' });
   const grant = await h.owner<{ id: string }>('standing', 'grant', '--file', await h.file({ agentId: a.id,
     perTxMax: '0.005', totalMax: '0.010', expiresAt: Date.now() + 600_000 }));
+  // The grant has its full 0.010 headroom: only its 0.005 per-tx bound blocks this.
+  const overPerTx = await a.transfer('0.006'); assert.equal(overPerTx.state, 'pending_approval');
+  assert.equal(overPerTx.signedAt, null); assert.equal(overPerTx.txHash, null);
+  await a.call('cancel_request', { requestId: overPerTx.id });
   const first = await a.paid('0.004'); const second = await a.paid('0.004');
   const excess = await a.transfer('0.004'); assert.equal(excess.state, 'pending_approval');
   await a.call('cancel_request', { requestId: excess.id });
@@ -212,8 +252,8 @@ export async function standing(h: Harness, output = true) {
   await h.owner('standing', 'revoke', unused.id);
   const revoked = await a.transfer('0.003'); assert.equal(revoked.state, 'pending_approval');
   const receipts = await a.receipts(); assert.equal(receipts.filter((x) => x.type === 'standing_approval_used').length, 2);
-  if (output) for (const r of [first, second, excess, revoked]) await printPayment(a, r);
+  if (output) for (const r of [overPerTx, first, second, excess, revoked]) await printPayment(a, r);
   await a.call('cancel_request', { requestId: revoked.id });
-  summary('PASS standing: 0.004 twice without owner; total exhaustion waits; revoked grant waits');
+  summary('PASS standing: 0.006 > grant perTx 0.005 waits with full headroom; 0.004 twice without owner; total exhaustion waits; revoked grant waits');
   return { a, payments: [first, second] };
 }

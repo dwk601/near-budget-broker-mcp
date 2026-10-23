@@ -1,20 +1,23 @@
 import assert from 'node:assert/strict';
 import { beforeAll, afterAll, it } from 'vitest';
-import { readFile, writeFile, mkdtemp, rm } from 'node:fs/promises';
+import type { TestContext } from 'vitest';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { actions, KeyPair } from 'near-api-js';
 import { formatNear, parseNear } from '../../../src/contracts/index.js';
 import { Agent, Harness, build, denied, fixtures, near, printPayment, sleep, standing, summary, threeAgents } from '../../../scripts/demo/harness.js';
 import type { Fixtures, Transfer } from '../../../scripts/demo/harness.js';
 import { Testnet, tokensBurnt } from './network.js';
+import { Disposable } from './disposable.js';
 
 type Snapshot = { sender: bigint; receiver: bigint };
 let f: Fixtures; let h: Harness; let network: Testnet; let unavailable = 'BB_LIVE is not 1';
 let initial: Snapshot; let observedPrincipal = 0n; let observedFees = 0n;
 const enabled = process.env['BB_LIVE'] === '1';
+const cleanups = new Set<() => Promise<void>>();
 beforeAll(async () => {
+  if (!enabled && process.env['BB_REQUIRE_LIVE'] === '1') throw new Error('BB_REQUIRE_LIVE=1 requires BB_LIVE=1');
   if (!enabled) return;
   try { f = await fixtures(); }
   catch {
@@ -28,11 +31,15 @@ beforeAll(async () => {
   assert(initial.sender > parseNear('1.5'), 'testnet funding must exceed 1.5 NEAR');
   h = await new Harness(f).init(); unavailable = '';
 }, 120_000);
-afterAll(async () => { await h?.close(); }, 90_000);
-function scenario(name: string, body: () => Promise<void>) {
+afterAll(async () => {
+  // Covers timeout/abort even when a scenario body never reaches its finally.
+  try { for (const cleanup of cleanups) await cleanup(); }
+  finally { await h?.close(); }
+}, 240_000);
+function scenario(name: string, body: (ctx: TestContext) => Promise<void>) {
   it(name, async (ctx) => {
     if (unavailable) { summary(`SKIP live ${name}: ${unavailable}`); ctx.skip(); return; }
-    try { await body(); summary(`PASS live ${name}`); }
+    try { await body(ctx); summary(`PASS live ${name}`); }
     catch (e) { summary(`FAIL live ${name}`); throw e; }
   }, 600_000);
 }
@@ -144,45 +151,44 @@ scenario('(i) standing approval on chain', async () => {
   const before = await network.snapshot(f.accountId, f.receiver); const result = await standing(h);
   await reconcile('standing', [result.a], result.payments, before);
 });
-scenario('(j) disposable account emergency broker-key deletion and recovery', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'bb-disposable-')); const recovery = KeyPair.fromRandom('ed25519'); const broker = KeyPair.fromRandom('ed25519');
+scenario('(j) disposable account emergency broker-key deletion and recovery', async (ctx) => {
   const id = `b10-${randomBytes(6).toString('hex')}.${f.accountId}`;
-  const parentRecovery = JSON.parse(await readFile(f.recoveryFile, 'utf8')) as { account_id: string; private_key: string };
-  assert.equal(parentRecovery.account_id, f.accountId);
-  const disposable = new Harness({ ...f, accountId: id, envelope: join(dir, 'envelope') }); let created = false; let cleaned = false;
+  const life = await new Disposable(id, f.accountId, network).init();
+  const disposable = new Harness({ ...f, accountId: id, envelope: join(life.directory, 'envelope') });
+  const cleanup = async () => { await life.cleanup(() => disposable.close()); cleanups.delete(cleanup); };
+  // Register BEFORE preparation/submission, not after a successful create response.
+  cleanups.add(cleanup); ctx.onTestFinished(cleanup, 240_000);
+  const chain = new Testnet(f.rpcUrl, fetch, ctx.signal);
+  const active = () => ctx.signal.throwIfAborted();
   try {
-    const create = await network.recovery(f.accountId, parentRecovery.private_key, id, [actions.createAccount(), actions.transfer(parseNear('0.5')),
-      actions.addFullAccessKey(recovery.getPublicKey()), actions.addFullAccessKey(broker.getPublicKey())]); created = true;
-    summary(`disposable create ${id} https://testnet.nearblocks.io/txns/${create.transaction.hash}`);
-    const raw = join(dir, 'broker'); await writeFile(raw, broker.toString(), { mode: 0o600 });
-    await disposable.command(['init-custody', '--key-file', raw, '--master-file', f.master, '--out', disposable.options.envelope, '--json']);
-    await disposable.init(); const a = await disposable.agent('disposable broker'); const paid = await a.paid('0.001'); await printPayment(a, paid);
-    const remove = await network.recovery(id, recovery.toString(), id, [actions.deleteKey(broker.getPublicKey())]);
+    const parentRecovery = JSON.parse(await readFile(f.recoveryFile, 'utf8')) as { account_id: string; private_key: string };
+    assert.equal(parentRecovery.account_id, f.accountId); active();
+    await life.create(parentRecovery.private_key, ctx.signal); active();
+    const raw = join(life.directory, 'broker'); await writeFile(raw, life.broker.toString(), { mode: 0o600 }); active();
+    await disposable.command(['init-custody', '--key-file', raw, '--master-file', f.master, '--out', disposable.options.envelope, '--json']); active();
+    await disposable.init(); active();
+    const a = await disposable.agent('disposable broker'); active();
+    const paid = await a.paid('0.001'); active(); await printPayment(a, paid); active();
+    const remove = await chain.recovery(id, life.recovery.toString(), id, [actions.deleteKey(life.broker.getPublicKey())]); active();
     summary(`disposable delete broker key https://testnet.nearblocks.io/txns/${remove.transaction.hash}`);
-    const keys = await network.keys(id); assert(!keys.some((k) => k.public_key === broker.getPublicKey().toString()));
-    assert(keys.some((k) => k.public_key === recovery.getPublicKey().toString()));
-    const before = await network.snapshot(id, f.receiver); const blocked = await a.transfer('0.001');
-    await sleep(5000); const next = await a.call<Transfer>('get_request', { requestId: blocked.id });
+    const keys = await chain.keys(id); active();
+    assert(!keys.some((k) => k.public_key === life.broker.getPublicKey().toString()));
+    assert(keys.some((k) => k.public_key === life.recovery.getPublicKey().toString()));
+    const before = await chain.snapshot(id, f.receiver); active();
+    // Drop all earlier drain logs: only a NEW missing-key failure may satisfy this check.
+    disposable.diagnostics = '';
+    const blocked = await a.transfer('0.001'); active();
+    await sleep(5000); active(); const next = await a.call<Transfer>('get_request', { requestId: blocked.id }); active();
     assert.equal(next.state, 'queued'); assert.equal(next.txHash, null, 'removed key prevents even signing/dispatch'); assert.equal(next.signedAt, null);
-    assert(disposable.diagnostics.includes('BROKER_UNAVAILABLE'), 'failed missing-key lookup reported by real daemon');
-    const after = await network.snapshot(id, f.receiver); assert.equal(after.receiver, before.receiver); assert.equal(after.sender, before.sender);
-    await printPayment(a, next); await a.call('cancel_request', { requestId: next.id });
-    summary('PASS emergency: removed broker key leaves next request queued/unsigned; zero dispatch; owner recovery key intact');
-    await disposable.close();
-    const proof = await network.recovery(id, recovery.toString(), f.receiver, [actions.transfer(1n)]);
+    assert(disposable.diagnostics.includes('BROKER_UNAVAILABLE'), 'fresh missing-key lookup failure reported after deletion');
+    const after = await chain.snapshot(id, f.receiver); active();
+    assert.equal(after.receiver, before.receiver); assert.equal(after.sender, before.sender);
+    await printPayment(a, next); active(); await a.call('cancel_request', { requestId: next.id }); active();
+    summary('PASS emergency: removed broker key leaves next request queued/unsigned; zero dispatch; fresh failure log; recovery key intact');
+    await disposable.close(); active();
+    const proof = await chain.recovery(id, life.recovery.toString(), f.receiver, [actions.transfer(1n)]); active();
     summary(`disposable recovery still works https://testnet.nearblocks.io/txns/${proof.transaction.hash}`);
-    const cleanup = await network.recovery(id, recovery.toString(), id, [actions.deleteAccount(f.accountId)]); cleaned = true;
-    summary(`disposable cleanup beneficiary=${f.accountId} https://testnet.nearblocks.io/txns/${cleanup.transaction.hash}`);
-  } finally {
-    await disposable.close();
-    try {
-      if (created && !cleaned) {
-        const cleanup = await network.recovery(id, recovery.toString(), id, [actions.deleteAccount(f.accountId)]); cleaned = true;
-        summary(`disposable cleanup after failure https://testnet.nearblocks.io/txns/${cleanup.transaction.hash}`);
-      }
-    } finally { await rm(dir, { recursive: true, force: true }); }
-    assert(!created || cleaned, 'disposable cleanup required');
-  }
+  } finally { await cleanup(); }
   const final = await network.snapshot(f.accountId, f.receiver); const spend = initial.sender - final.sender;
   assert(spend > 0n && spend < parseNear('1.5'), 'entire run net custody spend <1.5 NEAR including disposable funding returned');
   summary(`PASS live spend: net=${formatNear(spend)} NEAR (<1.5); ordinary principal=${formatNear(observedPrincipal)} fees=${formatNear(observedFees)}; disposable funded 0.5 and deleted back to custody`);

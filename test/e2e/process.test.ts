@@ -1,13 +1,26 @@
 import assert from 'node:assert/strict';
 import { it } from 'vitest';
-import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm, lstat, unlink } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { KeyPair } from 'near-api-js';
 import type { Checkpoint } from '../../src/contracts/index.js';
 import { Harness, build, denied, near, standing, summary, threeAgents } from '../../scripts/demo/harness.js';
-import { fakeRpc } from './fake-rpc.js';
+import { fakeRpc, INITIAL_NONCE } from './fake-rpc.js';
+
+async function assertNoOwnerSecret(h: Harness) {
+  assert(h.child?.pid);
+  let environment: string;
+  try {
+    environment = process.platform === 'linux' ? await readFile(`/proc/${h.child.pid}/environ`, 'utf8')
+      : (await promisify(execFile)('ps', ['eww', '-p', String(h.child.pid)])).stdout;
+  } catch { throw new Error('could not inspect spawned daemon environment (details redacted)'); }
+  assert(!environment.includes('BB_OWNER_PASSPHRASE='), 'daemon must not receive owner passphrase environment variable');
+  assert(!environment.includes(h.passphrase), 'daemon must not receive owner passphrase value');
+}
 
 it('built daemon + owner CLI + SDK through real stdio bridges: all offline scenarios', async () => {
   await build(); const rpc = await fakeRpc(); const dir = await mkdtemp(join(tmpdir(), 'bb-fake-rpc-'));
@@ -16,7 +29,7 @@ it('built daemon + owner CLI + SDK through real stdio bridges: all offline scena
     const raw = join(dir, 'raw-key'); await writeFile(raw, KeyPair.fromRandom('ed25519').toString(), { mode: 0o600 });
     await writeFile(h.options.master, randomBytes(32), { mode: 0o600 });
     await h.command(['init-custody', '--key-file', raw, '--master-file', h.options.master, '--out', h.options.envelope, '--json']);
-    await h.init();
+    await h.init(); await assertNoOwnerSecret(h);
     const demo = await threeAgents(h, false);
     assert.equal(rpc.sends.length, 1); assert.equal(rpc.sends[0]!.amount.toString(), near('0.001'));
     for (const a of [demo.b, demo.c]) {
@@ -62,7 +75,26 @@ it('built daemon + owner CLI + SDK through real stdio bridges: all offline scena
     tampered[0]!.hash = 'f'.repeat(64);
     await assert.rejects(h.owner('receipts', 'verify', '--file', await h.file(tampered), '--checkpoint', first.checkpoint, '--audit-key', trustedKey), /CLI_FAILED/);
     assert.deepEqual(rpc.violations, []);
+    assert(rpc.accessKeyNonces.length > 0 && rpc.accessKeyNonces.every((n) => typeof n === 'number' && Number.isSafeInteger(n) && BigInt(n) >= INITIAL_NONCE));
+    assert(rpc.sends.every((s) => s.nonce > INITIAL_NONCE));
+    assert.equal(rpc.waitUntil.length, rpc.sends.length); assert(rpc.waitUntil.every((wait) => wait === 'INCLUDED'));
+    assert([...rpc.paid.values()].every((entry) => entry.polls >= 1 && entry.finalized), 'every payment requires INCLUDED then tx polling to FINAL');
+    assert(rpc.headsSeen.length > 1);
+    for (let i = 1; i < rpc.headsSeen.length; i++) {
+      assert(rpc.headsSeen[i]!.height > rpc.headsSeen[i - 1]!.height); assert.notEqual(rpc.headsSeen[i]!.hash, rpc.headsSeen[i - 1]!.hash);
+    }
     summary('PASS receipt export: owner + every agent chain verified offline against pinned audit key/checkpoints; tampering rejected');
+    summary('PASS numeric large nonces, advancing block heights/hashes, INCLUDED -> tx polling -> FINAL');
+    await h.close(); await assert.rejects(lstat(h.keyLockPath), { code: 'ENOENT' });
+    // A file present BEFORE a later daemon launch must not be claimed or removed.
+    const preexisting = new Harness(h.options); let madeLock = false;
+    try {
+      await writeFile(h.keyLockPath, '', { mode: 0o600, flag: 'wx' }); madeLock = true;
+      const before = await lstat(h.keyLockPath);
+      await preexisting.init(); await preexisting.close();
+      const after = await lstat(h.keyLockPath); assert.equal(after.dev, before.dev); assert.equal(after.ino, before.ino);
+    } finally { await preexisting.close(); if (madeLock) await unlink(h.keyLockPath); }
+    summary('PASS daemon receives no owner passphrase; exact newly-created key lock removed after stop; pre-existing key lock preserved');
   } catch (e) { summary(`FAIL offline rpc: sends=${rpc.sends.length} violations=${rpc.violations.join('; ')}`); throw e; }
   finally { await h.close(); await rpc.close(); await rm(dir, { recursive: true, force: true }); }
 }, 180_000);
