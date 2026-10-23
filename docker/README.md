@@ -65,13 +65,24 @@ spending: missing policies deny. Fee reservation must cover plausible actual gas
 (see `src/broker/README.md`); chain access requires a full-access custody key.
 Startup attests RPC `chain_id=testnet` before custody unlock/recovery/serving.
 
-Compose v2 supports environment-sourced secrets. Supply `BB_MASTER_MATERIAL`
-(exact master bytes as text; use randomly generated base64 text for provisioning)
-and `BB_CONFIG_JSON` in the **protected deployment environment**. Compose mounts
-these as `/run/secrets/bb_master` and `/run/secrets/bb_config`; there are no host
-secret-file paths or bind-mounted DB/key directories in this setup. Clear
-provisioning environment afterward. A secret manager/backend that injects files
-may replace this provisioning source, preserving the same container paths.
+Compose uses **file-backed secrets**, which work with `read_only: true`.
+Environment/content-sourced Compose secrets do NOT work with a read-only service.
+Set `BB_MASTER_FILE=/protected/budget-broker/master` and
+`BB_CONFIG_FILE=/protected/budget-broker/config.json` to absolute paths **outside
+this repository**, in a 0700 directory, both files mode **0600**. These are path
+variables, never secret values. Protect this directory from agent OS users. On
+Linux, source files must be owned by uid 1000 (or the mapped container uid), so
+the non-root daemon can read them; Compose file-secret uid/mode remapping is not
+portable. On Docker Desktop verify the file-sharing ownership mapping. Do not
+relax file permissions to make a deployment work: provision under the correct
+protected OS user. A secret manager may materialize these protected files.
+
+Compose mounts these files at `/run/secrets/bb_master` and
+`/run/secrets/bb_config`. Host paths for these two secrets are an explicit
+protected-operator exception; DB, custody and audit keys remain exclusively in
+the named volume, never host bind mounts. The daemon accepts ONLY
+`BB_MASTER_SECRET_FILE`; direct `BB_MASTER_SECRET` is rejected, even if a file
+is also supplied. No secret value belongs in config, the DB, argv or logs.
 
 ```
 docker compose -f docker/docker-compose.yml config
@@ -87,14 +98,20 @@ Plain Compose secrets are not protection against the Docker-controlling host
 user. No claim of protection from a privileged host user is made here.
 
 Use **one named volume/trust root per custody key**, reused across deployments.
-Never deploy the same key with different named volumes/hosts. An exclusive
-`daemon.lock` fences one volume; a per-key uid-scoped /tmp lock also fences
-multiple data directories in one OS namespace. Independent container namespaces
-cannot fence each other without that shared volume. Active-active is unsupported.
-Locks intentionally fail closed on stale/unknown records (container PID numbers
-cannot prove process death). After SIGKILL/crash, an operator must verify the old
-container/process is stopped before removing its stale locks. Do not remove a
-live lock. SIGTERM/SIGINT stops scheduling, closes listeners, waits for invoked
+Never deploy the same key with different named volumes/data directories/hosts.
+`daemon.lock` is a separate SQLite database held in an EXCLUSIVE transaction for
+the whole process lifetime. It lives inside the private data directory, not in
+shared /tmp. The kernel releases the lock on SIGKILL/crash: restart automatically
+recovers, without PID guessing or deleting files. Retain this lock file forever;
+never unlink or replace a live lock or its data directory (host-volume control is
+outside the threat boundary). Active-active and independent volumes for one key
+are unsupported. Upgrading from the old O_EXCL format: stop the OLD daemon first,
+then remove its old text `daemon.lock` once before starting the new version.
+
+Distinct redacted stderr diagnostics are `LOCK_HELD`, `LOCK_UNAVAILABLE`,
+`BAD_CONFIG`, `BAD_MASTER_SECRET`, `MASTER_SECRET_ENV_REFUSED`, `LISTEN_FAILED`;
+network refusal remains `MAINNET_REFUSED`. No diagnostic includes secret values
+or paths. SIGTERM/SIGINT stops scheduling, closes listeners, waits for invoked
 broker work, locks custody and closes SQLite, then exits 0. A 90s compose grace
 period must exceed the deployment RPC/in-flight workload duration.
 
@@ -141,11 +158,12 @@ owner checkpoints list CHAIN_ID [--out CHECKPOINTS_JSON]
 owner receipts verify --file EXPORT_JSON --checkpoint RETAINED_CHECKPOINT_JSON --audit-key ed25519:TRUSTED_KEY
 ```
 
-Token issue/rotation returns **only a path** on stdout, writes plaintext token to
-an exclusively created 0600 file and never persists/logs it in DB. Choose a new
-path for rotation; existing files/symlinks are refused. Credential IDs are in the
-signed `credential_issued` receipt (export the affected agent's chain). Keep the
-old token file only until bridge consumers switch paths; revocation is immediate.
+Token issue/rotation prints the **path and public credential ID**, never the
+token, on stdout (`--json`: `{path,credentialId}`). Use that ID directly for
+rotation/revocation. Plaintext token is written only to an exclusively created
+0600 file, never logs or DB. Choose a new path for rotation; existing
+files/symlinks are refused. Keep the old token file only until bridge consumers
+switch paths; revocation is immediate.
 Discovery list commands show up to 1000 items with `nextCursor`; continue with
 `--after CURSOR`, optionally `--limit 1..1000`. The signed admin API supports
 continuation via the corresponding `query.after` (listAgents takes
@@ -179,8 +197,10 @@ JSON body fields matching the operation, excluding principal (e.g.
 invocation, raw signer, SQL or secret endpoint exists.
 
 Exit codes: 0 success/clean shutdown, 1 operation/dependency/verification failure,
-2 usage error, 3 authentication/authorization failure. Errors expose only stable
-codes (never raw RPC/SQL/key details).
+2 usage/local argument or file validation/stale policy revision conflict,
+3 authentication/authorization failure. CLI IDs must be broker-issued UUIDs.
+Errors expose only stable codes and daemon diagnostic reasons (never raw
+RPC/SQL/key details).
 
 ## Agent bridge
 
@@ -195,4 +215,10 @@ stdin EOF close transports and exit, including with the stdin pipe left open.
 Tests: `npm run test:cli`, `npm run test:isolation`, `npm run typecheck`,
 `npm run build`. The trusted `startDaemon({dependencies:{chain,signer,clock}})`
 composition seam supports offline tests without adding any environment-selectable
-fake chain or production auth bypass.
+fake chain or production auth bypass. Isolation tests require working Docker +
+Compose, actually build/create/up against an isolated fake testnet RPC, then
+SIGKILL/restart and remove their containers, network, image and named volume.
+Only an explicit `BB_SKIP_DOCKER=1` skips Docker integration, printing `SKIP`;
+missing Docker otherwise FAILS. `npx tsx test/cli/mutations.ts` runs the review
+mutants on isolated temporary copies, never edits the worktree, and requires
+all mutants to be killed.

@@ -1,8 +1,7 @@
 import { chmod, mkdir, readFile, realpath } from 'node:fs/promises';
 import { join, resolve, dirname, relative, isAbsolute } from 'node:path';
-import { tmpdir } from 'node:os';
 import type { Server } from 'node:http';
-import { BrokerError, fromDecimalText, parseConfig, sha256Hex } from '../contracts/index.js';
+import { BrokerError, fromDecimalText, parseConfig } from '../contracts/index.js';
 import type { Clock, Config, CustodySigner, NearChain, Store } from '../contracts/index.js';
 import { SqliteStore } from '../storage/index.js';
 import { NativeNearChain } from '../near/index.js';
@@ -15,13 +14,19 @@ import { BrokerService } from '../broker/index.js';
 import { createAgentHttpServer } from '../mcp/http/index.js';
 import { createAdminHttpServer } from './admin.js';
 import { exclusiveLock } from './lock.js';
+import { DaemonFailure } from './diagnostics.js';
 import { parseJson } from './wire.js';
 
 /** Config monetary fields are canonical yoctoNEAR strings, never unlock secrets. */
 export async function loadConfig(path: string): Promise<Config> {
-  const value = parseJson(await readFile(path, 'utf8')) as Record<string, unknown>;
-  return parseConfig({ ...value, safetyReserve: fromDecimalText(value['safetyReserve']),
-    ...(value['feeReservePerTx'] === undefined ? {} : { feeReservePerTx: fromDecimalText(value['feeReservePerTx']) }) });
+  try {
+    const value = parseJson(await readFile(path, 'utf8')) as Record<string, unknown>;
+    return parseConfig({ ...value, safetyReserve: fromDecimalText(value['safetyReserve']),
+      ...(value['feeReservePerTx'] === undefined ? {} : { feeReservePerTx: fromDecimalText(value['feeReservePerTx']) }) });
+  } catch (e) {
+    if (e instanceof BrokerError && e.code === 'MAINNET_REFUSED') throw e;
+    throw new DaemonFailure('BAD_CONFIG');
+  }
 }
 export interface DaemonOptions {
   config: Config;
@@ -37,7 +42,9 @@ async function listen(server: Server, port: number, host: string) {
   });
 }
 export async function startDaemon(options: DaemonOptions) {
-  const config = parseConfig(options.config);
+  let config: Config;
+  try { config = parseConfig(options.config); }
+  catch (e) { if (e instanceof BrokerError && e.code === 'MAINNET_REFUSED') throw e; throw new DaemonFailure('BAD_CONFIG'); }
   const clock = options.dependencies?.clock ?? { now: () => Date.now() };
   const log = options.log ?? ((code: string) => process.stderr.write(`Budget Broker daemon: ${code}\n`));
   const intervalMs = options.intervalMs ?? 1000;
@@ -47,7 +54,6 @@ export async function startDaemon(options: DaemonOptions) {
   await chmod(config.dataDir, 0o700);
   const dataDir = await realpath(config.dataDir);
   const releaseData = await exclusiveLock(join(dataDir, 'daemon.lock'));
-  let releaseKey: (() => Promise<void>) | undefined;
   let store: Store | undefined;
   const custody = new EncryptedFileCustody();
   let agent: ReturnType<typeof createAgentHttpServer> | undefined;
@@ -67,7 +73,7 @@ export async function startDaemon(options: DaemonOptions) {
     while (calls.size) await Promise.allSettled([...calls]);
     await attempt(() => custody.lock());
     await attempt(() => store?.close());
-    await attempt(() => releaseKey?.()); await attempt(() => releaseData());
+    await attempt(() => releaseData());
     if (errors.length) throw new BrokerError('BROKER_UNAVAILABLE');
   }
   try {
@@ -76,20 +82,22 @@ export async function startDaemon(options: DaemonOptions) {
     if (await chain.verifyNetwork() !== 'testnet') throw new BrokerError('MAINNET_REFUSED');
     let signer = options.dependencies?.signer;
     if (!signer) {
-      const master = await readMasterSecret(options.env ?? process.env);
-      try { signer = await custody.loadKeyFile(join(dataDir, 'custody.json'), master); }
-      finally { master.fill(0); }
+      const env = options.env ?? process.env;
+      if (env['BB_MASTER_SECRET'] !== undefined) throw new DaemonFailure('MASTER_SECRET_ENV_REFUSED');
+      let master: Buffer | undefined;
+      try {
+        master = await readMasterSecret({ BB_MASTER_SECRET_FILE: env['BB_MASTER_SECRET_FILE'] });
+        signer = await custody.loadKeyFile(join(dataDir, 'custody.json'), master);
+      } catch { throw new DaemonFailure('BAD_MASTER_SECRET'); }
+      finally { master?.fill(0); }
     }
-    // Same OS user cannot start a second data directory for this custody key.
-    // Cross-container fencing requires reusing the SAME named volume (see README).
-    releaseKey = await exclusiveLock(join(tmpdir(), `bb-custody-${process.getuid?.() ?? 'user'}-${sha256Hex(signer.publicKey)}.lock`));
     // Resolve the volume root once (e.g. macOS /var -> /private/var).
     const auditRelative = relative(resolve(config.dataDir), resolve(config.auditKeyPath));
-    if (!auditRelative || auditRelative.startsWith('..') || isAbsolute(auditRelative)) throw new BrokerError('FORBIDDEN');
+    if (!auditRelative || auditRelative.startsWith('..') || isAbsolute(auditRelative)) throw new DaemonFailure('BAD_CONFIG');
     const auditPath = join(dataDir, auditRelative);
     await mkdir(dirname(auditPath), { recursive: true, mode: 0o700 });
     const auditDir = await realpath(dirname(auditPath));
-    if (!auditDir.startsWith(`${dataDir}/`) && auditDir !== dataDir) throw new BrokerError('FORBIDDEN');
+    if (!auditDir.startsWith(`${dataDir}/`) && auditDir !== dataDir) throw new DaemonFailure('BAD_CONFIG');
     const audit = AuditSigner.loadOrCreate(auditPath);
     const receipts = new ReceiptLog(store, audit);
     const checkpoints = new CheckpointLog(store, audit);
@@ -109,8 +117,10 @@ export async function startDaemon(options: DaemonOptions) {
     } });
     agent = createAgentHttpServer({ config, broker: tracked, authenticator: auth, clock });
     admin = createAdminHttpServer(config, tracked, auth, checkpoints);
-    await listen(agent.server, config.agentPort, config.bindHost);
-    await listen(admin.server, config.adminPort, config.bindHost);
+    try {
+      await listen(agent.server, config.agentPort, config.bindHost);
+      await listen(admin.server, config.adminPort, config.bindHost);
+    } catch { throw new DaemonFailure('LISTEN_FAILED'); }
     timer = setInterval(() => {
       if (closing || scheduled) return;
       scheduled = (async () => { await broker.expirePending(); await broker.drain(); })()

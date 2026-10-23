@@ -6,6 +6,10 @@ import { json, parseJson } from '../daemon/wire.js';
 import { runStdioBridge } from '../bridge/index.js';
 import { initOwnerKey, ownerPassphrase, readProtected, unlockOwnerKey, writeProtected } from './keys.js';
 import { OwnerClient } from './client.js';
+import { adminSchemas } from '../daemon/admin.js';
+import type { AdminOperation } from '../daemon/admin.js';
+import { z } from 'zod';
+import { DaemonFailure } from '../daemon/diagnostics.js';
 
 class UsageError extends Error {}
 function usage(): never { throw new UsageError(); }
@@ -74,7 +78,9 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
     if (!form || args.length < form[0] || args.length > form[1] || (flags.has('force') && group !== 'resolve-attempt')) usage();
     if (group === 'init-owner-key') {
       if (args.length !== 2) usage();
-      const path = required('out'); const publicKey = await initOwnerKey(path, await ownerPassphrase(env));
+      const path = required('out'); const passphrase = await ownerPassphrase(env);
+      if (passphrase.length < 12 || passphrase.length > 4096) usage();
+      const publicKey = await initOwnerKey(path, passphrase);
       print({ path: resolve(path), publicKey }); return 0;
     }
     if (group === 'receipts' && action === 'verify') {
@@ -84,61 +90,98 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
       const verified = verifyExportedChain(receipts, checkpoint, required('audit-key'));
       print(verified); return verified.valid ? 0 : 1;
     }
-    const key = await unlockOwnerKey(flags.get('key') ?? env['BB_OWNER_KEY_FILE'] ?? usage(), await ownerPassphrase(env));
-    const client = new OwnerClient(flags.get('url') ?? env['BB_ADMIN_URL'] ?? 'http://127.0.0.1:3211', key);
+    let client: OwnerClient | undefined;
+    async function call(operation: AdminOperation, body: unknown = {}): Promise<unknown> {
+      try {
+        adminSchemas[operation].parse(body);
+        function ids(value: unknown): void {
+          if (!value || typeof value !== 'object') return;
+          for (const [key, item] of Object.entries(value)) {
+            if (['agentId', 'requestId', 'credentialId', 'approvalId'].includes(key) && item !== undefined) z.uuid().parse(item);
+            ids(item);
+          }
+        }
+        ids(body);
+        const fields = body as { reason?: string; expiresAt?: number; grant?: { expiresAt: number } };
+        if (fields.reason !== undefined && fields.reason.trim().length === 0) usage();
+        if (operation === 'approve' && fields.expiresAt! <= Date.now()) usage();
+        if (operation === 'grantStandingApproval' && fields.grant!.expiresAt <= Date.now()) usage();
+        json(body); // Reject malformed Unicode/non-JSON arguments before signing.
+      } catch { usage(); }
+      if (!client) {
+        const url = flags.get('url') ?? env['BB_ADMIN_URL'] ?? 'http://127.0.0.1:3211';
+        try {
+          const parsed = new URL(url);
+          if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== '/'
+            || (parsed.protocol === 'http:' && !['localhost', '127.0.0.1'].includes(parsed.hostname))) usage();
+        } catch { usage(); }
+        const key = await unlockOwnerKey(flags.get('key') ?? env['BB_OWNER_KEY_FILE'] ?? usage(), await ownerPassphrase(env));
+        client = new OwnerClient(url, key);
+      }
+      try { return await client.call(operation, body); }
+      catch (e) {
+        // The transport's stable FORBIDDEN vocabulary also represents a stale
+        // policy CAS. This is an owner input conflict, not failed authentication.
+        if (e instanceof BrokerError && e.code === 'FORBIDDEN' && ['setPolicy', 'setWalletPolicy'].includes(operation)) usage();
+        throw e;
+      }
+    }
     async function fileObject(): Promise<Record<string, unknown>> {
-      const value = parseJson(await readFile(required('file'), 'utf8'));
-      if (!value || typeof value !== 'object' || Array.isArray(value)) usage();
-      return value as Record<string, unknown>;
+      try {
+        const value = parseJson(await readFile(required('file'), 'utf8'));
+        if (!value || typeof value !== 'object' || Array.isArray(value)) usage();
+        return value as Record<string, unknown>;
+      } catch { usage(); }
     }
     const at = (index = 0) => rest[index] ?? usage();
-    const money = (value: unknown) => parseNear(value).toString();
+    const money = (value: unknown) => { try { return parseNear(value).toString(); } catch { usage(); } };
     const limit = flags.has('limit') ? Number(flags.get('limit')) : 1000;
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) usage();
     const page = { limit, ...(flags.has('after') ? { after: required('after') } : {}) };
     let result: unknown;
-    if (group === 'agent' && action === 'create') result = await client.call('createAgent', { name: at() });
-    else if (group === 'agent' && action === 'list') result = await client.call('listAgents', page);
-    else if (group === 'agent' && action === 'revoke') result = await client.call('revokeAgent', { agentId: at(), reason: at(1) });
+    if (group === 'agent' && action === 'create') result = await call('createAgent', { name: at() });
+    else if (group === 'agent' && action === 'list') result = await call('listAgents', page);
+    else if (group === 'agent' && action === 'revoke') result = await call('revokeAgent', { agentId: at(), reason: at(1) });
     else if (group === 'token' && (action === 'issue' || action === 'rotate')) {
-      // Only the path goes to stdout. Token plaintext exists only in its protected file.
-      const path = required('out');
+      // Public credential ID enables rotation/revocation without receipt scraping.
+      const path = required('out'); let credentialId: string | undefined;
       await writeProtected(path, async () => {
-        const issued = await client.call(action === 'issue' ? 'issueToken' : 'rotateToken', action === 'issue' ? { agentId: at() } : { credentialId: at() }) as { token: string };
+        const issued = await call(action === 'issue' ? 'issueToken' : 'rotateToken', action === 'issue' ? { agentId: at() } : { credentialId: at() }) as { token: string; credential: { id: string } };
+        credentialId = issued.credential.id;
         return `${AgentTokenSchema.parse(issued.token)}\n`;
       });
-      asJson ? print({ path: resolve(path) }) : out(`${resolve(path)}\n`); return 0;
-    } else if (group === 'token' && action === 'revoke') result = await client.call('revokeToken', { credentialId: at() });
-    else if (group === 'policy' && action === 'get') result = await client.call('getPolicy', { agentId: at() });
+      asJson ? print({ path: resolve(path), credentialId }) : out(`${resolve(path)}\ncredentialId: ${credentialId}\n`); return 0;
+    } else if (group === 'token' && action === 'revoke') result = await call('revokeToken', { credentialId: at() });
+    else if (group === 'policy' && action === 'get') result = await call('getPolicy', { agentId: at() });
     else if ((group === 'policy' || group === 'wallet-policy') && action === 'set') {
       const policy = await fileObject();
       for (const field of group === 'policy' ? ['perTxMax', 'rolling24hMax', 'lifetimeMax', 'gasBudget24h', 'approvalThreshold'] : ['rolling24hMax', 'safetyReserve']) {
         if (policy[field] !== null) policy[field] = money(policy[field]);
       }
       const rev = policy['revision']; if (!Number.isSafeInteger(rev) || (rev as number) < 1) usage();
-      result = await client.call(group === 'policy' ? 'setPolicy' : 'setWalletPolicy', { policy, expectedRevision: rev === 1 ? null : (rev as number) - 1 });
-    } else if (group === 'approvals' && action === 'list') result = await client.call('listRequests', { filter: { states: ['pending_approval'] }, query: page });
-    else if (group === 'approvals' && action === 'approve') result = await client.call('approve', { requestId: at(), expiresAt: Number(at(1)) });
-    else if (group === 'approvals' && action === 'reject') result = await client.call('reject', { requestId: at(), reason: at(1) });
+      result = await call(group === 'policy' ? 'setPolicy' : 'setWalletPolicy', { policy, expectedRevision: rev === 1 ? null : (rev as number) - 1 });
+    } else if (group === 'approvals' && action === 'list') result = await call('listRequests', { filter: { states: ['pending_approval'] }, query: page });
+    else if (group === 'approvals' && action === 'approve') result = await call('approve', { requestId: at(), expiresAt: Number(at(1)) });
+    else if (group === 'approvals' && action === 'reject') result = await call('reject', { requestId: at(), reason: at(1) });
     else if (group === 'standing' && action === 'grant') {
       const grant = await fileObject(); grant['perTxMax'] = money(grant['perTxMax']); grant['totalMax'] = money(grant['totalMax']);
-      result = await client.call('grantStandingApproval', { grant });
-    } else if (group === 'standing' && action === 'revoke') result = await client.call('revokeStandingApproval', { approvalId: at() });
-    else if (group === 'standing' && action === 'list') result = await client.call('listStandingApprovals', { agentId: at(), query: page });
+      result = await call('grantStandingApproval', { grant });
+    } else if (group === 'standing' && action === 'revoke') result = await call('revokeStandingApproval', { approvalId: at() });
+    else if (group === 'standing' && action === 'list') result = await call('listStandingApprovals', { agentId: at(), query: page });
     else if (group === 'freeze' || group === 'unfreeze') {
       // Here action is the scope, rest holds agent ID (if any), then reason.
       const target = action === 'global' ? { scope: 'global' } : action === 'agent' ? { scope: 'agent', agentId: at() } : usage();
-      result = await client.call(group, { target, reason: action === 'global' ? at() : at(1) });
-    } else if (group === 'status') result = await client.call('walletStatus');
-    else if (group === 'audit-key') result = await client.call('auditPublicKey');
-    else if (group === 'requests' && action === 'get') result = await client.call('getRequest', { requestId: at() });
-    else if (group === 'requests' && action === 'list') result = await client.call('listRequests', { filter: rest[0] ? { agentId: rest[0] } : {}, query: page });
-    else if (group === 'reconcile') result = await client.call('reconcile', action ? { requestId: action } : {});
-    else if (group === 'resolve-attempt') result = await client.call('resolveAttempt', { requestId: action ?? usage(), reason: at(), force: flags.has('force') });
+      result = await call(group, { target, reason: action === 'global' ? at() : at(1) });
+    } else if (group === 'status') result = await call('walletStatus');
+    else if (group === 'audit-key') result = await call('auditPublicKey');
+    else if (group === 'requests' && action === 'get') result = await call('getRequest', { requestId: at() });
+    else if (group === 'requests' && action === 'list') result = await call('listRequests', { filter: rest[0] ? { agentId: rest[0] } : {}, query: page });
+    else if (group === 'reconcile') result = await call('reconcile', action ? { requestId: action } : {});
+    else if (group === 'resolve-attempt') result = await call('resolveAttempt', { requestId: action ?? usage(), reason: at(), force: flags.has('force') });
     else if ((group === 'receipts' && action === 'export') || (group === 'checkpoints' && action === 'list')) {
       const chainId = ChainIdSchema.parse(at()); const all: (ReceiptEvent | Checkpoint)[] = []; let afterSeq = 0;
       for (;;) {
-        const batch = await client.call(group === 'receipts' ? 'exportReceipts' : 'listCheckpoints', { chainId, afterSeq, limit: 1000 }) as (ReceiptEvent | Checkpoint)[];
+        const batch = await call(group === 'receipts' ? 'exportReceipts' : 'listCheckpoints', { chainId, afterSeq, limit: 1000 }) as (ReceiptEvent | Checkpoint)[];
         if (!batch.length) break; all.push(...batch); afterSeq = batch.at(-1)!.seq;
       }
       if (flags.has('out')) { await writeProtected(required('out'), json(all)); asJson ? print({ path: resolve(required('out')) }) : out(`${resolve(required('out'))}\n`); return 0; }
@@ -146,8 +189,9 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
     } else usage();
     print(result ?? null); return 0;
   } catch (e) {
-    const code = e instanceof UsageError ? 'USAGE' : e instanceof BrokerError ? e.code : 'BROKER_UNAVAILABLE';
-    const text = asJson ? json({ error: { code } }) : `Budget Broker: ${code}${code === 'USAGE' ? ' (see docker/README.md for commands)' : ''}`;
+    const code = e instanceof UsageError || (args[0] === 'owner' && e instanceof z.ZodError) ? 'USAGE' : e instanceof BrokerError ? e.code : 'BROKER_UNAVAILABLE';
+    const reason = e instanceof DaemonFailure ? e.reason : undefined;
+    const text = asJson ? json({ error: { code, ...(reason ? { reason } : {}) } }) : `Budget Broker: ${reason ?? code}${code === 'USAGE' ? ' (see docker/README.md for commands)' : ''}`;
     err(`${text}\n`);
     if (code === 'USAGE') return 2;
     return ErrorCodeSchema.safeParse(code).success && (code === 'UNAUTHENTICATED' || code === 'FORBIDDEN') ? 3 : 1;

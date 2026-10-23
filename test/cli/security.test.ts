@@ -1,7 +1,8 @@
 import { expect, it } from 'vitest';
 import { request } from 'node:http';
 import { join } from 'node:path';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, stat } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { KeyPair } from 'near-api-js';
 import { startDaemon } from '../../src/daemon/index.js';
@@ -11,7 +12,7 @@ import { SqliteStore } from '../../src/storage/index.js';
 import { json } from '../../src/daemon/wire.js';
 import { runCli } from '../../src/cli/index.js';
 import { EncryptedFileCustody } from '../../src/custody/index.js';
-import { fixture, port } from './helpers.js';
+import { fixture } from './helpers.js';
 
 it('admin verifies exact bytes/path/method, duplicate JSON/headers, Host and Origin', async () => {
   const f = await fixture(); const daemon = await startDaemon({ config: f.config, dependencies: f.dependencies, log: () => {} });
@@ -50,12 +51,16 @@ it('admin verifies exact bytes/path/method, duplicate JSON/headers, Host and Ori
   } finally { await daemon.close(); await f.cleanup(); }
 });
 
-it('per-key singleton covers different data directories in the same OS namespace', async () => {
+it('singleton refuses a second SQLite connection without disturbing the held lock', async () => {
   const f = await fixture(); const daemon = await startDaemon({ config: f.config, dependencies: f.dependencies, log: () => {} });
   try {
-    const dataDir = join(f.dir, 'second');
-    await expect(startDaemon({ config: { ...f.config, dataDir, auditKeyPath: join(dataDir, 'audit.pem'), agentPort: await port(), adminPort: await port() }, dependencies: f.dependencies, log: () => {} })).rejects.toThrow('Exclusive custody lock');
-    await expect(readFile(join(dataDir, 'daemon.lock'))).rejects.toThrow();
+    for (let i = 0; i < 3; i++) await expect(startDaemon({ config: f.config, dependencies: f.dependencies, log: () => {} })).rejects.toMatchObject({ reason: 'LOCK_HELD' });
+    const path = join(f.config.dataDir, 'daemon.lock');
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    // A failed same-process contender must not close a raw fd and accidentally
+    // drop the kernel lock while SQLite still believes it holds it.
+    const probe = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `import {exclusiveLock} from './src/daemon/lock.ts'; try { const release = await exclusiveLock(${JSON.stringify(path)}); await release(); process.exit(0); } catch (e) { process.stderr.write(e.reason ?? 'unknown'); process.exit(1); }`], { encoding: 'utf8', timeout: 10_000 });
+    expect(probe.status).toBe(1); expect(probe.stderr).toContain('LOCK_HELD');
   } finally { await daemon.close(); await f.cleanup(); }
 });
 

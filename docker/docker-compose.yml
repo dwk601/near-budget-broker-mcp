@@ -3,6 +3,7 @@
 # separate OS user/sandbox. Encryption does NOT protect an unlocked daemon.
 services:
   daemon:
+    image: ${BB_IMAGE:-budget-broker:local}
     build:
       context: ..
       dockerfile: docker/Dockerfile
@@ -22,15 +23,15 @@ services:
     ports:
       - "127.0.0.1:3210:3210"
       - "127.0.0.1:3211:3211"
-# Compose v2 environment-sourced secrets: no host secret-file bind mounts.
-# Supply these only in the protected owner/deployment environment, never an
-# agent shell. They are mounted as files below /run/secrets inside the container.
-# Host same-user environment inspection is another reason for OS-user isolation.
+# Read-only services require FILE secrets (environment/content sources cannot
+# be materialized by Compose on a read-only rootfs). Use protected 0600 files in
+# a 0700 directory OUTSIDE the repository and inaccessible to agent OS users.
+# These paths are deliberately required: no insecure in-repository defaults.
 secrets:
   bb_master:
-    environment: BB_MASTER_MATERIAL
+    file: ${BB_MASTER_FILE:?set protected master secret file path}
   bb_config:
-    environment: BB_CONFIG_JSON
+    file: ${BB_CONFIG_FILE:?set protected config secret file path}
 volumes:
   bb_data:
-    name: budget-broker-data
+    name: ${BB_DATA_VOLUME:-budget-broker-data}

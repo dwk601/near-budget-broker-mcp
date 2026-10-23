@@ -10,6 +10,8 @@ import { KeyPair } from 'near-api-js';
 import { EncryptedFileCustody } from '../../src/custody/index.js';
 import { json } from '../../src/daemon/wire.js';
 import { fixture, port } from './helpers.js';
+import { OwnerClient } from '../../src/cli/client.js';
+import { initOwnerKey, unlockOwnerKey } from '../../src/cli/keys.js';
 
 async function stopped(child: ChildProcess): Promise<[number | null, NodeJS.Signals | null]> {
   if (child.exitCode !== null || child.signalCode !== null) return [child.exitCode, child.signalCode];
@@ -40,19 +42,53 @@ it('real main daemon unlocks file secret, refuses a second process, SIGTERM exit
   await new Promise<void>((r) => rpc.listen(rpcPort, '127.0.0.1', r));
   try {
     await mkdir(f.config.dataDir, { mode: 0o700 });
-    const master = randomBytes(32); const masterPath = join(f.dir, 'master'); await writeFile(masterPath, master, { mode: 0o600 });
+    const master = Buffer.from(`BB_MASTER_CANARY_${randomBytes(24).toString('hex')}`); const secretForms = [master.toString(), master.toString('hex'), master.toString('base64')];
+    const masterPath = join(f.dir, 'master'); await writeFile(masterPath, master, { mode: 0o600 });
     await new EncryptedFileCustody().createEncryptedKeyFile(join(f.config.dataDir, 'custody.json'), KeyPair.fromRandom('ed25519').toString(), master); master.fill(0);
+    const ownerPath = join(f.dir, 'owner'); const passphrase = 'PROCESS_OWNER_PASSPHRASE_CANARY';
+    f.config.ownerPublicKey = await initOwnerKey(ownerPath, passphrase);
+    const ownerSecret = await unlockOwnerKey(ownerPath, passphrase);
     const configPath = join(f.dir, 'config.json'); await writeFile(configPath, json({ ...f.config, rpcUrl: `http://127.0.0.1:${rpcPort}` }));
-    const start = () => spawn(process.execPath, ['--import', 'tsx', 'src/main.ts', 'daemon', '--config', configPath], { env: { ...process.env, BB_MASTER_SECRET_FILE: masterPath }, stdio: ['pipe', 'pipe', 'pipe'] });
+    let allOutput = '';
+    const start = (extra: NodeJS.ProcessEnv = {}, path = configPath) => {
+      const p = spawn(process.execPath, ['--import', 'tsx', 'src/main.ts', 'daemon', '--config', path], { env: { ...process.env, BB_MASTER_SECRET_FILE: masterPath, ...extra }, stdio: ['pipe', 'pipe', 'pipe'] });
+      p.stdout!.on('data', (b: Buffer) => { allOutput += b.toString(); }); p.stderr!.on('data', (b: Buffer) => { allOutput += b.toString(); });
+      return p;
+    };
     let diagnostics = ''; child = start(); child.stderr!.on('data', (b: Buffer) => { diagnostics += b.toString(); });
     await waitFor(() => diagnostics.includes('ready') || child!.exitCode !== null);
     expect(diagnostics).toContain('ready');
-    second = start(); second.stderr!.resume(); expect(await stopped(second)).toEqual([1, null]);
-    child.kill('SIGTERM'); expect(await stopped(child)).toEqual([0, null]);
-    await expect(readFile(join(f.config.dataDir, 'daemon.lock'))).rejects.toThrow();
+    second = start(); let held = ''; second.stderr!.on('data', (b: Buffer) => { held += b.toString(); }); expect(await stopped(second)).toEqual([1, null]); expect(held).toContain('LOCK_HELD');
+    const url = `http://127.0.0.1:${f.config.adminPort}`;
+    const owner = new OwnerClient(url, ownerSecret);
+    const created = await owner.call('createAgent', { name: 'real CLI token' }) as { id: string };
+    const tokenPath = join(f.dir, 'real-token');
+    second = spawn(process.execPath, ['--import', 'tsx', 'src/main.ts', 'owner', 'token', 'issue', created.id, '--out', tokenPath, '--key', ownerPath, '--url', url, '--json'], { env: { ...process.env, BB_OWNER_PASSPHRASE: passphrase }, stdio: ['pipe', 'pipe', 'pipe'] });
+    let issuedOut = ''; let issuedErr = '';
+    second.stdout!.on('data', (b: Buffer) => { issuedOut += b.toString(); }); second.stderr!.on('data', (b: Buffer) => { issuedErr += b.toString(); });
+    expect(await stopped(second)).toEqual([0, null]);
+    const token = (await readFile(tokenPath, 'utf8')).trim();
+    expect(JSON.parse(issuedOut)).toEqual({ path: tokenPath, credentialId: expect.any(String) });
+    expect(issuedErr).toBe(''); expect(`${issuedOut}${issuedErr}`).not.toContain(token); expect(`${issuedOut}${issuedErr}`).not.toContain(token.slice('bb_agent_'.length));
+    expect(`${issuedOut}${issuedErr}`).not.toContain(passphrase);
+    await owner.call('freeze', { target: { scope: 'global' }, reason: 'survive SIGKILL' });
+    child.kill('SIGKILL'); expect(await stopped(child)).toEqual([null, 'SIGKILL']);
+    // Kernel release must recover with the SAME lock file still present.
+    await readFile(join(f.config.dataDir, 'daemon.lock'));
     diagnostics = ''; child = start(); child.stderr!.on('data', (b: Buffer) => { diagnostics += b.toString(); });
-    await waitFor(() => diagnostics.includes('ready')); child.kill('SIGTERM'); expect(await stopped(child)).toEqual([0, null]);
-    expect(diagnostics).not.toContain('ed25519:');
+    await waitFor(() => diagnostics.includes('ready')); expect(await owner.call('getFreeze', { target: { scope: 'global' } })).toMatchObject({ frozen: true });
+    child.kill('SIGTERM'); expect(await stopped(child)).toEqual([0, null]);
+    const invalid = join(f.dir, 'invalid-config'); await writeFile(invalid, json({ ...f.config, masterSecret: 'never echo this' }));
+    for (const [extra, path, reason] of [
+      [{ BB_MASTER_SECRET_FILE: join(f.dir, 'missing') }, configPath, 'BAD_MASTER_SECRET'],
+      [{ BB_MASTER_SECRET: secretForms[0] }, configPath, 'MASTER_SECRET_ENV_REFUSED'],
+      [{}, invalid, 'BAD_CONFIG'],
+    ] as const) {
+      second = start(extra, path); let output = ''; second.stderr!.on('data', (b: Buffer) => { output += b.toString(); });
+      expect(await stopped(second)).toEqual([1, null]); expect(output).toContain(reason);
+    }
+    for (const secret of secretForms) expect(allOutput).not.toContain(secret);
+    expect(allOutput).not.toContain('ed25519:'); expect(allOutput).not.toContain('never echo this');
   } finally { await kill(second); await kill(child); await new Promise<void>((r) => rpc.close(() => r())); await f.cleanup(); }
 }, 30_000);
 

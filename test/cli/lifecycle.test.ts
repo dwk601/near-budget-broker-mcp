@@ -36,9 +36,11 @@ describe('daemon and owner CLI', () => {
       const agent = await cli('agent', 'create', 'hostile-agent'); const agentId = agent['id'] as string;
       expect((await cli('agent', 'list'))['items']).toHaveLength(1);
       const written = await cli('token', 'issue', agentId, '--out', tokenPath);
-      expect(written).toEqual({ path: tokenPath }); expect(stdout).not.toContain('bb_agent_');
+      expect(written).toEqual({ path: tokenPath, credentialId: expect.any(String) }); expect(stdout).not.toContain('bb_agent_');
+      expect(stderr).toBe('');
       const token = (await readFile(tokenPath, 'utf8')).trim();
       expect((await stat(tokenPath)).mode & 0o777).toBe(0o600);
+      expect(`${stdout}${stderr}`).not.toContain(token);
       const policyPath = join(f.dir, 'policy.json');
       await writeFile(policyPath, json({ agentId, revision: 1, perTxMax: '0.1', rolling24hMax: '1', lifetimeMax: '1', gasBudget24h: '1',
         ratePerMinute: 100, maxOutstanding: 10, recipients: { mode: 'allow_all', accounts: [] }, approvalThreshold: '0' }));
@@ -77,6 +79,7 @@ describe('daemon and owner CLI', () => {
       expect(await owner.call('exportReceipts', { chainId: 'owner', afterSeq: 0, limit: 1000 })).toEqual(before);
       const credentialEvents = await owner.call('exportReceipts', { chainId: `agent:${agentId}`, afterSeq: 0, limit: 1000 }) as { type: string; payload: { credentialId: string } }[];
       const credentialId = credentialEvents.find((e) => e.type === 'credential_issued')!.payload.credentialId;
+      expect(written['credentialId']).toBe(credentialId);
       // An existing output file is refused BEFORE rotation revokes a live token.
       expect(await runCli(['owner', 'token', 'rotate', credentialId, '--out', tokenPath], { env, stdout: () => {}, stderr: () => {} })).toBe(1);
       const rotatedPath = join(f.dir, 'rotated-token'); await cli('token', 'rotate', credentialId, '--out', rotatedPath);
@@ -94,7 +97,7 @@ describe('daemon and owner CLI', () => {
       const headers = signOwnerRequest(ownerKey, 'POST', path, body);
       const replay = () => fetch(`${env.BB_ADMIN_URL}${path}`, { method: 'POST', headers, body });
       expect((await replay()).status).toBe(200); expect((await replay()).status).toBe(401);
-      await expect(startDaemon({ config: f.config, dependencies: f.dependencies, log: () => {} })).rejects.toThrow('Exclusive custody lock');
+      await expect(startDaemon({ config: f.config, dependencies: f.dependencies, log: () => {} })).rejects.toMatchObject({ reason: 'LOCK_HELD' });
       await mcp.close(); await daemon.close(); daemon = undefined;
       daemon = await startDaemon({ config: f.config, dependencies: f.dependencies, intervalMs: 60_000, log: () => {} });
       expect((await replay()).status).toBe(401);
