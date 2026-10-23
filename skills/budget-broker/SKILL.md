@@ -27,11 +27,25 @@ This is 0.001 NEAR. Preview requires the key but reserves/writes nothing. Decode
 
 Call `request_transfer` with the **same complete input**. Retain returned request `id` (broker-issued UUID); use that exact ID, never a guessed label or another agent's ID. A key is scoped to you; the same key and payload returns the original request, different payload gives `IDEMPOTENCY_CONFLICT`. Omitted memo and empty memo are different intents. After timeout, bridge outage or reconnect, inspect `get_request {"requestId":"ID"}` if known; otherwise retry **the identical key/payload**, never invent a fresh key for the same uncertain payment.
 
-A policy denial or pending approval may be normal JSON result rather than MCP `isError`. Inspect `state` and `reasons` on every result. `APPROVAL_REQUIRED` / `pending_approval` means principal+fees are held for **this existing request**. Give the owner the ID, receiver, amount and reason; wait for their decision. Do not create more pending requests. A valid expiring standing approval only removes the prompt gate, not hard caps, wallet capacity or freeze.
+A policy denial or pending approval may be normal JSON result rather than MCP `isError`. Inspect `state` and `reasons` on every result. `APPROVAL_REQUIRED` / `pending_approval` means principal+fees are held for **this existing request**. Give the owner the ID, receiver, amount and reason promptly. The daemon's fixed TTL is **300 s (5 minutes)** from `createdAt`; `expiresAt = createdAt + 300000`. Poll with bounded backoff, checking for expiry, rather than waiting indefinitely. At the deadline pending approval expires when swept or processed by an owner action and releases principal+fee holds. Approval can shorten, never extend, the original deadline. Do not create more pending requests. A valid expiring standing approval only removes the prompt gate, not hard caps, wallet capacity or freeze.
 
 ## 4. Track completion and fees
 
 Poll `get_request` with bounded backoff; no busy loop. queued/approved/signed/submitted are not final success. `outcome_unknown` is **not failure**: preserve ID/key and let the owner reconcile; never pay again or ask for raw signing. `txHash`/testnet explorer link alone is not proof of final execution. `tokensBurnt` is your actual monetary fee, `gasBurnt` is gas units, null means unknown. Gas is charged to your budget even when execution fails; reservations/actual overages can block more work. An explicit owner resolution may show failed with a retained hold; don't assume all failed states free budget.
+
+Every persisted request permanently consumes its idempotency key. Terminal unsent requests cannot be revived by retrying the same key, even after backoff or capacity recovery.
+
+| State | Safe next action |
+| --- | --- |
+| `pending_approval` | Ask owner promptly; poll existing ID until decision or 300 s deadline |
+| `queued`, `approved`, `signed`, `submitted` | Track existing ID/key; not final success |
+| `expired` | Unsent hold released; new key and new request only with explicit owner authorization |
+| `cancelled` | Unsent hold released; new key and new request only with explicit owner authorization |
+| `denied` | No admission hold (or unsent hold released); inspect reasons. Backoff does not revive this key; new key and new request only with explicit owner authorization |
+| `rejected` | Owner refused; **never retry**, with either the old key or a new one |
+| `succeeded` | Complete; never pay again |
+| `failed` | Check fees/holds and owner review; no automatic replacement. A new key/request needs explicit owner authorization after outcome reconciliation |
+| `outcome_unknown` | Preserve ID/key/holds; wait for owner reconciliation, never create a replacement |
 
 `cancel_request {"requestId":"ID"}` is only for your pre-signing work; signed/offered/ambiguous payments cannot be cancelled to free funds. Do not evade that refusal.
 
@@ -41,7 +55,7 @@ Use `list_receipts {"afterSeq":0,"limit":100}` and continue from the last sequen
 
 On suspected misuse or when asked to stop, call `freeze_self {"reason":"suspected misuse; operator review required"}` immediately and notify the operator. It blocks new own spending/dispatch, cannot undo broadcasts, and retains uncertain holds. Only the owner can unfreeze. Never-offered work may permanently fail; unfreeze does not revive it.
 
-Errors: UNAUTHENTICATED/FORBIDDEN → stop and ask operator (never seek keys); AGENT_FROZEN/GLOBAL_FROZEN/NO_POLICY/cap or recipient refusals → no bypass; RATE_LIMITED/MAX_OUTSTANDING → bounded backoff/inspect existing work; INVALID_AMOUNT → fix exact representation before a genuinely new intent; IDEMPOTENCY_CONFLICT → inspect original intent; BROKER_UNAVAILABLE/AUDIT_UNAVAILABLE/NONCE_CONFLICT/MAINNET_REFUSED → owner review, no direct signing. POLICY_CHANGED requires fresh owner review. Do not disclose tokens in chat/logs.
+Errors: UNAUTHENTICATED/FORBIDDEN → stop and ask operator (never seek keys); AGENT_FROZEN/GLOBAL_FROZEN/NO_POLICY/cap or recipient refusals → no bypass; RATE_LIMITED/MAX_OUTSTANDING → bounded backoff/inspect existing work, but a stored `denied` result permanently consumes its key; owner authorization is required for any new key/request, never retry after `rejected`; INVALID_AMOUNT → fix exact representation before a genuinely new intent; IDEMPOTENCY_CONFLICT → inspect original intent; BROKER_UNAVAILABLE/AUDIT_UNAVAILABLE/NONCE_CONFLICT/MAINNET_REFUSED → owner review, no direct signing. POLICY_CHANGED requires fresh owner review. Do not disclose tokens in chat/logs.
 
 ## CLI fallback
 

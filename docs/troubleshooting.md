@@ -23,7 +23,7 @@ Never print keys/tokens, enable protocol logging on stdout, delete accounting ho
 | Force resolution did not restore budget | Intentional: uncertain principal+fees stay held until mature exclusion/final execution; later evidence may charge and globally freeze |
 | Agent unfreeze did not restart failed work | Never-offered signed requests may have been abandoned permanently; owner must authorize a genuinely new intent/key, never revive signed history |
 | Global freeze after late execution | Review signed lateResolution on both chains, actual principal/gas/standing overrun, reconcile before owner unfreeze |
-| `AUDIT_UNAVAILABLE` | Stop spending; check protected volume capacity/integrity and retained audit root; restore a coherent backup, not a fresh audit key beside old history |
+| `AUDIT_UNAVAILABLE` from daemon/MCP | Stop spending; check protected volume capacity/integrity and retained audit root; restore a coherent backup, not a fresh audit key beside old history. For offline `owner receipts verify`, see the local-input row below instead |
 | `BROKER_UNAVAILABLE` at startup | Check its separate redacted diagnostic reason below; do not expose raw config/environment/keys |
 | Lock file remains after crash | **Expected**: SQLite kernel locks release automatically; retain files, never unlink/replace them. Same-key locks use stable OS-account home, not HOME/TMPDIR. Old text O_EXCL format alone needs migration after old daemon stops; see operator guide |
 | Fixture faucet outage | Rerun apply using same external directory; no account/key regeneration; --check alone never provisions missing state |
@@ -32,7 +32,7 @@ Never print keys/tokens, enable protocol logging on stdout, delete accounting ho
 | Compose override tag error | Compose >=2.24.4 needed for prebuilt !reset; set BB_IMAGE consistently, validate config --quiet without logging secrets |
 | Docker build from tarball fails | Tarball intentionally excludes src/lock/tsconfig; build image from source checkout or use trusted prebuilt override |
 | Containerized agent cannot reach localhost | Its localhost is not host loopback; arrange restricted route in deployment, never publish admin publicly |
-| Offline receipt verification fails | Export begins at genesis; pass one retained checkpoint object, not array, with independently pinned public audit key. Corrupt JSON/schema/signature/checkpoint exits **1**; missing required flags exits 2. Never replace pin/key merely to get valid=true |
+| Offline receipt verification fails | Export begins at genesis; pass one retained checkpoint object, not array, with independently pinned public audit key. Missing/unreadable files or JSON/schema parsing failures exit **1** with `Budget Broker: AUDIT_UNAVAILABLE` (`--json`: `{error:{code:"AUDIT_UNAVAILABLE"}}`): here this means a **local input problem**, not a daemon audit-volume failure. With parseable files, a bad audit key instead produces `valid:false` JSON on stdout, empty stderr and exit 1 (also with `--json`). Check paths, file contents and the supplied public key. Corrupt JSON/schema/signature/checkpoint also exits 1; missing required flags exits 2. Never replace pin/key merely to get valid=true |
 
 ## Daemon diagnostics (not MCP/domain codes)
 

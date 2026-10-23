@@ -11,6 +11,8 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { KeyPair } from 'near-api-js';
 import { AuditSigner } from '../../src/audit/core/index.js';
 import { adminSchemas } from '../../src/daemon/admin.js';
+import { loadConfig } from '../../src/daemon/index.js';
+import { assertComposeConfig } from '../isolation/compose-config.js';
 import {
   AgentPolicySchema, WalletPolicySchema, StandingApprovalGrantSchema,
   canonicalJson, checkpointHashInput, parseNear, receiptHashInput, sha256Hex,
@@ -25,6 +27,20 @@ let project = '';
 let bin = '';
 let packedFiles: string[] = [];
 let tarball = '';
+
+// Freeze non-generated package paths: adding an example must be reviewed explicitly.
+const shippedArtifacts = new Set([
+  'package.json', 'README.md', 'LICENSE', 'skills/budget-broker/SKILL.md',
+  'examples/README.md', 'examples/agent-policy.json', 'examples/wallet-policy.json',
+  'examples/standing-approval.json', 'examples/daemon-config.json',
+  'examples/claude-desktop.json', 'examples/claude-code.mcp.json', 'examples/cursor.mcp.json',
+  'examples/compose.prebuilt.yaml', 'examples/compose.resources.yaml',
+  'docker/Dockerfile', 'docker/Dockerfile.dockerignore', 'docker/docker-compose.yml', 'docker/README.md',
+]);
+const allowedMember = (file: string) => shippedArtifacts.has(file) || /^dist\/.+/.test(file);
+// Raw native-key files and either private_key/secret_key JSON are covered by
+// the bare base58 secret pattern; public Ed25519 keys are only 32..44 chars.
+const credentialMaterial = /-----BEGIN (?:ENCRYPTED |EC |RSA )?PRIVATE KEY-----\r?\n[A-Za-z0-9+/=]{16}|bb_agent_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])|ed25519:[1-9A-HJ-NP-Za-km-z]{45,}/;
 
 async function command(file: string, args: string[], cwd: string, extra: NodeJS.ProcessEnv = {}) {
   try {
@@ -51,6 +67,7 @@ beforeAll(async () => {
   project = join(temporary, 'consumer');
   await mkdir(project);
   await writeFile(join(project, 'package.json'), JSON.stringify({ name: 'bb-package-consumer', version: '1.0.0', private: true }));
+  await rm(join(repo, 'dist'), { recursive: true, force: true });
   await ok('npm', ['run', 'build'], repo);
   const packed = await ok('npm', ['pack', '--json', '--pack-destination', temporary], repo);
   type PackManifest = { filename: string; files: { path: string }[] };
@@ -73,19 +90,64 @@ test('tarball has the allowlisted runnable distribution, no secrets/state/tests/
   expect(archive).toEqual([...packedFiles].sort());
   for (const file of packedFiles) {
     expect(file, 'absolute/traversal archive member').not.toMatch(/(^\/|(^|\/)\.\.($|\/))/);
-    expect(file, 'package allowlist').toMatch(/^(package\.json|README\.md|LICENSE|dist\/.+|skills\/.+|examples\/.+|docker\/.+)$/);
+    expect(allowedMember(file), `package allowlist: ${file}`).toBe(true);
     expect(file, 'secret/state/test/dependency member').not.toMatch(/(^|\/)(node_modules|test|tests|fixtures|\.env(?:\..*)?|\.git|secrets?|state|coverage)(\/|$)|\.(test|spec)\.[^/]+$|\.(sqlite(?:-wal|-shm)?|db|pem|key|secret|token|tgz)$|(^|\/)(custody|recovery|broker-key|master)\.json$/i);
   }
   for (const required of ['dist/main.js', 'README.md', 'LICENSE', 'skills/budget-broker/SKILL.md', 'examples/claude-desktop.json', 'examples/claude-code.mcp.json', 'examples/cursor.mcp.json', 'docker/Dockerfile', 'docker/docker-compose.yml']) expect(packedFiles).toContain(required);
   for (const file of packedFiles) {
     const contents = await readFile(join(project, 'node_modules/near-budget-broker-mcp', file), 'utf8');
-    expect(contents, `private credential material in ${file}`).not.toMatch(/-----BEGIN (?:ENCRYPTED |EC |RSA )?PRIVATE KEY-----\r?\n[A-Za-z0-9+/=]{16}|bb_agent_[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])|"private_key"\s*:\s*"ed25519:[1-9A-HJ-NP-Za-km-z]{80,}"/);
+    expect(contents, `private credential material in ${file}`).not.toMatch(credentialMaterial);
   }
   const metadata = JSON.parse(await readFile(join(project, 'node_modules/near-budget-broker-mcp/package.json'), 'utf8')) as { bin: Record<string, string>; scripts: Record<string, string> };
   expect(metadata.bin['budget-broker']).toBe('dist/main.js');
   expect(metadata.scripts['postinstall']).toBeUndefined();
   expect((await stat(bin)).mode & 0o111).not.toBe(0);
 });
+
+test('package guards reject unreviewed artifact names and raw or JSON private credentials', () => {
+  for (const prefix of ['examples', 'docker', 'skills/budget-broker']) {
+    for (const name of ['native-key', 'owner.json', 'receivers.json', 'fixtures.env', 'extra.md']) {
+      expect(allowedMember(`${prefix}/${name}`)).toBe(false);
+    }
+  }
+  for (const file of shippedArtifacts) expect(allowedMember(file)).toBe(true);
+  const pair = KeyPair.fromRandom('ed25519');
+  const secret = pair.toString();
+  for (const contents of [secret, JSON.stringify({ private_key: secret }), JSON.stringify({ secret_key: secret }),
+    `bb_agent_${randomBytes(32).toString('base64url')}`, '-----BEGIN PRIVATE KEY-----\n' + 'A'.repeat(32)]) {
+    expect(credentialMaterial.test(contents)).toBe(true);
+  }
+  expect(credentialMaterial.test(pair.getPublicKey().toString())).toBe(false);
+  expect(credentialMaterial.test('ed25519:REPLACE_WITH_OWNER_PUBLIC_KEY')).toBe(false);
+});
+
+test('shipped base and example Compose overrides render individually and together with preserved isolation', async () => {
+  const shipped = join(project, 'node_modules/near-budget-broker-mcp');
+  const master = join(temporary, 'compose-master'); const config = join(temporary, 'compose-config');
+  const volume = 'bb-package-render-only-no-volume-created';
+  const image = 'budget-broker:package-render-only';
+  await writeFile(master, 'render-only-not-a-real-secret', { mode: 0o600 });
+  await writeFile(config, '{}', { mode: 0o600 });
+  const extra = { BB_MASTER_FILE: master, BB_CONFIG_FILE: config, BB_DATA_VOLUME: volume, BB_IMAGE: image };
+  for (const overrides of [[], ['prebuilt'], ['resources'], ['prebuilt', 'resources']]) {
+    const args = ['compose', '-f', join(shipped, 'docker/docker-compose.yml')];
+    for (const override of overrides) args.push('-f', join(shipped, `examples/compose.${override}.yaml`));
+    const quiet = await command('docker', [...args, 'config', '--quiet'], shipped, extra);
+    expect(quiet.status, quiet.stderr).toBe(0);
+    const rendered = await command('docker', [...args, 'config', '--format', 'json'], shipped, extra);
+    expect(rendered.status, rendered.stderr).toBe(0);
+    const value = JSON.parse(rendered.stdout);
+    assertComposeConfig(value, { master, config, volume });
+    const service = value.services.daemon;
+    expect(service.image).toBe(image);
+    if (overrides.includes('prebuilt')) expect(service.build).toBeUndefined();
+    else expect(service.build).toBeDefined();
+    if (overrides.includes('resources')) {
+      expect(service.mem_limit).toBe('1073741824');
+      expect(service.pids_limit).toBe(128);
+    }
+  }
+}, 120_000);
 
 test('all example JSON parses, MCP launch paths/policies are valid, skill has YAML frontmatter', async () => {
   const shipped = join(project, 'node_modules/near-budget-broker-mcp');
@@ -112,6 +174,17 @@ test('all example JSON parses, MCP launch paths/policies are valid, skill has YA
     for (const field of fields) if (value[field] !== null) value[field] = parseNear(value[field]);
     schema.parse(value);
   }
+  const daemonConfig = JSON.parse(await readFile(join(examples, 'daemon-config.json'), 'utf8')) as Record<string, unknown>;
+  expect(daemonConfig['ownerPublicKey']).toBe('ed25519:REPLACE_WITH_OWNER_PUBLIC_KEY');
+  const publicKey = KeyPair.fromRandom('ed25519').getPublicKey().toString();
+  const configFile = join(temporary, 'example-daemon-config.json');
+  await writeFile(configFile, JSON.stringify({ ...daemonConfig, ownerPublicKey: publicKey }), { mode: 0o600 });
+  const config = await loadConfig(configFile);
+  expect(config.ownerPublicKey).toBe(publicKey);
+  expect(config.feeReservePerTx).toBe(BigInt(daemonConfig['feeReservePerTx'] as string));
+  expect(config.safetyReserve).toBe(BigInt(daemonConfig['safetyReserve'] as string));
+  expect(config.bindHost).toBe('0.0.0.0');
+  expect([config.agentPort, config.adminPort]).toEqual([3210, 3211]);
   const skill = await readFile(join(shipped, 'skills/budget-broker/SKILL.md'), 'utf8');
   // Deliberately support the simple YAML scalar frontmatter used by this skill,
   // without adding a runtime or development YAML dependency to the package.
@@ -175,6 +248,21 @@ test('installed owner command/flag matrix matches documented forms and real admi
     await writeFile(corruptFile, corrupt);
     const invalid = await installed(verifyArgs.map((arg) => arg === receiptsFile ? corruptFile : arg));
     expect(invalid.status, invalid.stderr).toBe(1);
+  }
+  for (const [flag, value] of [['--file', join(temporary, 'missing-receipts.json')], ['--audit-key', 'invalid-key']]) {
+    for (const json of [false, true]) {
+      const args = [...verifyArgs]; args[args.indexOf(flag!) + 1] = value!;
+      if (json) args.push('--json');
+      const invalid = await installed(args);
+      expect(invalid.status).toBe(1);
+      if (flag === '--audit-key') {
+        expect(JSON.parse(invalid.stdout)).toMatchObject({ valid: false, reason: 'Invalid export, checkpoint or pinned key' });
+        expect(invalid.stderr).toBe('');
+      } else {
+        expect(invalid.stdout).toBe('');
+        expect(invalid.stderr).toBe(json ? '{"error":{"code":"AUDIT_UNAVAILABLE"}}\n' : 'Budget Broker: AUDIT_UNAVAILABLE\n');
+      }
+    }
   }
   for (const args of [[], ['owner', 'receipts', 'verify'], ['owner', 'requests', 'get', 'not-a-uuid'], ['owner', 'agent', 'list', '--limit', '0']]) {
     const invalid = await installed([...args, '--json']);

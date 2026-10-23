@@ -17,7 +17,7 @@ Both preview and request require:
 }
 ```
 
-`amount` is positive **integer yoctoNEAR text** (example: 0.001 NEAR), never a JSON number or human decimal. Canonical `0|[1-9][0-9]*`, but transfer zero is rejected; max 2^128−1 (39 digits). `idempotencyKey`: 1..256 characters; `memo`: optional, at most 1024 characters, off-chain only. Receiver must be a valid NEAR account ID. Omitted memo normalizes to null in the request digest; empty string differs. Reuse the same key and identical payload after timeout/reconnect; changing payload gives `IDEMPOTENCY_CONFLICT`. A different agent's key namespace is independent. Preview requires a key but neither consumes nor records it.
+`amount` is positive **integer yoctoNEAR text** (example: 0.001 NEAR), never a JSON number or human decimal. Canonical `0|[1-9][0-9]*`, but transfer zero is rejected; max 2^128−1 (39 digits). `idempotencyKey`: 1..256 characters; `memo`: optional, at most 1024 characters, off-chain only. Receiver must be a valid NEAR account ID. Omitted memo normalizes to null in the request digest; empty string differs. Reuse the same key and identical payload after timeout/reconnect; changing payload gives `IDEMPOTENCY_CONFLICT`. A different agent's key namespace is independent. Preview requires a key but neither consumes nor records it. Every persisted request permanently consumes its key, including terminal unsent `denied`, `expired`, `rejected` and `cancelled` requests. Replaying it returns that request, not a new admission attempt, even after rate/capacity recovers. A new key and new request require owner authorization; never retry after `rejected`.
 
 ## Tools and outputs
 
@@ -42,7 +42,7 @@ Preview decision is `{kind:"allow",reasons:[]}`, `{kind:"deny",reasons:[CODE,...
 
 Fields: `id,agentId,idempotencyKey,requestDigest,receiverId,amount,memo?`, `state,reasons,policyRevision,approvalRef`, `createdAt,updatedAt,expiresAt,signedAt,submittedAt,completedAt`, `txHash,gasBurnt,tokensBurnt,explorerUrl`. Timestamps are integer epoch **ms**, nullable where not yet known; nullable revision/approvalRef; `approvalRef` is `{kind:"request"|"standing",id}`. Amount/tokensBurnt are yocto strings, gasBurnt is a gas-unit decimal string; null fees mean unknown, not zero. Explorer URL is null with no hash, otherwise `https://testnet.nearblocks.io/txns/` plus hash. A hash/signature/submission is **not final success**.
 
-States: `denied`, `pending_approval`, `approved`, `rejected`, `expired`, `cancelled`, `queued`, `signed`, `submitted`, `succeeded`, `failed`, `outcome_unknown`. Pending approval reserves principal+fees; ask the owner to review the existing ID, do not create many new requests. Approved work is re-evaluated before dispatch. Poll `get_request` with bounded backoff. On uncertain outcomes preserve the key/ID and wait for reconciliation; do not pay again with a fresh key. Failed executed transfers still charge actual gas. Explicit owner force-resolution may mark failed **while retaining the hold**; failed alone is not proof funds were released, and late evidence can correct an explicitly watched resolution.
+States: `denied`, `pending_approval`, `approved`, `rejected`, `expired`, `cancelled`, `queued`, `signed`, `submitted`, `succeeded`, `failed`, `outcome_unknown`. Pending approval reserves principal+fees; ask the owner to review the existing ID, do not create many new requests. The daemon uses a fixed **300 s (5 minute)** request TTL: `expiresAt = createdAt + 300000`. At that boundary pending approval expires when processed by the sweeper or owner action, releasing both principal and fee holds. Approval cannot extend the original deadline; its effective expiry is the earlier of the owner's supplied expiry and the request deadline. Rejection/cancellation also release unsent holds; a denied admission has no hold. These terminal unsent states do not free their idempotency keys. Approved work is re-evaluated before dispatch. Poll `get_request` with bounded backoff. On uncertain outcomes preserve the key/ID and wait for reconciliation; do not pay again with a fresh key. Failed executed transfers still charge actual gas. Explicit owner force-resolution may mark failed **while retaining the hold**; failed alone is not proof funds were released, and late evidence can correct an explicitly watched resolution.
 
 ### Receipts and freeze
 
@@ -61,10 +61,10 @@ Receipt fields: `{chainId,seq,prevHash,type,at,payload,hash,signature}`. Sequenc
 | `PER_TX_EXCEEDED`, `ROLLING_24H_EXCEEDED`, `LIFETIME_EXCEEDED` | Own hard principal caps; do not split requests to evade them |
 | `GLOBAL_CAP_EXCEEDED` | Wallet rolling cap; owner review |
 | `GAS_BUDGET_EXCEEDED` | Own monetary gas cap, including reservations/failed fees |
-| `RATE_LIMITED`, `MAX_OUTSTANDING` | Admission/session rate or outstanding capacity; bounded backoff, inspect existing requests |
+| `RATE_LIMITED`, `MAX_OUTSTANDING` | Back off and inspect existing requests. A persisted `denied` request stays denied on same-key replay; capacity recovery does not revive it. Only owner authorization permits a new key/request |
 | `RECIPIENT_NOT_ALLOWED` | Recipient policy refusal; no alternate signing path |
 | `WALLET_CAPACITY` | Insufficient/stale/unknown spendable capacity; preview is not a guarantee |
-| `APPROVAL_REQUIRED` | Owner or valid standing approval needed; preserve existing pending request |
+| `APPROVAL_REQUIRED` | Owner or valid standing approval needed within the original 300 s TTL; preserve existing pending request and check for expiry |
 | `IDEMPOTENCY_CONFLICT` | Key reused for different immutable payload; inspect original request, do not blindly retry |
 | `NOT_FOUND` | Unknown or not-owned request; do not probe others' IDs |
 | `BROKER_UNAVAILABLE` | Dependency/transport unavailable; outcome may be ambiguous, inspect/retry same key only |

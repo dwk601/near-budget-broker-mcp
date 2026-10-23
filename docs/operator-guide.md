@@ -99,7 +99,7 @@ List pagination: agent list, approvals list, standing list and requests list acc
 
 Token issuance/rotation prints the absolute path on one line and `credentialId: UUID` on the next; `--json` prints `{path,credentialId}`. Token plaintext appears only in its new 0600 file, never stdout/DB/logs. Use the returned credential ID directly for rotation/revocation (not the agent ID). Choose a new output path, deliver it to the isolated agent uid with mode 0600, and reconnect clients. Old credentials are revoked immediately; old sessions do not preserve access.
 
-Exit status (all errors to stderr):
+Exit status (diagnostics to stderr; verification results, including `valid:false`, to stdout):
 
 | Status | Meaning |
 | --- | --- |
@@ -108,7 +108,7 @@ Exit status (all errors to stderr):
 | 2 | Usage/local argument or policy/grant file validation; stale policy-write revision (`POLICY_CHANGED` mapped to `USAGE`) |
 | 3 | Authentication/authorization failure, including Host/Origin rejection on policy writes |
 
-Malformed JSON/schema, tampering, signature or checkpoint errors in `receipts verify` exit **1**, not 2/3. Missing required verify flags exit 2. `--json` error shape is `{error:{code}}`; daemon failures may add the separate redacted `reason` (see troubleshooting). Wrong UUIDs, expired grant/approve expiry, invalid monetary files, invalid URL and blank reasons are local usage errors. A policy authorization failure is still exit 3, **not** a stale-revision error.
+Malformed JSON/schema, tampering, signature or checkpoint errors in `receipts verify` exit **1**, not 2/3. Missing/unreadable files and JSON/schema parsing failures also exit 1 with `Budget Broker: AUDIT_UNAVAILABLE` (`--json`: `{error:{code:"AUDIT_UNAVAILABLE"}}`). In this offline command that code indicates a local verification input problem, not a daemon audit-volume failure: check paths, file contents and the independently pinned public key. With parseable files, an invalid audit key instead returns `valid:false` JSON on stdout and exits 1 with empty stderr, even with `--json`. Never replace the trusted key just to pass verification. Missing required verify flags exit 2. `--json` error shape is `{error:{code}}`; daemon failures may add the separate redacted `reason` (see troubleshooting). Wrong UUIDs, expired grant/approve expiry, invalid monetary files, invalid URL and blank reasons are local usage errors. A policy authorization failure is still exit 3, **not** a stale-revision error.
 
 ## Policies and gas
 
@@ -121,6 +121,8 @@ Admission reserves principal + `feeReservePerTx`, including pending approvals. O
 ## Approvals
 
 Strictly above threshold: `pending_approval` with `APPROVAL_REQUIRED`, not necessarily an MCP exception. Use `owner approvals list`, inspect exact request, approve with a short future epoch-ms expiry or reject with a reason. Approval binds digest/current policy revision; `POLICY_CHANGED` requires reread/review. Approval never bypasses freeze/hard caps/stale capacity.
+
+The daemon uses a fixed **300 s (5 minute)** request TTL, `expiresAt = createdAt + 300000`; there is no daemon config override. At the deadline a pending request becomes `expired` when swept or processed by an owner action and releases **both principal and fee holds**. Approval's effective expiry is the earlier of the supplied expiry and the original request deadline; approval cannot extend those five minutes. Rejection/cancellation release unsent holds too; denied admission has no hold. Every persisted request permanently consumes its idempotency key, including terminal unsent `expired`, `rejected`, `cancelled` and `denied` requests. Replaying that key returns the original state, even after `RATE_LIMITED`/`MAX_OUTSTANDING` conditions clear. A new key and new request require explicit owner authorization; agents must never retry after `rejected`.
 
 For standing approval, replace `examples/standing-approval.json`'s sample agent UUID, recipients, perTx/total maxima and illustrative expiry with a short future lifetime. Run `owner standing grant --file FILE`, retain returned ID, inspect with `owner standing list AGENT_ID`, revoke with `owner standing revoke APPROVAL_ID`. Absent recipients means any, empty means none. It bypasses only the approval prompt; reservations consume its total atomically, successful principal finalizes usage. Expiry/revocation before dispatch blocks use; executed payments cannot be undone.
 
