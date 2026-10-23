@@ -1,4 +1,5 @@
 import { expect, test } from 'vitest';
+import { randomUUID } from 'node:crypto';
 import { Fixture, owner } from '../broker/fixtures.js';
 
 // Execute the production defaults behind the documented approval/retry workflow.
@@ -25,7 +26,42 @@ test('pending approvals expire at 300 seconds, release both holds and retain the
   } finally { f.close(); }
 });
 
-test.each([60_000, 600_000])('owner approval expiry %i ms can shorten but never extend the original deadline', async (ttl) => {
+test.each(['queued', 'approved'] as const)('%s work expires at the original 300 s deadline even while globally frozen; unfreeze cannot revive its key', async (state) => {
+  const f = new Fixture({ autoDispatch: false });
+  try {
+    await f.init();
+    const agent = await f.agent(state, { approvalThreshold: state === 'approved' ? 0n : null });
+    const input = f.input(`frozen-${state}`);
+    const admitted = await f.broker.requestTransfer(agent, input);
+    if (state === 'approved') {
+      // Exercise the production approval transition's persisted intermediate
+      // state (before BrokerService moves approved -> queued), as after a crash.
+      f.store.withImmediateTransaction((tx) => f.options.approvals.approve(tx, {
+        requestId: admitted.id, approvalId: randomUUID(), expiresAt: f.now + 600_000, now: f.now,
+      }));
+    }
+    expect((await f.broker.getRequest(agent, admitted.id)).state).toBe(state);
+    expect(admitted.expiresAt! - admitted.createdAt).toBe(300_000);
+    await f.broker.freeze(owner, { scope: 'global' }, 'pause dispatch');
+    f.now += 299_999;
+    await f.broker.drain();
+    expect((await f.broker.getRequest(agent, admitted.id)).state).toBe(state);
+    expect(f.store.read((r) => r.getHold(admitted.id))).toMatchObject({ principal: input.amount, feeReserve: 10n, status: 'active' });
+    f.now++;
+    await f.broker.drain();
+    const expired = await f.broker.getRequest(agent, admitted.id);
+    expect(expired.state).toBe('expired');
+    expect(f.store.read((r) => r.getHold(admitted.id)?.status)).toBe('released');
+    expect(await f.broker.requestTransfer(agent, input)).toEqual(expired);
+    await f.broker.unfreeze(owner, { scope: 'global' }, 'resume after review');
+    await f.broker.drain();
+    expect(await f.broker.requestTransfer(agent, input)).toEqual(expired);
+    expect(f.chain.built).toHaveLength(0);
+    expect(f.chain.broadcasts).toHaveLength(0);
+  } finally { f.close(); }
+});
+
+test.each([60_000, 600_000])('owner approval expiry %i ms is capped at the unchanged original request deadline', async (ttl) => {
   const f = new Fixture({ autoDispatch: false });
   try {
     await f.init();
@@ -33,6 +69,7 @@ test.each([60_000, 600_000])('owner approval expiry %i ms can shorten but never 
     const pending = await f.broker.requestTransfer(agent, f.input('approval-deadline'));
     const approved = await f.broker.approve(owner, pending.id, f.now + ttl);
     expect(approved.state).toBe('queued');
+    expect(approved.expiresAt).toBe(pending.expiresAt);
     expect(f.store.read((r) => r.getRequestApproval(pending.id)?.expiresAt)).toBe(pending.createdAt + Math.min(ttl, 300_000));
   } finally { f.close(); }
 });
