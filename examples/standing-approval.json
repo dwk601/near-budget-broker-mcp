@@ -1,0 +1,7 @@
+{
+  "agentId": "REPLACE_AGENT_ID",
+  "recipients": ["replace-receiver.testnet"],
+  "perTxMax": "0.01",
+  "totalMax": "0.03",
+  "expiresAt": 2000000000000
+}

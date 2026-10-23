@@ -1,0 +1,15 @@
+{
+  "network": "testnet",
+  "rpcUrl": "https://test.rpc.fastnear.com",
+  "accountId": "replace-custody.testnet",
+  "bindHost": "0.0.0.0",
+  "agentPort": 3210,
+  "adminPort": 3211,
+  "allowedHosts": ["127.0.0.1", "localhost"],
+  "allowedOrigins": [],
+  "dataDir": "/var/lib/budget-broker",
+  "auditKeyPath": "/var/lib/budget-broker/audit.pem",
+  "ownerPublicKey": "ed25519:REPLACE_WITH_OWNER_PUBLIC_KEY",
+  "feeReservePerTx": "1000000000000000000000",
+  "safetyReserve": "10000000000000000000000"
+}

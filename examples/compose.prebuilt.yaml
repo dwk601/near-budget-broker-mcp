@@ -1,0 +1,7 @@
+# Compose >=2.24.4; merge AFTER docker/docker-compose.yml.
+# Operator supplies an independently built/trusted image; the npm tarball has no src.
+# May be combined with compose.fixture.yaml. Do not change loopback publications.
+services:
+  daemon:
+    build: !reset null
+    image: ${BB_DAEMON_IMAGE:?set trusted budget-broker image tag or digest}

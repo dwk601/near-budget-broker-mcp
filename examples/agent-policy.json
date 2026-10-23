@@ -1,0 +1,12 @@
+{
+  "agentId": "REPLACE_AGENT_ID",
+  "revision": 1,
+  "perTxMax": "0.01",
+  "rolling24hMax": "0.05",
+  "lifetimeMax": "0.1",
+  "gasBudget24h": "0.01",
+  "ratePerMinute": 5,
+  "maxOutstanding": 2,
+  "recipients": { "mode": "allowlist", "accounts": ["replace-receiver.testnet"] },
+  "approvalThreshold": "0.005"
+}

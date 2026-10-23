@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "budget-broker": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["--yes", "--package", "/abs/path/near-budget-broker-mcp-0.1.0.tgz", "budget-broker", "mcp"],
+      "env": { "BB_URL": "http://127.0.0.1:3210", "BB_TOKEN_FILE": "/agent/private/token" }
+    }
+  }
+}
