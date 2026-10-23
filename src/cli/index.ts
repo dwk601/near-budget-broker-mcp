@@ -13,17 +13,51 @@ import { DaemonFailure } from '../daemon/diagnostics.js';
 
 class UsageError extends Error {}
 function usage(): never { throw new UsageError(); }
+const OWNER_FORMS: Record<string, readonly [number, number]> = {
+  'init-owner-key': [2, 2], status: [2, 2], 'audit-key': [2, 2], reconcile: [2, 3], 'resolve-attempt': [4, 4],
+  'agent create': [4, 4], 'agent list': [3, 3], 'agent revoke': [5, 5],
+  'token issue': [4, 4], 'token rotate': [4, 4], 'token revoke': [4, 4],
+  'policy set': [3, 3], 'policy get': [4, 4], 'wallet-policy set': [3, 3],
+  'approvals list': [3, 3], 'approvals approve': [5, 5], 'approvals reject': [5, 5],
+  'standing grant': [3, 3], 'standing revoke': [4, 4], 'standing list': [4, 4],
+  'freeze global': [4, 4], 'freeze agent': [5, 5], 'unfreeze global': [4, 4], 'unfreeze agent': [5, 5],
+  'requests list': [3, 4], 'requests get': [4, 4], 'receipts export': [4, 4], 'receipts verify': [3, 3], 'checkpoints list': [4, 4],
+};
+const HELP = `Usage: budget-broker <daemon|mcp|init-custody|owner> [options]
+       budget-broker help [subcommand]
+       budget-broker <subcommand> --help
+
+  daemon --config FILE                  Run the testnet daemon
+  mcp                                   Agent stdio bridge (BB_URL + BB_TOKEN_FILE)
+  init-custody --key-file FILE --master-file FILE --out FILE
+  owner init-owner-key --out FILE        Create an encrypted owner key
+  owner agent create|list|revoke
+  owner token issue|rotate|revoke        --out FILE for issue/rotation
+  owner policy set|get                  --file FILE for set (human NEAR amounts)
+  owner wallet-policy set --file FILE
+  owner approvals list|approve|reject
+  owner standing grant|revoke|list
+  owner freeze|unfreeze global|agent
+  owner status|audit-key|reconcile|resolve-attempt
+  owner requests list|get
+  owner receipts export|verify
+  owner checkpoints list
+
+Owner options: --key FILE --url URL --json; list paging: --limit N --after ID.
+See docker/README.md for command arguments, secret provisioning and isolation.
+`;
 export interface CliOptions { env?: NodeJS.ProcessEnv; stdout?: (text: string) => void; stderr?: (text: string) => void }
 /** Returns an exit code. Only main owns process exit; injectable output keeps tests quiet. */
 export async function runCli(argv: string[], options: CliOptions = {}): Promise<number> {
   const env = options.env ?? process.env;
   const out = options.stdout ?? ((text: string) => process.stdout.write(text));
   const err = options.stderr ?? ((text: string) => process.stderr.write(text));
-  const args: string[] = []; const flags = new Map<string, string>(); let asJson = false;
+  const args: string[] = []; const flags = new Map<string, string>(); let asJson = false; let wantsHelp = false;
   try {
     for (let i = 0; i < argv.length; i++) {
       const arg = argv[i]!;
-      if (arg === '--json') asJson = true;
+      if (arg === '--help') wantsHelp = true;
+      else if (arg === '--json') asJson = true;
       else if (arg === '--force') flags.set('force', 'true');
       else if (arg.startsWith('--')) {
         if (!['key', 'url', 'file', 'out', 'config', 'master-file', 'key-file', 'audit-key', 'checkpoint', 'after', 'limit'].includes(arg.slice(2)) || argv[i + 1] === undefined || argv[i + 1]!.startsWith('--') || flags.has(arg.slice(2))) usage();
@@ -33,6 +67,17 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
     const required = (name: string) => flags.get(name) ?? usage();
     const print = (value: unknown) => out(`${json(value)}\n`);
     const [command, group, action, ...rest] = args;
+    if (wantsHelp || command === 'help') {
+      const path = command === 'help' ? args.slice(1) : args;
+      const name = path.join(' ');
+      const ownerPath = name.startsWith('owner ') ? name.slice(6) : undefined;
+      const known = name === '' || ['daemon', 'mcp', 'init-custody', 'owner'].includes(name)
+        || (ownerPath !== undefined && (Object.hasOwn(OWNER_FORMS, ownerPath) || Object.keys(OWNER_FORMS).some((form) => form.startsWith(`${ownerPath} `))));
+      if (!known) usage();
+      // Never contaminate MCP stdout, even when no bridge was started.
+      (path[0] === 'mcp' ? err : out)(HELP);
+      return 0;
+    }
     if (command === 'daemon') {
       if (args.length !== 1) usage();
       const { loadConfig, runDaemon } = await import('../daemon/index.js');
@@ -64,17 +109,7 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
       asJson ? print({ path: resolve(required('out')) }) : out(`${resolve(required('out'))}\n`); return 0;
     }
     if (command !== 'owner') usage();
-    const forms: Record<string, readonly [number, number]> = {
-      'init-owner-key': [2, 2], status: [2, 2], 'audit-key': [2, 2], reconcile: [2, 3], 'resolve-attempt': [4, 4],
-      'agent create': [4, 4], 'agent list': [3, 3], 'agent revoke': [5, 5],
-      'token issue': [4, 4], 'token rotate': [4, 4], 'token revoke': [4, 4],
-      'policy set': [3, 3], 'policy get': [4, 4], 'wallet-policy set': [3, 3],
-      'approvals list': [3, 3], 'approvals approve': [5, 5], 'approvals reject': [5, 5],
-      'standing grant': [3, 3], 'standing revoke': [4, 4], 'standing list': [4, 4],
-      'freeze global': [4, 4], 'freeze agent': [5, 5], 'unfreeze global': [4, 4], 'unfreeze agent': [5, 5],
-      'requests list': [3, 4], 'requests get': [4, 4], 'receipts export': [4, 4], 'receipts verify': [3, 3], 'checkpoints list': [4, 4],
-    };
-    const form = forms[group ?? ''] ?? forms[`${group} ${action}`];
+    const form = OWNER_FORMS[group ?? ''] ?? OWNER_FORMS[`${group} ${action}`];
     if (!form || args.length < form[0] || args.length > form[1] || (flags.has('force') && group !== 'resolve-attempt')) usage();
     if (group === 'init-owner-key') {
       if (args.length !== 2) usage();
