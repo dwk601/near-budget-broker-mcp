@@ -9,7 +9,7 @@ import { Fixture, hash, owner } from './fixtures.js';
 let f: Fixture; let custody: EncryptedFileCustody;
 afterEach(async () => { await custody?.lock(); f?.close(); });
 
-it.each(['Expired', 'InvalidNonce', 'transient-attestation', 'GC', 'persistent-lag', 'late-visible', 'late-during-sign'] as const)(
+it.each(['Expired', 'InvalidNonce', 'NotEnoughBalance', 'dropped-504', 'transient-attestation', 'GC', 'persistent-lag', 'late-visible', 'late-during-sign'] as const)(
   'real NativeNearChain + encrypted custody signer: %s recovers and unblocks another agent', async (mode) => {
     f = new Fixture({ autoDispatch: false });
     custody = new EncryptedFileCustody(); const master = Buffer.alloc(32, 42); const pair = KeyPair.fromRandom('ed25519');
@@ -43,11 +43,13 @@ it.each(['Expired', 'InvalidNonce', 'transient-attestation', 'GC', 'persistent-l
         const txHash = baseEncode(createHash('sha256').update(tx.encode()).digest());
         expect(tx.actions).toHaveLength(1); expect(tx.actions[0]?.transfer?.deposit).toBe(parseNear('0.001'));
         expect(tx.publicKey.toString()).toBe(signer.publicKey); expect(tx.signerId).toBe('broker.testnet');
-        if ((mode === 'Expired' || mode === 'InvalidNonce') && !rejected) {
-          rejected = true; finalHash = hash('later'); height = 111n;
+        if ((mode === 'Expired' || mode === 'InvalidNonce' || mode === 'NotEnoughBalance' || mode === 'dropped-504') && !rejected) {
+          rejected = true; finalHash = hash('later'); height = 1110n;
+          if (mode === 'dropped-504') return new Response('not forwarded to chain', { status: 504 });
           if (mode === 'InvalidNonce') nonce = 5n;
           return Response.json({ jsonrpc: '2.0', id: r.id, error: { data: { TxExecutionError: { InvalidTxError:
-            mode === 'Expired' ? 'Expired' : { InvalidNonce: { tx_nonce: tx.nonce.toString(), ak_nonce: nonce.toString() } } } } } });
+            mode === 'Expired' ? 'Expired' : mode === 'NotEnoughBalance' ? { NotEnoughBalance: { balance: '0' } }
+              : { InvalidNonce: { tx_nonce: tx.nonce.toString(), ak_nonce: nonce.toString() } } } } } });
         }
         if (!paid.has(txHash)) {
           expect(tx.nonce).toBeGreaterThan(nonce); nonce = tx.nonce;
@@ -67,7 +69,7 @@ it.each(['Expired', 'InvalidNonce', 'transient-attestation', 'GC', 'persistent-l
       } else throw new Error('unexpected RPC');
       return Response.json({ jsonrpc: '2.0', id: r.id, result });
     };
-    const chain = await NativeNearChain.connect({ accountId: 'broker.testnet', rpcUrl: 'http://offline.invalid', fetch: fetcher, clock: f.clock });
+    const chain = await NativeNearChain.connect({ accountId: 'broker.testnet', rpcUrl: 'http://offline.invalid', fetch: fetcher, clock: f.clock, sleep: async (ms) => { f.now += ms; } });
     f.options = { ...f.options, chain, signer };
     if (mode === 'transient-attestation') f.options.hooks = { afterPersistSigned: async () => { statusCountdown = 1; } };
     f.broker = new BrokerService(f.options);
@@ -76,7 +78,7 @@ it.each(['Expired', 'InvalidNonce', 'transient-attestation', 'GC', 'persistent-l
     expect((await f.broker.getRequest(a, first.id)).state).toBe('outcome_unknown');
     const original = f.store.read((r) => r.listAttempts(first.id)[0]!);
     if (mode === 'transient-attestation') expect(sends).toHaveLength(0);
-    f.now += 60_000; // allow final RPC visibility to converge since the last offer
+    f.now += 120_000; // signing age >= validity time; final head includes the 1000-block margin
     if (mode === 'late-visible' || mode === 'late-during-sign') {
       // Fault-inject a persisted proof from the old unsafe adapter. The new
       // adapter never generates this proof for accepted/ambiguous bytes.
@@ -111,7 +113,7 @@ it.each(['Expired', 'InvalidNonce', 'transient-attestation', 'GC', 'persistent-l
     const restart = f.another({ hooks: {} }); await restart.start();
     expect(paid.size).toBe(2); expect((await restart.getRequest(a, first.id)).state).toBe('succeeded');
     const attempts = f.store.read((r) => r.listAttempts(first.id));
-    expect(attempts).toHaveLength(mode === 'Expired' || mode === 'InvalidNonce' ? 2 : 1);
+    expect(attempts).toHaveLength(mode === 'Expired' || mode === 'InvalidNonce' || mode === 'NotEnoughBalance' || mode === 'dropped-504' ? 2 : 1);
     if (mode === 'transient-attestation') expect(sends[0]).toBe(original.signedTxBase64);
     expect((await restart.budgetStatus(a)).usage.agentGas24h).toBe(7n);
     expect(requests).toContain('tx');

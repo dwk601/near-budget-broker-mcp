@@ -80,8 +80,10 @@ mutations.push(['N15-stale-abandon', () => scope('  private async recover(', '  
   "(reasons.length === 1 && reasons.includes('WALLET_CAPACITY') && this.o.store.read((r) => this.stale(r)))", 'false'))]);
 mutations.push(['N17-drain-pump', () => scope('  private async run(', '  private authorizeQueued(', (s) => replace(s, 'this.pump.run(', 'Promise.resolve().then('))]);
 add('N29-reconcile-id', 'if (requestId !== undefined && existing.request.id !== requestId) break;', '/* mutant: ignore ID */');
-add('N29-watch-id', '.filter((request) => requestId === undefined || request.id === requestId)', '.filter(() => true)');
-add('N2-final-recheck', 'const current = await this.status(prior);', "const current: ChainOutcome = { kind: 'not_executed', evidence: 'cached proof', invalidNonce: true };");
+mutations.push(['N29-watch-id', () => scope('  private async watchResolved(', '  private correctLateExecution(', (s) => replace(replace(s,
+  'const ids = requestId === undefined ? [...this.watchIndex.keys()] : [requestId];', 'const ids = [...this.watchIndex.keys()];'),
+  '.filter((request) => requestId === undefined || request.id === requestId)', '.filter(() => true)'))]);
+add('N2-final-recheck', 'let current = await this.status(prior);', "let current: ChainOutcome = { kind: 'not_executed', evidence: 'cached proof', invalidNonce: true };");
 add('N3-explicit-force-required', "if (outcome.kind !== 'not_executed' && !force) throw new BrokerError('FORBIDDEN');", "if (outcome.kind !== 'not_executed') force = true;");
 add('N3-retain-forced-hold', "force, outcome.kind !== 'not_executed'", 'force, false');
 add('N3-watch-resolution', 'new Set<string>(await this.watchResolved(requestId))', 'new Set<string>()');
@@ -95,16 +97,38 @@ function other(id: string, path: string, mutate: (text: string) => string) {
 other('N1-history-retained', 'src/near/native.ts', (s) => replace(s,
   "const anchor = record(record(await this.#rpc.call('block', { block_id: t.blockHash }))['header']);",
   "const anchor = { hash: t.blockHash, height: '0' } as Record<string, unknown>;"));
-other('N1-prolonged-lag', 'src/near/native.ts', (s) => replace(s,
-  "if (attempt.offerCount !== 1 || (attempt.firstRejection !== 'INVALID_NONCE'\n        && attempt.firstRejection !== 'EXPIRED_BLOCK_HASH')) return unknownOutcome();",
-  '/* mutant: negative lookup lag accepted as proof for accepted bytes */'));
+other('N1-prolonged-lag', 'src/near/native.ts', (s) => replace(s, 'if (nonceProof) {', 'if (true) {'));
 other('N1-minimum-age', 'src/near/native.ts', (s) => replace(s, 'now - offered < NON_EXECUTION_MIN_AGE_MS', 'false'));
 other('N4-negative-cache', 'src/broker/balance.ts', (s) => replace(s,
   'if (state.failedAt !== undefined && now >= state.failedAt && now - state.failedAt < BALANCE_FAILURE_BACKOFF_MS)', 'if (false)'));
 other('N8-preview-cache', 'src/broker/balance.ts', (s) => replace(s,
   'if (state.cached && state.cached.observedAt <= now && now - state.cached.observedAt <= maxAge)', 'if (false)'));
 
-const run = () => spawnSync(process.execPath, [resolve('node_modules/vitest/vitest.mjs'), 'run', 'test/broker/review.test.ts', 'test/broker/safety.test.ts', 'test/near/non-execution.test.ts'],
+// Follow-up Q11/Q02/Q36/Q19/Q39/Q43 and bounded-watch/expiry regressions.
+mutations.push(['Q11-force-visible-success', () => scope('  async resolveAttempt(', '  async drain(', (s) => replace(s,
+  "if (outcome.kind === 'succeeded' || outcome.kind === 'failed' || outcome.kind === 'pending')",
+  "if (!force && (outcome.kind === 'succeeded' || outcome.kind === 'failed' || outcome.kind === 'pending'))"))]);
+add('Q02-replay-rejection', 'ready.offerCount === 1', 'ready.offerCount >= 1');
+other('Q36-erase-provenance', 'src/storage/sqlite-store.ts', (s) => replace(s,
+  'requireThat(old.firstRejection === undefined || old.firstRejection === attempt.firstRejection);', '/* mutant: provenance erased */'));
+mutations.push(['Q19-late-cache-invalidation', () => scope('  private correctLateExecution(', '  private async observe(', (s) => replace(s,
+  'invalidateBalance(this.balance);', '/* mutant: stale pre-payment cache retained */'))]);
+other('Q39-superseded-correction', 'src/storage/sqlite-store.ts', (s) => replace(s, 'old.txHash === prior.txHash && ', ''));
+other('Q43-request-amount', 'src/storage/sqlite-store.ts', (s) => replace(s,
+  "const immutableRequest = ['id', 'agentId', 'idempotencyKey', 'requestDigest', 'receiverId', 'amount', 'memo', 'createdAt',",
+  "const immutableRequest = ['id', 'agentId', 'idempotencyKey', 'requestDigest', 'receiverId', 'memo', 'createdAt',"));
+add('L1-failed-table-scan', 'const ids = requestId === undefined ? [...this.watchIndex.keys()] : [requestId];',
+  "const ids = requestId === undefined ? pages((q) => r.listRequests({ states: ['failed'] }, q)).map((r) => r.id) : [requestId];");
+add('L1-watch-horizon', 'if (requestId === undefined && this.o.clock.now() - base > RESOLUTION_WATCH_HORIZON_MS)', 'if (false)');
+mutations.push(['L2-record-before-attestation', () => scope('  private async send(', '  private withOffer(', (s) => replace(replace(s,
+  'await this.attest();', '/* mutant: pre-offer check moved after intent */'), 'let result;', 'await this.attest(); let result;'))]);
+add('L3-never-offered-hold', 'if (force && this.o.store.read((r) => this.neverOffered(r, attempt)))', 'if (false)');
+other('M1-expiry-for-any-offer', 'src/near/native.ts', (s) => replace(s, 'if (evidence === null) {', 'if (!nonceProof) return unknownOutcome(); if (evidence === null) {'));
+other('M1-safety-margin', 'src/near/proof-policy.ts', (s) => replace(s, 'EXPIRY_SAFETY_BLOCKS = 1_000n', 'EXPIRY_SAFETY_BLOCKS = 0n'));
+other('M1-lookup-spacing', 'src/near/proof-policy.ts', (s) => replace(s, 'EXPIRY_LOOKUP_SPACING_MS = 1_000', 'EXPIRY_LOOKUP_SPACING_MS = 0'));
+other('M1-validity-age', 'src/near/native.ts', (s) => replace(s, 'BigInt(signingAge) < validity * VALIDITY_BLOCK_MS', 'false'));
+
+const run = () => spawnSync(process.execPath, [resolve('node_modules/vitest/vitest.mjs'), 'run', 'test/broker/review.test.ts', 'test/broker/safety.test.ts', 'test/broker/followup.test.ts', 'test/near/non-execution.test.ts'],
   { cwd: root, encoding: 'utf8', timeout: 30000 });
 let killed = 0;
 try {

@@ -14,6 +14,7 @@ import type {
 } from '../contracts/index.js';
 import { record, RpcClient, RpcFailure, unsigned } from './rpc.js';
 import type { RpcFetch } from './rpc.js';
+import { EXPIRY_SAFETY_BLOCKS, VALIDITY_BLOCK_MS, EXPIRY_LOOKUP_SPACING_MS } from './proof-policy.js';
 
 const U64_MAX = (1n << 64n) - 1n;
 const digest = (bytes: Uint8Array): Buffer => createHash('sha256').update(bytes).digest();
@@ -65,6 +66,8 @@ export interface NativeNearChainOptions {
   clock?: Clock;
   fetch?: RpcFetch;
   timeoutMs?: number;
+  /** Test seam paired with Clock; production waits real elapsed time. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /** Native-only testnet adapter. Use connect() so startup cannot skip attestation.
@@ -73,11 +76,13 @@ export class NativeNearChain implements NearChain {
   readonly #rpc: RpcClient;
   readonly #accountId: string;
   readonly #clock: Clock;
+  readonly #sleep: (ms: number) => Promise<void>;
   private constructor(options: NativeNearChainOptions) {
     try { ConfigSchema.shape.rpcUrl.parse(options.rpcUrl); }
     catch { throw new BrokerError('MAINNET_REFUSED'); }
     this.#accountId = AccountIdSchema.parse(options.accountId);
     this.#clock = options.clock ?? { now: () => Date.now() };
+    this.#sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     const timeout = options.timeoutMs ?? 10_000;
     if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 120_000) throw new BrokerError('FORBIDDEN');
     this.#rpc = new RpcClient(options.rpcUrl, options.fetch ?? fetch, timeout);
@@ -180,11 +185,11 @@ export class NativeNearChain implements NearChain {
       const result = await this.#rpc.call('tx', { tx_hash: txHash, sender_account_id: signerId, wait_until: 'FINAL' });
       return this.observedOutcome(record(result), txHash, signerId);
     } catch (error) {
-      if (attempt && unknownTransaction(error)) return this.proveNotExecuted(txHash, signerId, attempt);
+      if (attempt && unknownTransaction(error)) return this.proveNotExecuted(txHash, signerId, attempt, this.#clock.now());
       return unknownOutcome();
     }
   }
-  private async proveNotExecuted(txHash: string, signerId: string, attempt: TxAttempt): Promise<ChainOutcome> {
+  private async proveNotExecuted(txHash: string, signerId: string, attempt: TxAttempt, negativeAt: number): Promise<ChainOutcome> {
     try {
       await this.verifyNetwork();
       // Never accept caller metadata alone as evidence. Decode and verify the
@@ -196,13 +201,11 @@ export class NativeNearChain implements NearChain {
         || t.blockHash !== attempt.blockHash) return unknownOutcome();
       // Never infer non-execution from a fresh offer or missing legacy offer
       // metadata. RPC pools/indexers may lag inclusion by multiple final blocks.
-      // Even retained history plus a delay cannot turn an indexer/pool's
-      // prolonged negative lookup lag into an absence proof for an accepted
-      // transaction. Only a definitive rejection of our sole FIRST offer can
-      // establish never-accepted bytes. Ambiguous/accepted/replayed work cannot
-      // auto-replace from UNKNOWN_TRANSACTION alone, however old it becomes.
-      if (attempt.offerCount !== 1 || (attempt.firstRejection !== 'INVALID_NONCE'
-        && attempt.firstRejection !== 'EXPIRED_BLOCK_HASH')) return unknownOutcome();
+      // A consumed nonce alone cannot disambiguate an accepted transaction.
+      // Keep first-offer rejection provenance for the NONCE path. Independently,
+      // an aged expiry proof may cover any offer count, including a lost 504.
+      const nonceProof = attempt.offerCount === 1 && (attempt.firstRejection === 'INVALID_NONCE'
+        || attempt.firstRejection === 'EXPIRED_BLOCK_HASH');
       const offered = attempt.lastOfferedAt;
       const now = this.#clock.now();
       if (offered === undefined || offered === null || !Number.isSafeInteger(offered)
@@ -216,20 +219,35 @@ export class NativeNearChain implements NearChain {
       const headHash = ChainHashSchema.parse(head['hash']); blockHash(headHash);
       const headHeight = unsigned(head['height'], U64_MAX);
       if (headHeight < height) return unknownOutcome();
-      const key = record(await this.#rpc.call('query', { request_type: 'view_access_key', account_id: signerId,
-        public_key: t.publicKey, block_id: headHash }));
-      if (key['block_hash'] !== headHash) return unknownOutcome();
-      const nonce = unsigned(key['nonce'], U64_MAX);
-      let evidence: string;
+      let evidence: string | null = null;
       let invalidNonce = false;
-      if (nonce >= t.nonce) {
-        invalidNonce = true;
-        evidence = `FIRST_OFFER_REJECTED:${attempt.firstRejection}; UNKNOWN_TRANSACTION; retained anchor ${t.blockHash} height ${height}; final access key ${headHash} nonce ${nonce} >= attempt ${t.nonce}; last offer ${offered}`;
-      } else {
+      if (nonceProof) {
+        try {
+          const key = record(await this.#rpc.call('query', { request_type: 'view_access_key', account_id: signerId,
+            public_key: t.publicKey, block_id: headHash }));
+          if (key['block_hash'] === headHash) {
+            const nonce = unsigned(key['nonce'], U64_MAX);
+            if (nonce >= t.nonce) {
+              invalidNonce = true;
+              evidence = `FIRST_OFFER_REJECTED:${attempt.firstRejection}; UNKNOWN_TRANSACTION; retained anchor ${t.blockHash} height ${height}; final access key ${headHash} nonce ${nonce} >= attempt ${t.nonce}; last offer ${offered}`;
+            }
+          }
+        } catch { /* An expiry proof does not depend on access-key availability. */ }
+      }
+      if (evidence === null) {
         const protocol = record(await this.#rpc.call('EXPERIMENTAL_protocol_config', { block_id: headHash }));
         const validity = unsigned(protocol['transaction_validity_period'], U64_MAX);
-        if (validity === 0n || headHeight <= height + validity) return unknownOutcome();
-        evidence = `FIRST_OFFER_REJECTED:${attempt.firstRejection}; UNKNOWN_TRANSACTION; final head ${headHash} height ${headHeight} > anchor ${t.blockHash} height ${height} + validity ${validity}`;
+        // Signing age, unlike last-offer time, is not reset by identical replay.
+        // Keep the separate 60s last-offer gate above for recent visibility lag.
+        const signingAge = now - attempt.createdAt;
+        if (!Number.isSafeInteger(signingAge) || signingAge < 0 || validity === 0n
+          || BigInt(signingAge) < validity * VALIDITY_BLOCK_MS
+          || headHeight < height + validity + EXPIRY_SAFETY_BLOCKS) return unknownOutcome();
+        const elapsed = this.#clock.now() - negativeAt;
+        if (elapsed < 0) return unknownOutcome();
+        if (elapsed < EXPIRY_LOOKUP_SPACING_MS) await this.#sleep(EXPIRY_LOOKUP_SPACING_MS - elapsed);
+        if (this.#clock.now() - negativeAt < EXPIRY_LOOKUP_SPACING_MS) return unknownOutcome();
+        evidence = `EXPIRY_PROOF; UNKNOWN_TRANSACTION twice spaced >= ${EXPIRY_LOOKUP_SPACING_MS}ms; retained anchor ${t.blockHash} height ${height}; final head ${headHash} height ${headHeight} >= anchor + validity ${validity} + margin ${EXPIRY_SAFETY_BLOCKS}; signing age ${signingAge}ms; last offer ${offered}`;
       }
       // A second negative lookup AFTER the final nonce/expiry observation closes
       // the observation race. Timeout, malformed result, or any other error is

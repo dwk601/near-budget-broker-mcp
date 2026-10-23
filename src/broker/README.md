@@ -28,28 +28,33 @@ failure pauses admitted work (including never-offered work), never abandons it.
 ## Proof and replay
 
 Only persisted bytes are offered. Every offer first durably updates
-`lastOfferedAt` and increments `offerCount`; byte-identical retries reuse the first signed intent receipt.
+`lastOfferedAt` and increments `offerCount`; byte-identical retries reuse the first
+signed intent receipt. Broker attestation runs BEFORE intent recording. A transient
+failure at that pre-offer boundary retries promptly using the same stored bytes;
+it does not record an offer or impose a 60-second replay delay.
 New attempts explicitly store null before intent, avoiding receipt-chain scans.
 Legacy rows recover intent/offer time once per changed chain head. An early send
 return leaves signed/never-offered state, not a false outcome_unknown receipt.
 
-Status is checked every drain; identical-byte retries and exclusion proofs wait
-at least 60,000 ms since the latest offer. This gives final visibility time to
-converge and avoids retries forever resetting the proof clock. A new signature
-requires fresh negative lookups, a retrievable signed anchor block/history on
-**both** nonce and expiry paths, a pinned final consumed nonce or expired validity,
-and a second definitive UNKNOWN_TRANSACTION after that final observation. A
-GC/history error, recent/missing offer time, lagging head, timeout or malformed
-response never proves exclusion. **These gates alone are not enough for prolonged
-lookup lag.** The native adapter also requires the sole first offer (offerCount=1)
-to have a durably recorded definitive InvalidNonce/Expired validation rejection.
-Ambiguous, accepted or replayed bytes can NEVER automatically re-sign on negative
-lookups alone, even if their nonce was consumed and their anchor is retained.
-Missing legacy counters do not establish this provenance. Known rejected bytes
-wait for proof rather than destroy first-offer evidence with unnecessary retries.
-These observations trust the node's definitive validation response, not an
-indexer's cryptographically unproven absence claim. Indefinite uncertainty can
-retain budget indefinitely; safety takes precedence over freeing capacity.
+Status is checked every drain. After an offer, identical-byte retries/exclusion
+wait at least 60,000 ms. Both proof paths bind signed identity and require a
+retrievable anchor/history; missing/GC history never proves absence.
+
+* NONCE proof still requires sole-first-offer InvalidNonce/Expired rejection
+  provenance plus a pinned FINAL consumed nonce. Rejected replays do not acquire
+  first-rejection provenance, and that stored provenance cannot be erased.
+* EXPIRY proof applies to any offer count, including ambiguous 504/timeouts and
+  other definitive first-offer InvalidTxError kinds (e.g. NotEnoughBalance). Require
+  FINAL head >= anchor height + protocol validity + 1,000 safety blocks, signing
+  age >= validity * 1,000 ms (nominal one-second testnet block), and two definitive
+  UNKNOWN_TRANSACTION lookups spaced >=1,000 ms. Keep the 60s last-offer age too.
+  Signing age is immutable and is not reset by replay. Positive visibility,
+  missing anchor, RPC failure, insufficient margin/age/spacing vetoes proof.
+
+Expiry observations trust complete, consistent retained FINAL history from the
+configured RPC, not a cryptographic absence proof from arbitrary indexer silence.
+This bounded expiry path prevents a dropped first offer from locking funds forever.
+Known rejected bytes wait for proof rather than destroying their provenance.
 
 Persisted proof is not permanent authority: recheck on recovery, then again after
 async signing immediately before replacement persistence. That fresh evidence is
@@ -74,10 +79,17 @@ Explicit `force=true` may retire an uncertain lane item, but **retains the entir
 principal+fee hold** until fresh exclusion or final execution. It cannot free the
 same budget for another payment. Both chains receive failed-resolution receipts
 with force/holdRetained flags, basis and required reason. Audit failure rolls back
-the operation. Force never creates a replacement.
+the operation. Force never creates a replacement. Exception: a forced NEVER-OFFERED
+attempt uses broker abandonment, releases its hold, and creates no watch. Visible
+success/failure/pending always vetoes even that force path.
 
-Resolved offered attempts are durably watched through their validity window AND
-beyond for late historical visibility; watches never broadcast. Actual late
+Resolved offered attempts are automatically watched for 60 hours from signing or
+the latest offer, covering nominal testnet validity + margin up to the approximate
+five-epoch GC horizon. A receipt-tail index (replayed once on restart, then consumed
+incrementally) avoids scanning all failed requests every drain. Automatic watches
+stop at the horizon; uncertain holds are NOT released just because time elapsed.
+Explicit reconcile(id) remains available beyond the horizon, e.g. with an archival
+RPC. Watches never broadcast. Actual late
 success/failure corrects the resolved request/attempt/hold through the narrow
 `Store.correctResolvedExecution` seam, charges actual principal/tokensBurnt once,
 appends signed lateResolution receipts to both chains, and globally freezes for
@@ -114,10 +126,14 @@ F1–F12 tests remain. `safety.test.ts` covers N1–N10, stale/offline pause, co
 force budgets, restart/legacy/late accounting and all new concurrency survivors.
 Real NativeNearChain plus encrypted custody/fake RPC tests cover GC, lag and
 execution becoming visible during replacement signing, besides Expired,
-InvalidNonce and transient pre-send failures. Storage tests pin correction guards.
+InvalidNonce, dropped 504, other InvalidTxError and transient pre-send failures.
+`followup.test.ts` covers Q11/Q02/Q36/Q19/Q39/Q43 plus watch indexing/horizon,
+pre-offer retries and forced never-offered release. Storage guard tests use real
+SqliteStore through the existing port; B06F needs no storage/schema amendment.
 
 `npx tsx test/broker/mutations.ts` operates ONLY on an isolated temporary copy of
 source/tests, never worktree src (even if killed). Review IDs lack patch files,
 so mutations are explicitly semantic reconstructions. The runner verifies real
 assertion failures, cleans the temporary copy and checks worktree source bytes.
-MCP/HTTP placeholders remain downstream-owned; B06 does not skip or silence them.
+MCP/HTTP suites are included as integration regressions. B08 deployment/CLI paths
+remain outside B06F's ownership.

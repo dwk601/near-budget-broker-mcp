@@ -641,20 +641,40 @@ offer metadata is recovered from receipts or fails closed. The final observation
 and repeated definitive UNKNOWN_TRANSACTION lookups rely on the configured trusted
 RPC's retained, consistent final history, not arbitrary indexer absence.
 
-Minimum age/retained history are necessary but not sufficient: prolonged negative
-lookup lag can still hide an ACCEPTED transaction. Therefore the native adapter
-additionally requires a durable offerCount=1 and a structured firstRejection
-(INVALID_NONCE or EXPIRED_BLOCK_HASH) from that sole offer. Only those bytes are
-known never to have been accepted under the trusted node validation contract.
-An ambiguous/accepted/replayed offer never gets automatic exclusion or replacement
-from UNKNOWN_TRANSACTION alone, even with a retained anchor and consumed nonce.
-New offer counts are persisted before invocation and cannot decrease; definitive
-first-rejection provenance cannot be erased. Legacy missing counters do not get
-upgraded into first-offer evidence. Known rejected bytes are not pointlessly
-rebroadcast while waiting for the aged final proof. Long-lived uncertainty may
-therefore retain its budget until actual final evidence arrives; owner force can
-retire its lane item but cannot manufacture spendable capacity. This stronger rule
-is intentional: neither a delay nor an indexer's silence is an absence proof.
+### B06F M1/L4: separate nonce and generous-expiry exclusion rules
+
+For the NONCE path, minimum age/retained history alone are insufficient: prolonged
+lookup lag can hide an accepted transaction. A nonce-based exclusion additionally
+requires durable offerCount=1 and definitive firstRejection (INVALID_NONCE or
+EXPIRED_BLOCK_HASH) from that sole offer. Missing legacy counters never establish
+this provenance; rejected rebroadcasts cannot become first rejections. Those
+provenance records remain immutable.
+
+The independent EXPIRY path applies to ANY offerCount and needs no first-rejection
+metadata. It covers an ambiguous first 504 whose bytes never reached the chain,
+replayed bytes, and other definitive first-offer InvalidTxError kinds such as
+NotEnoughBalance (represented by RPC_REJECTED, not forged nonce provenance).
+All of these conditions are required:
+
+* Retrieve and validate the exact signed anchor block from retained history.
+* Pin FINAL head/protocol configuration; require head height >= anchor height +
+  transaction_validity_period + 1,000 safety blocks.
+* Signing age (immutable attempt.createdAt) >= validity period * 1,000 ms, using
+  testnet's nominal one-second validity block as an additional wall-clock gate.
+  Keep the separate minimum 60-second age since lastOfferedAt. Replays cannot
+  reset signing age or extend the signed transaction's block-hash validity.
+* Obtain two definitive UNKNOWN_TRANSACTION lookups spaced at least 1,000 ms,
+  with the second after the retained/final observations. Positive visibility,
+  timeout, malformed data, GC/missing anchor or insufficient spacing vetoes proof.
+
+The 1,000-block margin and spaced negative lookups rely on the configured trusted
+RPC's complete, consistent retained FINAL history; they are not a cryptographic
+absence proof from an arbitrary indexer. Nonce consumption by itself still cannot
+resolve accepted/ambiguous work. Proven expiry can release a hold or authorize a
+replacement only with the existing policy/freeze re-evaluations and fresh exclusion
+recheck immediately before atomic replacement persistence. New offer counts are
+persisted before invocation and cannot decrease. Known first-rejected invalid
+bytes wait for proof rather than being pointlessly rebroadcast.
 
 Persist lastOfferedAt BEFORE every invocation (including byte-identical retries).
 Reuse the first signed submission-intent receipt for those same bytes rather than

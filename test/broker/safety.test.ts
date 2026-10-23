@@ -240,7 +240,7 @@ it('N7 reoffers update a durable last-offer timestamp, reuse one intent and neve
   const { a, request } = await ambiguous(); let scans = 0; const read = f.store.read.bind(f.store);
   const spy = vi.spyOn(f.store, 'read').mockImplementation(<T>(fn: (r: StoreReader) => T): T => read((r) => fn(new Proxy(r, {
     get(target, key) { const value: unknown = Reflect.get(target, key); if (typeof value !== 'function') return value;
-      return (...args: unknown[]) => { if (key === 'listReceipts') scans++; return Reflect.apply(value, target, args) as unknown; }; },
+      return (...args: unknown[]) => { if (key === 'listReceipts' && args[0] !== 'owner') scans++; return Reflect.apply(value, target, args) as unknown; }; },
   }))));
   for (let i = 0; i < 3; i++) { f.now += AGE; await f.broker.reconcile(owner, request.id); }
   spy.mockRestore(); expect(scans).toBe(0); expect(f.chain.broadcasts).toHaveLength(4);

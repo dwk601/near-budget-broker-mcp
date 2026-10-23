@@ -68,6 +68,10 @@ function pages<T>(fetch: (query: PageQuery) => Page<T>): T[] {
   }
 }
 const preSigning = ['pending_approval', 'approved', 'queued'] as const;
+/** Automatic history watches cover testnet's nominal validity window + margin,
+ * up to the approximately five-epoch GC horizon. Explicit reconcile(id) remains
+ * available after this horizon; expiring a watch never frees an uncertain hold. */
+export const RESOLUTION_WATCH_HORIZON_MS = 60 * 60 * 60 * 1_000;
 
 /** Principals are capabilities supplied by B03/transport, NOT JSON authentication.
  * Agent credentials are rechecked on every operation, including idempotent reads.
@@ -79,6 +83,8 @@ export class BrokerService implements BrokerPort {
   private readonly balance: ReturnType<typeof balanceState>;
   private readonly offerCache = new Map<string, { seq: number; at: number | null }>();
   private readonly legacyWatchCache = new Map<string, { seq: number; watch: boolean }>();
+  private watchCursor = 0;
+  private readonly watchIndex = new Map<string, string>();
   private readonly receipts: ReceiptLog;
   private readonly ttl: number;
   constructor(private readonly o: BrokerOptions) {
@@ -478,9 +484,16 @@ export class BrokerService implements BrokerPort {
       const outcome = await this.status(attempt);
       if (outcome.kind === 'succeeded' || outcome.kind === 'failed' || outcome.kind === 'pending') throw new BrokerError('FORBIDDEN');
       if (outcome.kind !== 'not_executed' && !force) throw new BrokerError('FORBIDDEN');
-      return this.lane.run(async () => this.finishAttempt(attempt, 'owner_attested', reason,
-        outcome.kind === 'not_executed' ? outcome.evidence : 'Explicit owner force; execution still possible or chain unavailable',
-        force, outcome.kind !== 'not_executed'));
+      return this.lane.run(async () => {
+        // Force cannot leak a hold when durable intent proves the bytes were
+        // never offered. Positive execution was still vetoed above, even here.
+        if (force && this.o.store.read((r) => this.neverOffered(r, attempt))) {
+          return this.finishAttempt(attempt, 'never_offered', reason, 'Broker evidence: no submission intent or acknowledgment exists', true, false);
+        }
+        return this.finishAttempt(attempt, 'owner_attested', reason,
+          outcome.kind === 'not_executed' ? outcome.evidence : 'Explicit owner force; execution still possible or chain unavailable',
+          force, outcome.kind !== 'not_executed');
+      });
     });
   }
   async drain(): Promise<void> {
@@ -580,7 +593,14 @@ export class BrokerService implements BrokerPort {
       // A persisted exclusion observation is NOT an enduring authorization to
       // replace. Re-query AFTER all async build/sign work, immediately before
       // the replacement transaction. Positive visibility corrects the old proof.
-      const current = await this.status(prior);
+      let current = await this.status(prior);
+      if (current.kind === 'not_executed' && this.o.store.read((r) => this.stale(r))) {
+        // Spaced expiry lookups can age a short-lived balance snapshot. Refresh
+        // it, then reverify exclusion again so NO async RPC follows the final
+        // proof before the atomic replacement transaction.
+        await this.refreshLocked();
+        current = await this.status(prior);
+      }
       if (current.kind !== 'not_executed') {
         if (current.kind === 'succeeded' || current.kind === 'failed') this.settle(prior, current);
         else if (current.kind === 'pending') this.o.store.withImmediateTransaction((tx) => {
@@ -662,6 +682,9 @@ export class BrokerService implements BrokerPort {
   }
   /** Caller holds the per-attempt lane, never the whole queue or FINAL polling. */
   private async send(attempt: TxAttempt): Promise<boolean> {
+    // A transient failure here provably precedes intent/offer recording. Recovery
+    // can retry these identical bytes immediately rather than invent ambiguity.
+    await this.attest();
     const ready = this.o.store.withImmediateTransaction((tx) => {
       const request = must(tx.getRequest(attempt.requestId));
       const decision = this.boundDecision(tx, this.evaluation(tx, request, request.id));
@@ -680,8 +703,7 @@ export class BrokerService implements BrokerPort {
       return offered;
     });
     if (!ready) return false;
-    // Network attestation failures before invocation are NOT execution evidence.
-    await this.attest();
+    // Once intent is durable, all unexpected port failures remain ambiguous.
     let result;
     try { result = await this.o.chain.broadcast(attempt.signedTxBase64); }
     catch { result = { kind: 'outcome_unknown' as const, txHash: attempt.txHash }; }
@@ -740,9 +762,9 @@ export class BrokerService implements BrokerPort {
       return next;
     });
   }
-  /** Durable watch list lives in attempt JSON, not a process-local queue. Watch
-   * beyond the validity window too: late historical visibility must be charged.
-   * These checks NEVER broadcast and do not occupy the owner mutation lane. */
+  /** Watch eligibility is durable in attempt JSON and signed owner receipts.
+   * The in-memory index tails that chain incrementally instead of walking every
+   * failed request on every drain. These checks NEVER broadcast. */
   private legacyResolution(r: StoreReader, attempt: TxAttempt): boolean {
     if (attempt.resolutionWatch !== undefined) return attempt.resolutionWatch;
     const chainId = `agent:${must(r.getRequest(attempt.requestId)).agentId}`;
@@ -760,10 +782,39 @@ export class BrokerService implements BrokerPort {
     this.legacyWatchCache.set(attempt.id, { seq, watch });
     return watch;
   }
+  private syncWatchIndex(r: StoreReader): void {
+    for (;;) {
+      const events = r.listReceipts('owner', this.watchCursor, 1000);
+      if (!events.length) return;
+      for (const event of events) {
+        if (event.type === 'failed' && event.payload.resolution) {
+          if (event.payload.resolution.basis === 'never_offered') this.watchIndex.delete(event.payload.requestId);
+          else this.watchIndex.set(event.payload.requestId, event.payload.resolution.attemptId);
+        }
+        if ((event.type === 'succeeded' || event.type === 'failed') && event.payload.lateResolution) {
+          this.watchIndex.delete(event.payload.requestId);
+        }
+        this.watchCursor = event.seq;
+      }
+    }
+  }
   private async watchResolved(requestId?: string): Promise<string[]> {
-    const watches = this.o.store.read((r) => pages((q) => r.listRequests({ states: ['failed'] }, q))
-      .filter((request) => requestId === undefined || request.id === requestId)
-      .flatMap((request) => r.listAttempts(request.id).filter((a) => a.txHash === request.txHash && this.legacyResolution(r, a))));
+    const watches = this.o.store.read((r) => {
+      this.syncWatchIndex(r);
+      const ids = requestId === undefined ? [...this.watchIndex.keys()] : [requestId];
+      return ids.map((id) => r.getRequest(id)).filter((request): request is TransferRequest => request !== null && request.state === 'failed')
+        .filter((request) => requestId === undefined || request.id === requestId)
+        .flatMap((request) => r.listAttempts(request.id).filter((a) => a.txHash === request.txHash && this.legacyResolution(r, a)))
+        .filter((attempt) => {
+          const last = this.withOffer(r, attempt).lastOfferedAt ?? attempt.createdAt;
+          const base = Math.max(attempt.createdAt, last);
+          if (requestId === undefined && this.o.clock.now() - base > RESOLUTION_WATCH_HORIZON_MS) {
+            this.watchIndex.delete(attempt.requestId);
+            return false;
+          }
+          return true;
+        });
+    });
     const touched: string[] = [];
     for (const attempt of watches) {
       if (attempt.resolutionWatch === undefined) {
