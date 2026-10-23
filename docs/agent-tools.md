@@ -1,12 +1,12 @@
 # Agent MCP reference
 
-Exactly eight tools. Identity comes from the bearer token, never an `agentId` argument. Inputs are strict JSON objects: extra fields are rejected. No owner tools, keys, direct signing, arbitrary actions, FT or contract calls. Native NEAR testnet only.
+The broker exposes exactly eight tools. The bearer token identifies the agent, and no tool takes an `agentId` argument. Inputs are strict JSON objects, and the broker rejects extra fields. Agents get no owner tools, no keys, no direct signing, no arbitrary actions, and no fungible token or contract calls. Only native NEAR on testnet is supported.
 
-Success is an MCP `content` array containing a text item whose `text` is canonical JSON of the result below; parse that JSON, not a prose summary. Domain bigints serialize as decimal strings. Errors set `isError:true`, text JSON `{"code":"CODE","message":"CODE"}`, and `structuredContent:{"error":{"code":"CODE","message":"CODE"}}`. Tool discovery/transport failures may instead be protocol or HTTP errors. A **policy denial or pending approval can be a successful tool response containing a decision/request with reasons**, not `isError`.
+A successful call returns an MCP `content` array with one text item. Its `text` is canonical JSON of the result described below. Parse that JSON rather than any prose. Bigint values serialize as decimal strings. On error the result sets `isError:true`, the text is JSON `{"code":"CODE","message":"CODE"}`, and `structuredContent` is `{"error":{"code":"CODE","message":"CODE"}}`. Failures during tool discovery or in the transport may instead arrive as protocol or HTTP errors. A policy denial or a pending approval can be a successful tool response that contains a decision or request with reasons, not an `isError` result.
 
 ## Shared transfer input
 
-Both preview and request require:
+`preview_transfer` and `request_transfer` both take:
 
 ```json
 {
@@ -17,61 +17,96 @@ Both preview and request require:
 }
 ```
 
-`amount` is positive **integer yoctoNEAR text** (example: 0.001 NEAR), never a JSON number or human decimal. Canonical `0|[1-9][0-9]*`, but transfer zero is rejected; max 2^128−1 (39 digits). `idempotencyKey`: 1..256 characters; `memo`: optional, at most 1024 characters, off-chain only. Receiver must be a valid NEAR account ID. Omitted memo normalizes to null in the request digest; empty string differs. Reuse the same key and identical payload after timeout/reconnect; changing payload gives `IDEMPOTENCY_CONFLICT`. A different agent's key namespace is independent. Preview requires a key but neither consumes nor records it. Every persisted request permanently consumes its key, including terminal unsent `denied`, `expired`, `rejected` and `cancelled` requests. Replaying it returns that request, not a new admission attempt, even after rate/capacity recovers. A new key and new request require owner authorization; never retry after `rejected`.
+`amount` is a positive integer number of yoctoNEAR written as a string. The example is 0.001 NEAR. It is never a JSON number or a decimal NEAR value. The canonical form is `0|[1-9][0-9]*`, but a transfer of zero is rejected. The maximum is 2^128−1, which has 39 digits. `idempotencyKey` is 1 to 256 characters. `memo` is optional, at most 1024 characters, and never goes on chain. `receiverId` must be a valid NEAR account ID. An omitted memo becomes null in the request digest, which differs from an empty string.
+
+After a timeout or reconnect, send the same key with the identical payload. A changed payload returns `IDEMPOTENCY_CONFLICT`. Each agent has its own key namespace. A preview needs a key but does not use it up or record it. Every stored request keeps its key forever, including requests that ended without being sent: `denied`, `expired`, `rejected`, and `cancelled`. Replaying the key returns that request and does not try admission again, even after rate limits or capacity recover. A new key and a new request need owner authorization. Never retry after `rejected`.
 
 ## Tools and outputs
 
 | Tool | Input | Result |
 | --- | --- | --- |
-| `budget_status` | `{}` | `{agent,policy,agentFrozen,usage,remaining,at}`; own scope only |
-| `preview_transfer` | Shared transfer input | `{decision,policyRevision,at}`; no hold, request, receipt or idempotency write |
-| `request_transfer` | Shared transfer input | `TransferView`; saves one request and decision, reserves if admitted |
-| `get_request` | `{"requestId":"ID"}` | Own `TransferView`; other-agent/unknown ID gives `NOT_FOUND` |
-| `cancel_request` | `{"requestId":"ID"}` | Own `TransferView` changed to cancelled before signing; signed/ambiguous/terminal work is refused |
-| `list_receipts` | `{"afterSeq":0,"limit":100}` (both optional) | Own `ReceiptEvent[]`, ascending sequence; exclusive `afterSeq`, limit 1..1000 |
-| `verify_receipt` | `{"receipt":FULL_RECEIPT_EVENT}` | `{valid,chainId,checked,firstInvalidSeq,reason}`; scope is own agent chain |
-| `freeze_self` | `{"reason":"nonempty explanation"}` | `{scope:"agent",agentId,frozen:true,reason,at}`; reason 1..1024 characters |
+| `budget_status` | `{}` | `{agent,policy,agentFrozen,usage,remaining,at}` for the calling agent only |
+| `preview_transfer` | Shared transfer input | `{decision,policyRevision,at}`. Creates no hold, request, or receipt, and records no idempotency key |
+| `request_transfer` | Shared transfer input | `TransferView`. Stores one request and its decision, and reserves funds if admitted |
+| `get_request` | `{"requestId":"ID"}` | The agent's own `TransferView`. Another agent's ID or an unknown ID returns `NOT_FOUND` |
+| `cancel_request` | `{"requestId":"ID"}` | The agent's own `TransferView`, now cancelled. Works only before signing. Signed, ambiguous, or finished work is refused |
+| `list_receipts` | `{"afterSeq":0,"limit":100}`, both optional | The agent's own `ReceiptEvent[]` in ascending sequence. `afterSeq` is exclusive. `limit` is 1 to 1000 |
+| `verify_receipt` | `{"receipt":FULL_RECEIPT_EVENT}` | `{valid,chainId,checked,firstInvalidSeq,reason}`. Checks only the agent's own chain |
+| `freeze_self` | `{"reason":"nonempty explanation"}` | `{scope:"agent",agentId,frozen:true,reason,at}`. The reason is 1 to 1024 characters |
 
 ### Budget and decisions
 
-`agent`: `{id,name,status,createdAt}`; status active or revoked (revoked tokens cannot authenticate). Policy includes own agentId/revision, monetary caps, ratePerMinute/maxOutstanding, recipients, approvalThreshold and optional expiresAt. `usage` has `agentRolling24h`, `agentLifetime`, `agentGas24h` (yocto strings), `agentRequestsLastMinute` and `agentOutstanding` (integer counts). `remaining` has `perTx`, `rolling24h`, `lifetime`, `gas24h` (yocto strings), `requestsPerMinute`, `outstandingSlots` (counts). Missing/expired policy or own freeze yields zero remaining. No custody balance, wallet policy, global freeze flag, other-agent usage or standing totals are exposed. Remaining own quota is **not** a capacity/approval promise.
+`agent` is `{id,name,status,createdAt}`, and `status` is `active` or `revoked`. A revoked agent's token cannot authenticate. `policy` holds the agent's own `agentId` and revision, its amount caps, `ratePerMinute`, `maxOutstanding`, recipients, `approvalThreshold`, and an optional `expiresAt`.
 
-Preview decision is `{kind:"allow",reasons:[]}`, `{kind:"deny",reasons:[CODE,...]}`, `{kind:"needs_approval",reasons:["APPROVAL_REQUIRED"]}`, or `{kind:"allow_via_standing_approval",reasons:[],standingApprovalId}`. It is advisory and may change before admission/dispatch. Queued/approved requests cannot adopt a standing grant they were never bound to: they return to `pending_approval` for owner approval. Signed attempts never switch grants either; never-offered or fresh exclusion evidence can resolve the authorization mismatch as failed, but offered ambiguity retains holds pending evidence/owner resolution. Executed standing-capacity overruns remain accounted and trigger grant revocation and the global kill switch; ask the owner to review, never create a replacement payment.
+`usage` has `agentRolling24h`, `agentLifetime`, and `agentGas24h` as yoctoNEAR strings, and `agentRequestsLastMinute` and `agentOutstanding` as integer counts. `remaining` has `perTx`, `rolling24h`, `lifetime`, and `gas24h` as yoctoNEAR strings, and `requestsPerMinute` and `outstandingSlots` as counts. If the policy is missing or expired, or the agent is frozen, every remaining value is zero. The tool does not show the custody balance, the wallet policy, the global freeze flag, other agents' usage, or standing grant totals. Remaining quota does not promise wallet capacity or approval.
+
+A preview decision is one of:
+
+- `{kind:"allow",reasons:[]}`
+- `{kind:"deny",reasons:[CODE,...]}`
+- `{kind:"needs_approval",reasons:["APPROVAL_REQUIRED"]}`
+- `{kind:"allow_via_standing_approval",reasons:[],standingApprovalId}`
+
+A preview is advisory, and the result may change before admission or dispatch.
+
+A queued or approved request cannot start using a standing grant it was never bound to. It returns to `pending_approval` for the owner. Signed attempts never switch grants either. If the attempt was never offered, or fresh evidence shows it did not execute, the broker can mark it failed. If it was offered and the outcome is unclear, the broker keeps its holds until evidence arrives or the owner resolves it. If an executed payment exceeds the remaining standing capacity, the broker still records it, revokes the grant, and sets the global kill switch. Ask the owner to review, and never create a replacement payment.
 
 ### TransferView and lifecycle
 
-Fields: `id,agentId,idempotencyKey,requestDigest,receiverId,amount,memo?`, `state,reasons,policyRevision,approvalRef`, `createdAt,updatedAt,expiresAt,signedAt,submittedAt,completedAt`, `txHash,gasBurnt,tokensBurnt,explorerUrl`. Timestamps are integer epoch **ms**, nullable where not yet known; nullable revision/approvalRef; `approvalRef` is `{kind:"request"|"standing",id}`. Amount/tokensBurnt are yocto strings, gasBurnt is a gas-unit decimal string; null fees mean unknown, not zero. Explorer URL is null with no hash, otherwise `https://testnet.nearblocks.io/txns/` plus hash. A hash/signature/submission is **not final success**.
+A `TransferView` has these fields:
 
-States: `denied`, `pending_approval`, `approved`, `rejected`, `expired`, `cancelled`, `queued`, `signed`, `submitted`, `succeeded`, `failed`, `outcome_unknown`. Pending approval reserves principal+fees; ask the owner to review the existing ID, do not create many new requests. The daemon uses a fixed **300 s (5 minute)** request TTL: `expiresAt = createdAt + 300000`. The deadline covers **`pending_approval`, `queued` and `approved`** before signing. At or after it, pending approval expires when processed by the sweeper or owner action; queued/approved work expires when the dispatch gate next processes it, releasing both principal and fee holds. Freeze does not pause or extend the TTL: queued/approved work can expire while globally frozen. Unfreeze does not revive expired work or its consumed key. This TTL does not release signed/offered uncertainty. Approval cannot extend the original deadline; its effective expiry is the earlier of the owner's supplied expiry and the request deadline. Rejection/cancellation also release unsent holds; a denied admission has no hold. These terminal unsent states do not free their idempotency keys. Approved work is re-evaluated before dispatch. Poll `get_request` with bounded backoff. On uncertain outcomes preserve the key/ID and wait for reconciliation; do not pay again with a fresh key. Failed executed transfers still charge actual gas. Explicit owner force-resolution of **offered uncertain bytes** may mark failed **while retaining the hold**; fresh exclusion can release it. Force on **never-offered signed bytes** instead abandons the request and releases principal+fees without a resolution watch. Positive pending/final execution evidence vetoes either force path. Failed alone is not proof funds were released. Automatic post-resolution watches for offered work stop after more than **60 h from the later of signing and last recorded offer**, without releasing uncertain holds; afterwards the owner must use explicit `owner reconcile REQUEST_ID` to check that request. Late execution found during a watch or explicit reconciliation corrects accounting once on both chains and globally freezes for review.
+- `id`, `agentId`, `idempotencyKey`, `requestDigest`, `receiverId`, `amount`, `memo` (optional)
+- `state`, `reasons`, `policyRevision`, `approvalRef`
+- `createdAt`, `updatedAt`, `expiresAt`, `signedAt`, `submittedAt`, `completedAt`
+- `txHash`, `gasBurnt`, `tokensBurnt`, `explorerUrl`
+
+Timestamps are integer epoch milliseconds and are null until known. `policyRevision` and `approvalRef` can be null. `approvalRef` is `{kind:"request"|"standing",id}`. `amount` and `tokensBurnt` are yoctoNEAR strings, and `gasBurnt` is a decimal string of gas units. A null fee means unknown, not zero. `explorerUrl` is null when there is no hash, and otherwise is `https://testnet.nearblocks.io/txns/` followed by the hash. A hash, a signature, or a submission does not mean the transfer succeeded.
+
+The states are `denied`, `pending_approval`, `approved`, `rejected`, `expired`, `cancelled`, `queued`, `signed`, `submitted`, `succeeded`, `failed`, and `outcome_unknown`.
+
+A pending approval reserves principal and fees. Ask the owner to review the existing request ID, and do not create more requests. The daemon gives every request a fixed time to live of 300 seconds, so `expiresAt = createdAt + 300000`. The deadline applies to `pending_approval`, `queued`, and `approved`, which are the states before signing. Once it passes, a pending request expires the next time the sweeper or an owner action processes it. A queued or approved request expires the next time the dispatch gate processes it. Expiry releases both the principal hold and the fee hold. A freeze does not pause or extend the deadline, so queued or approved work can expire during a global freeze. Unfreezing does not revive expired work or free its key. The deadline never releases signed or offered work with an uncertain outcome. An approval cannot extend the original deadline. It expires at the owner's chosen time or at the request deadline, whichever comes first. Rejection and cancellation also release unsent holds, and a denied request never had a hold. These final states keep their idempotency keys. The broker checks approved work again before dispatch.
+
+Poll `get_request` with bounded backoff. If the outcome is uncertain, keep the key and ID and wait for reconciliation. Do not pay again with a new key. A failed transfer that executed still pays its actual gas.
+
+The owner can force-resolve an attempt in two cases:
+
+- For signed bytes that were offered and have an uncertain outcome, forcing may mark the request failed while the hold stays in place. Fresh evidence that it did not execute can release the hold.
+- For signed bytes that were never offered, forcing abandons the request and releases the principal and fees, with no resolution watch.
+
+Positive evidence that the transfer is pending or executed blocks both. A `failed` state alone does not prove the funds were released.
+
+For offered work, automatic watches after resolution stop once more than 60 hours have passed since signing or the last recorded offer, whichever is later. They do not release uncertain holds when they stop. After that, the owner must run `owner reconcile REQUEST_ID` to check the request. If a watch or an explicit reconcile finds a late execution, the broker corrects accounting once on both chains and sets a global freeze for review.
 
 ### Receipts and freeze
 
-Receipt fields: `{chainId,seq,prevHash,type,at,payload,hash,signature}`. Sequence starts 1, genesis prevHash is 64 zeros. SHA-256 covers canonical preimage fields (excluding hash/signature); audit Ed25519 signature covers decoded hash bytes. Type-specific payloads record decisions, approvals, queue/submission intent/acknowledgment, settlement/actual fees, unknown outcomes, policy/credential/freeze events. No token or key plaintext. `verify_receipt` checks one event against the daemon's audit key; it does **not** independently pin history/completeness. Page until empty or shorter than limit, continuing from last sequence; export/pin/offline verification is an owner operation. Across pages, history can grow.
+A receipt has the fields `{chainId,seq,prevHash,type,at,payload,hash,signature}`. Sequence numbers start at 1, and the genesis `prevHash` is 64 zeros. The SHA-256 hash covers the canonical preimage fields, which exclude `hash` and `signature`. The audit Ed25519 signature covers the decoded hash bytes. Each receipt type has its own payload. Payloads record decisions, approvals, queueing, submission intent and acknowledgment, settlement and actual fees, unknown outcomes, and policy, credential, and freeze events. No receipt contains a token or key in plaintext.
 
-`freeze_self` blocks new own spending and final dispatch; owner alone can unfreeze. Own reads/receipts remain available with a valid token. It cannot undo broadcasts. Never-offered signed work may be permanently abandoned and needs a genuinely new request if later authorized; offered uncertainty retains its hold. Use freeze immediately on suspected misuse, then notify the operator.
+`verify_receipt` checks one event against the daemon's audit key. It does not pin history or prove that the chain is complete. To read the whole chain, page until a page comes back empty or shorter than the limit, continuing from the last sequence number. The chain can grow between pages. Export, pinning, and offline verification are owner operations.
 
-## Stable error/reason codes
+`freeze_self` blocks the agent's new spending and its final dispatch, and only the owner can unfreeze. The agent can still read its own state and receipts with a valid token. A freeze cannot undo a broadcast. Signed work that was never offered may be abandoned permanently and then needs a new request if the owner later allows it. Offered work with an uncertain outcome keeps its hold. Freeze at once if you suspect misuse, then tell the operator.
 
-| Codes | Meaning / safe response |
+## Error and reason codes
+
+| Codes | Meaning and safe response |
 | --- | --- |
-| `UNAUTHENTICATED` | Missing/invalid/revoked token; ask owner for a protected replacement, never seek keys |
-| `FORBIDDEN` | Invalid arguments, forbidden origin/host, cross-chain verification, uncancellable state or authorization; correct usage/review |
-| `AGENT_FROZEN`, `GLOBAL_FROZEN` | Stop spending; owner review, no bypass |
-| `NO_POLICY` | Missing/expired effective policy; ask owner |
-| `PER_TX_EXCEEDED`, `ROLLING_24H_EXCEEDED`, `LIFETIME_EXCEEDED` | Own hard principal caps; do not split requests to evade them |
-| `GLOBAL_CAP_EXCEEDED` | Wallet rolling cap; owner review |
-| `GAS_BUDGET_EXCEEDED` | Own monetary gas cap, including reservations/failed fees |
-| `RATE_LIMITED`, `MAX_OUTSTANDING` | Back off and inspect existing requests. A persisted `denied` request stays denied on same-key replay; capacity recovery does not revive it. Only owner authorization permits a new key/request |
-| `RECIPIENT_NOT_ALLOWED` | Recipient policy refusal; no alternate signing path |
-| `WALLET_CAPACITY` | Insufficient/stale/unknown spendable capacity; preview is not a guarantee |
-| `APPROVAL_REQUIRED` | Owner or valid standing approval needed within the original 300 s TTL; preserve existing pending request and check for expiry |
-| `IDEMPOTENCY_CONFLICT` | Key reused for different immutable payload; inspect original request, do not blindly retry |
-| `NOT_FOUND` | Unknown or not-owned request; do not probe others' IDs |
-| `BROKER_UNAVAILABLE` | Dependency/transport unavailable; outcome may be ambiguous, inspect/retry same key only |
-| `INVALID_AMOUNT` | Incorrect monetary representation/range/zero transfer; use exact positive yocto text |
-| `MAINNET_REFUSED` | Network attestation/config refused; no mainnet or alternate RPC bypass |
-| `AUDIT_UNAVAILABLE` | Audit failure blocks mutation/dispatch; notify owner |
-| `NONCE_CONFLICT` | Custody lane/nonce conflict; owner reconciliation, no direct retry-signing |
-| `POLICY_CHANGED` | Approval policy revision changed; owner rereads/reviews |
+| `UNAUTHENTICATED` | The token is missing, invalid, or revoked. Ask the owner for a protected replacement. Never look for keys |
+| `FORBIDDEN` | Invalid arguments, a forbidden Origin or Host, verification of another agent's chain, a state that cannot be cancelled, or an authorization failure. Fix the call or ask for review |
+| `AGENT_FROZEN`, `GLOBAL_FROZEN` | Stop spending and wait for owner review. There is no bypass |
+| `NO_POLICY` | The effective policy is missing or expired. Ask the owner |
+| `PER_TX_EXCEEDED`, `ROLLING_24H_EXCEEDED`, `LIFETIME_EXCEEDED` | The agent's hard principal caps. Do not split requests to get around them |
+| `GLOBAL_CAP_EXCEEDED` | The wallet rolling cap. Ask the owner to review |
+| `GAS_BUDGET_EXCEEDED` | The agent's gas budget, counting reservations and fees from failed transfers |
+| `RATE_LIMITED`, `MAX_OUTSTANDING` | Back off and inspect existing requests. A stored `denied` request stays denied when you replay its key, even after capacity recovers. Only the owner can authorize a new key or request |
+| `RECIPIENT_NOT_ALLOWED` | The policy does not allow this recipient. There is no other signing path |
+| `WALLET_CAPACITY` | Spendable capacity is too low, stale, or unknown. A preview does not guarantee capacity |
+| `APPROVAL_REQUIRED` | The owner or a valid standing approval must approve within the original 300-second deadline. Keep the existing pending request and check whether it expired |
+| `IDEMPOTENCY_CONFLICT` | The key was already used with a different payload. Inspect the original request and do not retry blindly |
+| `NOT_FOUND` | The request is unknown or belongs to another agent. Do not probe other agents' IDs |
+| `BROKER_UNAVAILABLE` | A dependency or the transport is down, and the outcome may be unclear. Inspect the request, and retry only with the same key |
+| `INVALID_AMOUNT` | The amount has the wrong format, is out of range, or is zero. Send an exact positive yoctoNEAR string |
+| `MAINNET_REFUSED` | The broker refused the network attestation or config. There is no mainnet path and no RPC bypass |
+| `AUDIT_UNAVAILABLE` | An audit failure blocks changes and dispatch. Tell the owner |
+| `NONCE_CONFLICT` | A nonce conflict in the custody lane. The owner must reconcile. Do not retry by signing directly |
+| `POLICY_CHANGED` | The policy revision changed under an approval. The owner rereads and reviews |
 
-Validation authenticates first. Codes are stable; raw RPC/SQL/stack/secret details are intentionally suppressed.
+The broker authenticates before it validates input. Codes are stable. The broker never returns raw RPC, SQL, stack, or secret details.
