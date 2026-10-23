@@ -16,6 +16,7 @@ import { permissionStatus } from '../fixtures/native/fixtures.js';
 import { createServer } from 'node:net';
 
 const exec = promisify(execFile);
+const lockSuffixes = ['', '-journal', '-wal', '-shm'] as const;
 export const near = (value: string) => parseNear(value).toString();
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 export const summary = (line: string) => process.stdout.write(`${line}\n`);
@@ -132,9 +133,10 @@ export class Harness {
   }
   async start() {
     assert(!this.closed, 'cannot start a closed harness');
-    const existed = await lstat(this.keyLockPath).then(() => true, (e: NodeJS.ErrnoException) => {
-      if (e.code !== 'ENOENT') throw e; return false;
-    });
+    const existed = (await Promise.all(lockSuffixes.map((suffix) =>
+      lstat(`${this.keyLockPath}${suffix}`).then(() => true, (e: NodeJS.ErrnoException) => {
+        if (e.code !== 'ENOENT') throw e; return false;
+      })))).some(Boolean);
     assert(!this.closed, 'cannot start a closed harness');
     const child = spawn(process.execPath, [resolve('dist/main.js'), 'daemon', '--config', this.configPath], { env: this.env(), stdio: ['ignore', 'pipe', 'pipe'] });
     this.child = child; let diagnostics = ''; this.diagnostics = ''; child.stdout!.resume(); child.stderr!.on('data', (b: Buffer) => { diagnostics += b.toString(); this.diagnostics = (this.diagnostics + b.toString()).slice(-4096); });
@@ -177,6 +179,19 @@ export class Harness {
         const stat = await lstat(this.keyLockPath);
         assert.equal(stat.dev, this.ownedKeyLock.dev); assert.equal(stat.ino, this.ownedKeyLock.ino);
         assert(stat.isFile() && !stat.isSymbolicLink(), 'owned key lock was replaced');
+        // SIGKILL leaves the lock transaction's rollback journal behind. Remove
+        // only exact sidecar paths of our newly created DB, after child exit and
+        // the inode check above. Never glob the shared per-user lock directory.
+        for (const suffix of lockSuffixes.slice(1)) {
+          const path = `${this.keyLockPath}${suffix}`;
+          const sidecar = await lstat(path).catch((e: NodeJS.ErrnoException) => {
+            if (e.code !== 'ENOENT') throw e; return undefined;
+          });
+          if (sidecar) {
+            assert(sidecar.isFile() && !sidecar.isSymbolicLink(), 'owned key lock sidecar was replaced');
+            await unlink(path);
+          }
+        }
         await unlink(this.keyLockPath); this.ownedKeyLock = undefined;
       }
       if (this.dir) await rm(this.dir, { recursive: true, force: true });

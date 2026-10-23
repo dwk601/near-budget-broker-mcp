@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { closeSync, constants, fchmodSync, openSync, chmodSync } from 'node:fs';
 import type { SQLInputValue } from 'node:sqlite';
 import type { z } from 'zod';
 import {
@@ -77,7 +78,20 @@ export class SqliteStore implements Store {
     const timeout = options.busyTimeoutMs ?? 5_000;
     requireThat(Number.isSafeInteger(timeout) && timeout >= 0 && timeout <= 2_147_483_647);
     this.options = { ...options, network: 'testnet' };
-    try { this.db = new DatabaseSync(filename); } catch (error) { throw storageError(error); }
+    try {
+      if (filename !== ':memory:' && filename !== '') {
+        // Pre-create before SQLite can write anything. SQLite derives new WAL/SHM
+        // permissions from the main DB, not the process's (possibly loose) umask.
+        const fd = openSync(filename, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+        try { fchmodSync(fd, 0o600); } finally { closeSync(fd); }
+        // Also tighten sidecars left by an older deployment/crash before opening.
+        for (const suffix of ['-wal', '-shm']) {
+          try { chmodSync(`${filename}${suffix}`, 0o600); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+        }
+      }
+      this.db = new DatabaseSync(filename);
+    } catch (error) { throw storageError(error); }
     try {
       this.db.exec(`PRAGMA busy_timeout = ${timeout}; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;`);
       migrate(this.db, options.accountId);

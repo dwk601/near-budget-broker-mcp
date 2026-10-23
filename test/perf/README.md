@@ -61,8 +61,8 @@ provided. The opt-in `test/near/live.spike.test.ts` outside `test/live` is expli
 excluded too, rather than relying on its environment gate. Other suites are
 worker-serialized to avoid build/isolation contention.
 
-Base `5765067` still contains throwing placeholders in
-`test/package/placeholder.test.ts` and `test/e2e/placeholder.test.ts`. **B08/B10
-amendment requested:** replace those placeholders with genuine package/e2e tests.
-B14 cannot edit them. CI deliberately includes them and will stay red until
-those owner amendments land; it does not skip or conceal missing coverage.
+`test/e2e` now exercises the built daemon, owner CLI and real stdio MCP bridges
+against a loopback fake testnet RPC, plus disposable-account cleanup fault
+injection. `test/package/placeholder.test.ts` remains a throwing placeholder;
+CI deliberately includes it and will stay red until the package owner replaces
+it with genuine coverage. No missing coverage is skipped or concealed.

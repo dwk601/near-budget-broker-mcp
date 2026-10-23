@@ -40,11 +40,13 @@ function decode(text: string, length: number): Buffer {
   if (bytes.length !== length || bytes.toString('base64') !== text) throw denied();
   return bytes;
 }
-async function readBounded(path: string, maximum: number): Promise<Buffer> {
-  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+async function readBounded(path: string, maximum: number, protectedFile = false): Promise<Buffer> {
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = await file.stat();
     if (!stat.isFile() || stat.size > maximum) throw denied();
+    if (protectedFile && ((stat.mode & 0o7777 & ~0o600) !== 0
+      || (process.getuid && stat.uid !== process.getuid()))) throw denied();
     const bytes = Buffer.alloc(maximum + 1);
     try {
       let offset = 0;
@@ -155,7 +157,7 @@ export async function readMasterSecret(env: NodeJS.ProcessEnv = process.env): Pr
   try {
     const direct = env['BB_MASTER_SECRET']; const path = env['BB_MASTER_SECRET_FILE'];
     if ((direct === undefined) === (path === undefined)) throw denied();
-    const secret = direct === undefined ? await readBounded(path!, 4096) : Buffer.from(direct, 'utf8');
+    const secret = direct === undefined ? await readBounded(path!, 4096, true) : Buffer.from(direct, 'utf8');
     if (secret.length < MIN_MASTER_BYTES || secret.length > 4096) { secret.fill(0); throw denied(); }
     return secret;
   } catch { throw denied(); }

@@ -1,8 +1,8 @@
 import { createDecipheriv, createHash, scryptSync } from 'node:crypto';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { baseDecode, baseEncode, KeyPair } from 'near-api-js';
 import type { EncryptedCustodyKey } from '../../src/contracts/index.js';
 import { EncryptedFileCustody, readMasterSecret } from '../../src/custody/index.js';
@@ -179,6 +179,32 @@ describe('daemon encrypted file and master-secret sources', () => {
     await safeError(c.loadKeyFile(path, Buffer.from('wrong master password with sufficient length')));
     const bad = join(await temp(), 'bad.json'); await writeFile(bad, `{malformed ${secret}`);
     await safeError(c.loadKeyFile(bad, master));
+  });
+  it('requires a regular, non-symlink master file with mode 0600 or stricter', async () => {
+    const dir = await temp(); const path = join(dir, 'master');
+    await writeFile(path, master, { mode: 0o600 });
+    for (const mode of [0o600, 0o400]) {
+      await chmod(path, mode);
+      const bytes = await readMasterSecret({ BB_MASTER_SECRET_FILE: path });
+      expect(bytes).toEqual(master); bytes.fill(0);
+    }
+    for (const mode of [0o644, 0o640, 0o604, 0o700]) {
+      await chmod(path, mode);
+      await safeError(readMasterSecret({ BB_MASTER_SECRET_FILE: path }));
+    }
+    await chmod(path, 0o600);
+    const link = join(dir, 'link'); await symlink(path, link);
+    await safeError(readMasterSecret({ BB_MASTER_SECRET_FILE: link }));
+    const directory = join(dir, 'directory'); await mkdir(directory, { mode: 0o700 });
+    await safeError(readMasterSecret({ BB_MASTER_SECRET_FILE: directory }));
+  });
+  it('rejects a master file owned by another uid', async () => {
+    const path = join(await temp(), 'master'); await writeFile(path, master, { mode: 0o600 });
+    const owner = (await stat(path)).uid;
+    // Exercise the actual descriptor stat without requiring privileged chown.
+    const uid = vi.spyOn(process, 'getuid').mockReturnValue(owner + 1);
+    try { await safeError(readMasterSecret({ BB_MASTER_SECRET_FILE: path })); }
+    finally { uid.mockRestore(); }
   });
   it('loads exactly one env/file source and uses verbatim bytes', async () => {
     const envSecret = await readMasterSecret({ BB_MASTER_SECRET: master.toString() });
