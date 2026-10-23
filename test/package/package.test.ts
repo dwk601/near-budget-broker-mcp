@@ -137,15 +137,27 @@ test('shipped base and example Compose overrides render individually and togethe
     const rendered = await command('docker', [...args, 'config', '--format', 'json'], shipped, extra);
     expect(rendered.status, rendered.stderr).toBe(0);
     const value = JSON.parse(rendered.stdout);
-    assertComposeConfig(value, { master, config, volume });
     const service = value.services.daemon;
-    expect(service.image).toBe(image);
     if (overrides.includes('prebuilt')) expect(service.build).toBeUndefined();
-    else expect(service.build).toBeDefined();
+    else {
+      // The installed tarball's build context is its package root, not this
+      // checkout. Resolve logical cwd aliases before checking that exact root.
+      expect({ ...service.build, context: await realpath(service.build.context) }).toEqual({
+        context: await realpath(shipped), dockerfile: 'docker/Dockerfile',
+      });
+    }
+    // The shared helper asserts the exact unmodified source deployment. First
+    // check each intentional package/override difference, then normalize ONLY
+    // those differences on a clone so every other key remains allowlisted.
+    const base = structuredClone(value);
+    base.services.daemon.build = { context: await realpath(repo), dockerfile: 'docker/Dockerfile' };
     if (overrides.includes('resources')) {
       expect(service.mem_limit).toBe('1073741824');
       expect(service.pids_limit).toBe(128);
+      delete base.services.daemon.mem_limit;
+      delete base.services.daemon.pids_limit;
     }
+    assertComposeConfig(base, { master, config, volume, image });
   }
 }, 120_000);
 
