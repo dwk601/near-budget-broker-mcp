@@ -20,6 +20,7 @@ import {
 } from '../approvals/index.js';
 import { PurePolicyEvaluator } from '../policy/index.js';
 import { custodyLane, custodyPump } from './lane.js';
+import type { BroadcastPreparation } from '../near/index.js';
 import { balanceState, fetchBalance, invalidateBalance } from './balance.js';
 
 export interface BrokerOptions {
@@ -648,11 +649,13 @@ export class BrokerService implements BrokerPort {
       return attempt;
     });
   }
-  private async status(attempt: TxAttempt): Promise<ChainOutcome> {
+  private async status(attempt: TxAttempt, prove = true): Promise<ChainOutcome> {
     try {
-      const offered = this.o.store.read((r) => this.withOffer(r, attempt));
-      const outcome = await this.o.chain.txStatus(attempt.txHash, this.o.config.accountId, offered);
-      if (outcome.kind === 'not_executed' && (offered.lastOfferedAt === null || offered.lastOfferedAt === undefined
+      const offered = prove ? this.o.store.read((r) => this.withOffer(r, attempt)) : undefined;
+      const outcome = offered === undefined
+        ? await this.o.chain.txStatus(attempt.txHash, this.o.config.accountId)
+        : await this.o.chain.txStatus(attempt.txHash, this.o.config.accountId, offered);
+      if (outcome.kind === 'not_executed' && (!offered || offered.lastOfferedAt === null || offered.lastOfferedAt === undefined
         || this.o.clock.now() - offered.lastOfferedAt < NON_EXECUTION_MIN_AGE_MS)) {
         return { kind: 'outcome_unknown', reason: 'Exclusion observation is too close to the last offer' };
       }
@@ -685,6 +688,10 @@ export class BrokerService implements BrokerPort {
     // A transient failure here provably precedes intent/offer recording. Recovery
     // can retry these identical bytes immediately rather than invent ambiguity.
     await this.attest();
+    const chain: NearChain & Partial<BroadcastPreparation> = this.o.chain;
+    const broadcast = chain.prepareBroadcast
+      ? await chain.prepareBroadcast(attempt.signedTxBase64)
+      : () => chain.broadcast(attempt.signedTxBase64);
     const ready = this.o.store.withImmediateTransaction((tx) => {
       const request = must(tx.getRequest(attempt.requestId));
       const decision = this.boundDecision(tx, this.evaluation(tx, request, request.id));
@@ -705,7 +712,7 @@ export class BrokerService implements BrokerPort {
     if (!ready) return false;
     // Once intent is durable, all unexpected port failures remain ambiguous.
     let result;
-    try { result = await this.o.chain.broadcast(attempt.signedTxBase64); }
+    try { result = await broadcast(); }
     catch { result = { kind: 'outcome_unknown' as const, txHash: attempt.txHash }; }
     await this.o.hooks?.afterBroadcast?.(attempt);
     if (result.kind === 'accepted' && result.txHash === attempt.txHash) {
@@ -740,7 +747,12 @@ export class BrokerService implements BrokerPort {
     this.offerCache.set(attempt.id, { seq, at });
     return { ...attempt, lastOfferedAt: at };
   }
-  private neverOffered(r: StoreReader, attempt: TxAttempt): boolean { return this.withOffer(r, attempt).lastOfferedAt === null; }
+  private neverOffered(r: StoreReader, attempt: TxAttempt): boolean {
+    // Callers can hold a stale snapshot across async preflight. Resolve from the
+    // supplied read/transaction's CURRENT row, especially the final release gate.
+    const current = must(r.listAttempts(attempt.requestId).find((a) => a.id === attempt.id));
+    return this.withOffer(r, current).lastOfferedAt === null;
+  }
   private finishAttempt(attempt: TxAttempt, basis: 'owner_attested' | 'chain_proof' | 'never_offered', reason: string, evidence: string,
     force = false, retainHold = false): TransferRequest {
     return this.o.store.withImmediateTransaction((tx) => {
@@ -820,7 +832,10 @@ export class BrokerService implements BrokerPort {
       if (attempt.resolutionWatch === undefined) {
         this.o.store.withImmediateTransaction((tx) => tx.putAttempt({ ...attempt, resolutionWatch: true }));
       }
-      const outcome = await this.status(attempt);
+      // Released holds need only visibility/accounting checks, not another
+      // anchor/key/protocol proof (or its deliberate lookup-spacing wait).
+      const activeHold = this.o.store.read((r) => r.getHold(attempt.requestId)?.status === 'active');
+      const outcome = await this.status(attempt, activeHold);
       touched.push(attempt.requestId);
       if (outcome.kind === 'succeeded' || outcome.kind === 'failed') {
         await this.lane.run(async () => this.correctLateExecution(attempt, outcome));

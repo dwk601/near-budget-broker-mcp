@@ -29,9 +29,11 @@ failure pauses admitted work (including never-offered work), never abandons it.
 
 Only persisted bytes are offered. Every offer first durably updates
 `lastOfferedAt` and increments `offerCount`; byte-identical retries reuse the first
-signed intent receipt. Broker attestation runs BEFORE intent recording. A transient
-failure at that pre-offer boundary retries promptly using the same stored bytes;
-it does not record an offer or impose a 60-second replay delay.
+signed intent receipt. Both broker and real adapter pre-send attestations run
+BEFORE intent through the optional `BroadcastPreparation` capability. Its one-shot
+closure submits only already validated bytes, after the broker records intent.
+A failure at either pre-offer boundary retries the same stored bytes promptly;
+there is no offer count/timestamp or 60-second replay delay to undo.
 New attempts explicitly store null before intent, avoiding receipt-chain scans.
 Legacy rows recover intent/offer time once per changed chain head. An early send
 return leaves signed/never-offered state, not a false outcome_unknown receipt.
@@ -45,11 +47,13 @@ retrievable anchor/history; missing/GC history never proves absence.
   first-rejection provenance, and that stored provenance cannot be erased.
 * EXPIRY proof applies to any offer count, including ambiguous 504/timeouts and
   other definitive first-offer InvalidTxError kinds (e.g. NotEnoughBalance). Require
+  a FINAL-head-pinned access-key nonce STRICTLY LESS than the attempt nonce,
   FINAL head >= anchor height + protocol validity + 1,000 safety blocks, signing
   age >= validity * 1,000 ms (nominal one-second testnet block), and two definitive
   UNKNOWN_TRANSACTION lookups spaced >=1,000 ms. Keep the 60s last-offer age too.
   Signing age is immutable and is not reset by replay. Positive visibility,
-  missing anchor, RPC failure, insufficient margin/age/spacing vetoes proof.
+  missing anchor/key, unpinned key, consumed nonce, RPC failure or insufficient
+  margin/age/spacing vetoes proof. Expiry alone cannot disprove prior execution.
 
 Expiry observations trust complete, consistent retained FINAL history from the
 configured RPC, not a cryptographic absence proof from arbitrary indexer silence.
@@ -71,8 +75,8 @@ already-offered ambiguity cannot use broker abandonment.
 ## Owner resolution and late execution
 
 `resolveAttempt(owner,id,reason,force=false)` requires fresh, aged exclusion:
-definitive UNKNOWN_TRANSACTION, retained history and final nonce consumed/validity
-expired. It cannot normally resolve a still-valid/in-flight transaction or an
+definitive UNKNOWN_TRANSACTION, retained history and either first-rejected nonce
+proof or expiry with an unconsumed pinned nonce. It cannot normally resolve an
 unreachable chain. Positive pending/final execution always vetoes resolution.
 
 Explicit `force=true` may retire an uncertain lane item, but **retains the entire
@@ -89,7 +93,9 @@ five-epoch GC horizon. A receipt-tail index (replayed once on restart, then cons
 incrementally) avoids scanning all failed requests every drain. Automatic watches
 stop at the horizon; uncertain holds are NOT released just because time elapsed.
 Explicit reconcile(id) remains available beyond the horizon, e.g. with an archival
-RPC. Watches never broadcast. Actual late
+RPC. Once the hold is released, watches make only the cheap visibility RPC;
+they do not repeatedly fetch anchor/key/protocol or sleep to re-prove exclusion.
+Watches never broadcast. Actual late
 success/failure corrects the resolved request/attempt/hold through the narrow
 `Store.correctResolvedExecution` seam, charges actual principal/tokensBurnt once,
 appends signed lateResolution receipts to both chains, and globally freezes for
@@ -128,8 +134,11 @@ Real NativeNearChain plus encrypted custody/fake RPC tests cover GC, lag and
 execution becoming visible during replacement signing, besides Expired,
 InvalidNonce, dropped 504, other InvalidTxError and transient pre-send failures.
 `followup.test.ts` covers Q11/Q02/Q36/Q19/Q39/Q43 plus watch indexing/horizon,
-pre-offer retries and forced never-offered release. Storage guard tests use real
-SqliteStore through the existing port; B06F needs no storage/schema amendment.
+pre-offer retries and forced never-offered release. `correction-guards.test.ts`
+independently pins every request/attempt immutable, fee equality, requestId and
+hold-status guard. Redundant ID lookups are fault-injected with corrupt JSON row
+identity to test fail-closed behavior independently, not counted as healthy-row
+attack paths. Storage tests use real SqliteStore; no storage/schema amendment.
 
 `npx tsx test/broker/mutations.ts` operates ONLY on an isolated temporary copy of
 source/tests, never worktree src (even if killed). Review IDs lack patch files,

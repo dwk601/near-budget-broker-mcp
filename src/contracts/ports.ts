@@ -161,8 +161,10 @@ export interface NearChain {
   decodeSignedTx(bytes: Uint8Array): SignedNativeTransfer;
   /** Broadcast exact persisted signed bytes, no implicit nonce selection/retry-signing. */
   broadcast(signedTxBase64: string): Promise<BroadcastResult>;
-  /** Optional persisted attempt supplies exact bytes/nonce/block for positive
-   * non-execution evidence; legacy two-argument readers remain supported. */
+  /** Optional attempt enables exclusion proofs bound to signed bytes/nonce/block.
+   * Omit it for inexpensive visibility-only polling of released resolutions.
+   * Native expiry additionally requires an unconsumed FINAL-head-pinned nonce;
+   * legacy two-argument readers remain supported. */
   txStatus(txHash: string, signerId: string, attempt?: TxAttempt): Promise<ChainOutcome>;
   classifyOutcome(rpcResponse: unknown): ChainOutcome;
 }
@@ -204,12 +206,14 @@ export interface OwnerBrokerService {
   /** Reconcile existing attempts only; never admit/dispatch unrelated queued work.
    * Result contains only requests examined by this call, not the request table. */
   reconcile(principal: OwnerPrincipal, requestId?: string): Promise<ReconcileResult>;
-  /** Default requires fresh, aged exclusion with retained history (definitive
-   * UNKNOWN_TRANSACTION and final nonce consumed/validity expired). Explicit
-   * force may retire a still-uncertain lane item, but retains its full hold.
-   * Pending/final execution always vetoes resolution. Requires a reason and
-   * receipts on owner + agent chains. Resolved work is durably watched; late
-   * execution corrects actual accounting. Never creates a replacement payment. */
+  /** Default requires fresh retained-history exclusion: first-rejected nonce
+   * proof, or aged/margin-confirmed expiry with a strictly unconsumed FINAL-head
+   * nonce and spaced negative lookups. Force retires uncertain OFFERED work while
+   * retaining its full hold; force on NEVER-OFFERED work releases by abandonment
+   * with a fresh transaction recheck. Visible pending/success/failure vetoes even
+   * force. Requires reason and dual receipts; never creates a replacement payment.
+   * Automatic resolution watches have a bounded horizon; explicit reconcile(id)
+   * may inspect later history. Released holds are watched using status-only RPCs. */
   resolveAttempt(principal: OwnerPrincipal, requestId: string, reason: string, force?: boolean): Promise<TransferRequest>;
   exportReceipts(principal: OwnerPrincipal, chainId: ChainId, afterSeq: number, limit: number): Promise<ReceiptEvent[]>;
   listRequests(principal: OwnerPrincipal, filter: RequestFilter, query: PageQuery): Promise<Page<TransferRequest>>;

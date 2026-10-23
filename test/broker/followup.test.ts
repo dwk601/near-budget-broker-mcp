@@ -24,6 +24,13 @@ it.each([true, false])('Q11 explicit force still vetoes visible success (offered
   expect(f.receipts.list('owner', 0, 100).filter((r) => r.type === 'failed')).toEqual([]);
 });
 
+it.each(['failed', 'pending'] as const)('F4 explicit force also vetoes visible %s', async (kind) => {
+  const { request, attempt } = await pending();
+  f.chain.outcomes.set(attempt.txHash, kind === 'pending' ? { kind } : { kind, final: true, receiptIds: [], gasBurnt: 123n, tokensBurnt: 7n, error: 'failed' });
+  await expect(f.broker.resolveAttempt(owner, request.id, 'force must not hide execution', true)).rejects.toHaveProperty('code', 'FORBIDDEN');
+  expect(f.store.read((r) => r.getHold(request.id)?.status)).toBe('active');
+});
+
 it.each(['invalid', 'expired'] as const)('Q02 %s rejection of a replay stays ambiguous without first-rejection provenance', async (mode) => {
   const { a, request } = await pending(); f.now += AGE; f.chain.mode = mode;
   await expect(f.broker.reconcile(owner, request.id)).resolves.toMatchObject({ requests: [expect.objectContaining({ id: request.id, state: 'outcome_unknown' })] });
@@ -125,6 +132,43 @@ it('L2 transient broker attestation failure before any offer retries promptly wi
   spy.mockImplementation(verify); await f.broker.drain(); // no Clock advance or 60-second pause
   expect(f.chain.broadcasts).toEqual([stored.signedTxBase64]); expect(f.chain.built).toHaveLength(1);
   expect((await f.broker.getRequest(a, request.id)).state).toBe('succeeded');
+});
+
+it('F5 final never-offered release gate rechecks the transaction snapshot after a stale preliminary read', async () => {
+  const { a, request, attempt } = await pending(false);
+  const immediate = f.store.withImmediateTransaction.bind(f.store); let injected = false;
+  vi.spyOn(f.store, 'withImmediateTransaction').mockImplementation((operation) => {
+    if (!injected) {
+      injected = true;
+      // Fault-inject durable intent AFTER the preliminary check but BEFORE the
+      // release transaction. The normal pump prevents this race; the final
+      // snapshot guard must independently reject it (including on future edits).
+      immediate((tx) => {
+        const stored = tx.listAttempts(request.id)[0]!;
+        tx.putAttempt({ ...stored, offerCount: 1, lastOfferedAt: f.now });
+        f.receipts.append(tx, { chainId: `agent:${a.agentId}`, type: 'submitted', at: f.now,
+          payload: { requestId: request.id, agentId: a.agentId, attemptId: attempt.id, txHash: attempt.txHash, phase: 'intent' } });
+      });
+    }
+    return immediate(operation);
+  });
+  await expect(f.broker.resolveAttempt(owner, request.id, 'stale never-offered snapshot', true)).rejects.toHaveProperty('code', 'FORBIDDEN');
+  expect(f.store.read((r) => r.getHold(request.id)?.status)).toBe('active');
+  expect(f.store.read((r) => r.listAttempts(request.id)[0]?.lastOfferedAt)).toBe(f.now);
+});
+
+it('F5 owner-chain index enrolls chain_proof resolutions and corrects late success on automatic restart', async () => {
+  const { a, request, attempt } = await pending(); f.now += AGE;
+  f.chain.outcomes.set(attempt.txHash, { kind: 'not_executed', evidence: 'positive exclusion', invalidNonce: true });
+  await f.broker.reconcile(owner, request.id);
+  await f.broker.revokeAgent(owner, a.agentId, 'no longer authorized');
+  await f.broker.reconcile(owner, request.id);
+  expect(f.receipts.list('owner', 0, 100).find((e) => e.type === 'failed')?.payload).toMatchObject({ resolution: { basis: 'chain_proof' } });
+  expect(f.store.read((r) => r.getHold(request.id)?.status)).toBe('released');
+  f.chain.outcomes.set(attempt.txHash, success); await f.another().start();
+  expect((await f.broker.getRequest(owner, request.id)).state).toBe('succeeded');
+  expect(f.store.read((r) => r.getUsageSnapshot(a.agentId, f.now))).toMatchObject({ agentLifetime: request.amount, agentGas24h: 7n });
+  expect((await f.broker.getFreeze(owner, { scope: 'global' }))?.frozen).toBe(true);
 });
 
 it('L3 forcing a never-offered attempt abandons it, releases all budget and creates no watch', async () => {

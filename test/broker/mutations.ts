@@ -97,7 +97,7 @@ function other(id: string, path: string, mutate: (text: string) => string) {
 other('N1-history-retained', 'src/near/native.ts', (s) => replace(s,
   "const anchor = record(record(await this.#rpc.call('block', { block_id: t.blockHash }))['header']);",
   "const anchor = { hash: t.blockHash, height: '0' } as Record<string, unknown>;"));
-other('N1-prolonged-lag', 'src/near/native.ts', (s) => replace(s, 'if (nonceProof) {', 'if (true) {'));
+other('N1-prolonged-lag', 'src/near/native.ts', (s) => replace(s, 'if (nonceProof && nonce >= t.nonce)', 'if (nonce >= t.nonce)'));
 other('N1-minimum-age', 'src/near/native.ts', (s) => replace(s, 'now - offered < NON_EXECUTION_MIN_AGE_MS', 'false'));
 other('N4-negative-cache', 'src/broker/balance.ts', (s) => replace(s,
   'if (state.failedAt !== undefined && now >= state.failedAt && now - state.failedAt < BALANCE_FAILURE_BACKOFF_MS)', 'if (false)'));
@@ -128,18 +128,54 @@ other('M1-safety-margin', 'src/near/proof-policy.ts', (s) => replace(s, 'EXPIRY_
 other('M1-lookup-spacing', 'src/near/proof-policy.ts', (s) => replace(s, 'EXPIRY_LOOKUP_SPACING_MS = 1_000', 'EXPIRY_LOOKUP_SPACING_MS = 0'));
 other('M1-validity-age', 'src/near/native.ts', (s) => replace(s, 'BigInt(signingAge) < validity * VALIDITY_BLOCK_MS', 'false'));
 
-const run = () => spawnSync(process.execPath, [resolve('node_modules/vitest/vitest.mjs'), 'run', 'test/broker/review.test.ts', 'test/broker/safety.test.ts', 'test/broker/followup.test.ts', 'test/near/non-execution.test.ts'],
-  { cwd: root, encoding: 'utf8', timeout: 30000 });
+// F1-F7 reviewer follow-up. Redundant ID checks are exercised with explicit
+// malformed persisted-row fault injection; healthy-row lookup alone cannot
+// distinguish those guards. No production database or worktree is modified.
+other('F1-expiry-consumed-nonce', 'src/near/native.ts', (s) => replace(s, 'if (nonce >= t.nonce) return unknownOutcome();', '/* mutant: consumed nonce ignored */'));
+mutations.push(['F2-adapter-preflight', () => replace(original,
+  'const broadcast = chain.prepareBroadcast\n      ? await chain.prepareBroadcast(attempt.signedTxBase64)\n      : () => chain.broadcast(attempt.signedTxBase64);',
+  'const broadcast = () => chain.broadcast(attempt.signedTxBase64);')]);
+other('F3-relative-signing-age', 'src/near/native.ts', (s) => replace(s, 'const signingAge = now - attempt.createdAt;', 'const signingAge = now;'));
+other('F3-anchor-binding', 'src/near/native.ts', (s) => replace(s, "if (anchor['hash'] !== t.blockHash) return unknownOutcome();", '/* mutant: wrong anchor trusted */'));
+for (const kind of ['pending', 'failed']) {
+  mutations.push([`F4-force-${kind}`, () => scope('  async resolveAttempt(', '  async drain(', (s) => replace(s, ` || outcome.kind === '${kind}'`, ''))]);
+}
+function omitImmutable(s: string, name: string, key: string): string {
+  const start = s.indexOf(`const ${name} = [`); const end = s.indexOf('] as const;', start) + '] as const;'.length;
+  if (start < 0 || end < start) throw new Error('Missing immutable array');
+  const keys = [...s.slice(start, end).matchAll(/'([^']+)'/g)].map((m) => m[1]!);
+  if (!keys.includes(key)) throw new Error('Missing immutable key');
+  return s.slice(0, start) + `const ${name} = [${keys.filter((k) => k !== key).map((k) => `'${k}'`).join(', ')}] as const;` + s.slice(end);
+}
+for (const key of ['id', 'agentId', 'idempotencyKey', 'requestDigest', 'receiverId', 'memo', 'createdAt', 'approvalRef', 'policyRevision', 'reasons', 'expiresAt', 'signedAt', 'submittedAt']) {
+  other(`F4-request-${key}`, 'src/storage/sqlite-store.ts', (s) => omitImmutable(s, 'immutableRequest', key));
+}
+for (const key of ['id', 'requestId', 'nonce', 'publicKey', 'blockHash', 'signedTxBase64', 'txHash', 'createdAt', 'lastOfferedAt', 'offerCount', 'firstRejection', 'nonExecutionEvidence']) {
+  other(`F4-attempt-${key}`, 'src/storage/sqlite-store.ts', (s) => omitImmutable(s, 'immutableAttempt', key));
+}
+other('F4-hold-status', 'src/storage/sqlite-store.ts', (s) => replace(s, "(hold.status === 'active' || hold.status === 'released')", 'true'));
+other('F4-requestId-binding', 'src/storage/sqlite-store.ts', (s) => replace(s, ' && attempt.requestId === old.id', ''));
+other('F4-gas-equality', 'src/storage/sqlite-store.ts', (s) => replace(s, 'request.gasBurnt === attempt.gasBurnt && ', ''));
+other('F4-token-equality', 'src/storage/sqlite-store.ts', (s) => replace(s, ' && request.tokensBurnt === attempt.tokensBurnt', ''));
+add('F5-final-snapshot', "if (basis === 'never_offered' && !this.neverOffered(tx, stored)) throw new BrokerError('FORBIDDEN');", '/* mutant: stale preliminary authority trusted */');
+add('F5-chain-proof-watch', 'else this.watchIndex.set(event.payload.requestId, event.payload.resolution.attemptId);',
+  "else if (event.payload.resolution.basis === 'owner_attested') this.watchIndex.set(event.payload.requestId, event.payload.resolution.attemptId);");
+add('F6-reprove-released', 'const outcome = await this.status(attempt, activeHold);', 'const outcome = await this.status(attempt, true);');
+const filter = process.argv[2] ? new RegExp(process.argv[2]) : null;
+const selected = mutations.filter(([id]) => filter === null || filter.test(id));
+const run = (native = false) => spawnSync(process.execPath, [resolve('node_modules/vitest/vitest.mjs'), 'run',
+  'test/broker/review.test.ts', 'test/broker/safety.test.ts', 'test/broker/followup.test.ts', 'test/broker/correction-guards.test.ts', 'test/near/non-execution.test.ts',
+  ...(native ? ['test/broker/native-integration.test.ts'] : [])], { cwd: root, encoding: 'utf8', timeout: 30000 });
 let killed = 0;
 try {
   for (const path of ['src', 'test/broker', 'test/near', 'package.json', 'vitest.config.ts', 'tsconfig.json', 'tsconfig.test.json']) cpSync(path, join(root, path), { recursive: true });
   symlinkSync(resolve('node_modules'), join(root, 'node_modules'), 'dir');
   const baseline = run();
   if (baseline.status !== 0) throw new Error(`Baseline failed\n${baseline.stdout}\n${baseline.stderr}`);
-  for (const [id, mutate, side] of mutations) {
+  for (const [id, mutate, side] of selected) {
     writeFileSync(file, mutate());
     if (side) writeFileSync(join(root, side.path), side.mutate(others.get(side.path)!));
-    const result = run();
+    const result = run(id === 'F1-expiry-consumed-nonce' || id === 'F2-adapter-preflight' || id === 'F6-reprove-released');
     const output = result.stdout + result.stderr;
     writeFileSync(file, original);
     if (side) writeFileSync(join(root, side.path), others.get(side.path)!);
@@ -152,4 +188,4 @@ try {
     throw new Error('Worktree source changed outside the isolated mutation runner');
   }
 }
-console.log(`${killed}/${mutations.length} non-equivalent review-gap mutants killed in isolated copy; worktree unchanged`);
+console.log(`${killed}/${selected.length} review-gap mutants killed in isolated copy (including identity-corruption guards); worktree unchanged`);

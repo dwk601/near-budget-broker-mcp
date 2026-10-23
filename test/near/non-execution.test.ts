@@ -5,7 +5,7 @@ import type { TxAttempt } from '../../src/contracts/index.js';
 const hash = (i: number) => baseEncode(new Uint8Array(32).fill(i));
 const pair = KeyPair.fromRandom('ed25519'); const publicKey = pair.getPublicKey().toString();
 const unknown = { error: { name: 'HANDLER_ERROR', cause: { name: 'UNKNOWN_TRANSACTION', info: {} } } };
-async function fixture(options: { nonce?: string; height?: string; validity?: string; txError?: unknown; second?: unknown; wrongHead?: boolean; gcAnchor?: boolean; now?: number; noSleepAdvance?: boolean } = {}) {
+async function fixture(options: { nonce?: string; height?: string; validity?: string; txError?: unknown; second?: unknown; wrongHead?: boolean; gcAnchor?: boolean; now?: number; noSleepAdvance?: boolean; createdAt?: number; lastOfferedAt?: number; wrongAnchor?: boolean; keyError?: boolean } = {}) {
   let lookups = 0; let txHash = ''; let now = options.now ?? 120_000;
   const lookupTimes: number[] = [];
   const calls: string[] = [];
@@ -16,7 +16,8 @@ async function fixture(options: { nonce?: string; height?: string; validity?: st
     if (req.method === 'status') result = { chain_id: 'testnet' };
     if (req.method === 'block' && req.params['block_id'] && options.gcAnchor) return Response.json({ jsonrpc: '2.0', id: req.id,
       error: { cause: { name: 'UNKNOWN_BLOCK', info: {} } } });
-    if (req.method === 'block') result = { header: { hash: req.params['block_id'] ?? hash(2), height: req.params['block_id'] ? '10' : options.height ?? '1110' } };
+    if (req.method === 'block') result = { header: { hash: req.params['block_id'] ? options.wrongAnchor ? hash(9) : req.params['block_id'] : hash(2), height: req.params['block_id'] ? '10' : options.height ?? '1110' } };
+    if (req.method === 'query' && options.keyError) return Response.json({ jsonrpc: '2.0', id: req.id, error: { cause: { name: 'UNKNOWN_ACCESS_KEY' } } });
     if (req.method === 'query') result = { nonce: options.nonce ?? '0', block_hash: options.wrongHead ? hash(9) : hash(2) };
     if (req.method === 'EXPERIMENTAL_protocol_config') result = { transaction_validity_period: options.validity ?? '100' };
     if (req.method === 'tx') {
@@ -32,7 +33,7 @@ async function fixture(options: { nonce?: string; height?: string; validity?: st
     nonce: 5n, publicKey, blockHash: hash(1) }, { publicKey, sign: async (bytes) => pair.sign(bytes).signature });
   txHash = signed.txHash;
   const attempt: TxAttempt = { id: 't', requestId: 'r', nonce: 5n, publicKey, blockHash: hash(1), signedTxBase64: signed.signedTxBase64,
-    txHash, status: 'outcome_unknown', receiptIds: [], gasBurnt: null, tokensBurnt: null, createdAt: 1, updatedAt: 1, nonExecutionEvidence: null, lastOfferedAt: 1, offerCount: 1,
+    txHash, status: 'outcome_unknown', receiptIds: [], gasBurnt: null, tokensBurnt: null, createdAt: options.createdAt ?? 1, updatedAt: 1, nonExecutionEvidence: null, lastOfferedAt: options.lastOfferedAt ?? 1, offerCount: 1,
     firstRejection: options.nonce === '5' ? 'INVALID_NONCE' : 'EXPIRED_BLOCK_HASH' };
   return { chain, attempt, calls, lookupTimes };
 }
@@ -83,14 +84,32 @@ it('prolonged lookup lag after an accepted/ambiguous offer never proves absence,
     expect((await chain.txStatus(attempt.txHash, 'broker.testnet', { ...attempt, ...metadata })).kind).toBe('outcome_unknown');
   }
 });
-it.each([undefined, 1, 3])('M1 generous expiry proves ambiguous bytes with offerCount=%s, even when the nonce is consumed', async (offerCount) => {
-  const { chain, attempt, lookupTimes } = await fixture({ nonce: '5' });
+it.each(['5', '6'].flatMap((nonce) => [undefined, 1, 3].map((offerCount) => ({ nonce, offerCount }))))(
+  'F1 consumed nonce $nonce vetoes ambiguous expiry beyond the full margin (offerCount=$offerCount)', async ({ nonce, offerCount }) => {
+  const { chain, attempt } = await fixture({ nonce, height: '1111' });
+  expect((await chain.txStatus(attempt.txHash, 'broker.testnet', { ...attempt, offerCount, firstRejection: undefined })).kind).toBe('outcome_unknown');
+});
+it.each([undefined, 1, 3])('M1 generous expiry proves ambiguous bytes only with unconsumed nonce (offerCount=%s)', async (offerCount) => {
+  const { chain, attempt, lookupTimes } = await fixture({ nonce: '4', height: '1111' });
   const result = await chain.txStatus(attempt.txHash, 'broker.testnet', { ...attempt, offerCount, firstRejection: undefined });
   expect(result).toMatchObject({ kind: 'not_executed', invalidNonce: false, evidence: expect.stringContaining('EXPIRY_PROOF') });
   expect(lookupTimes[1]! - lookupTimes[0]!).toBeGreaterThanOrEqual(1000);
 });
 it('M1 expiry needs signing age >= validity time, not merely the 60s last-offer gate', async () => {
   const { chain, attempt } = await fixture({ now: 80_000 });
+  expect((await chain.txStatus(attempt.txHash, 'broker.testnet', { ...attempt, firstRejection: undefined })).kind).toBe('outcome_unknown');
+});
+it('F3 signing age is relative to creation, not Unix epoch time', async () => {
+  const now = 10_000_000;
+  const { chain, attempt } = await fixture({ now, createdAt: now - 70_000, lastOfferedAt: now - 70_000, height: '1111' });
+  expect((await chain.txStatus(attempt.txHash, 'broker.testnet', { ...attempt, firstRejection: undefined })).kind).toBe('outcome_unknown');
+});
+it.each(['0', '5'])('F3 retrieved anchor must bind the signed hash (nonce=%s)', async (nonce) => {
+  const { chain, attempt } = await fixture({ nonce, wrongAnchor: true });
+  expect((await chain.txStatus(attempt.txHash, 'broker.testnet', attempt)).kind).toBe('outcome_unknown');
+});
+it.each([{ keyError: true }, { wrongHead: true }])('F1 expiry requires a retrievable final-head-pinned key view %#', async (options) => {
+  const { chain, attempt } = await fixture(options);
   expect((await chain.txStatus(attempt.txHash, 'broker.testnet', { ...attempt, firstRejection: undefined })).kind).toBe('outcome_unknown');
 });
 it('M1 expiry of ambiguous replayed bytes still fails closed on GC history', async () => {

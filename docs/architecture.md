@@ -587,12 +587,13 @@ A backwards clock step skips pending expirations newer than the clock.
 
 NearChain.txStatus accepts an optional persisted TxAttempt (the two-argument
 form remains compatible). The native adapter validates its signed bytes and binds
-hash/signer/key/nonce/block before proving exclusion. A structured
-UNKNOWN_TRANSACTION lookup plus a pinned final access-key nonce >= attempt nonce
-proves that nonce cannot execute anew. Alternatively a final head strictly past
-the signed block height + protocol transaction_validity_period establishes
-expiry. Both paths require a second UNKNOWN_TRANSACTION lookup AFTER the final
-observation. Timeouts, arbitrary error strings, missing fields, an unpinned key
+hash/signer/key/nonce/block before proving exclusion. A nonce proof requires
+sole-first-offer definitive rejection provenance plus a FINAL-head-pinned access-key
+nonce >= attempt nonce. An expiry proof instead requires the pinned nonce STRICTLY
+LESS than the attempt nonce, FINAL head >= anchor height + validity + 1,000 safety
+blocks, signing age >= nominal validity time, and two UNKNOWN_TRANSACTION lookups
+spaced >=1,000 ms. Both paths require retained anchor history and a second negative
+lookup AFTER the final observation; consumed nonce alone never proves absence. Timeouts, arbitrary error strings, missing fields, an unpinned key
 view or a head merely at the validity boundary never prove exclusion. Any positive
 transaction/inclusion evidence vetoes exclusion even if final fee data is missing.
 Proof is retained in nonExecutionEvidence and through restart. When replacement
@@ -610,15 +611,16 @@ cannot use this exception. A standing grant remains bound to the exact grant in
 the decision receipt; signing must re-reserve that same grant. A benign revision
 mismatch at owner approval returns the stable POLICY_CHANGED code.
 
-OwnerBrokerService.resolveAttempt(owner, requestId, reason) is an explicit
-owner-attested **zero-execution** resolution for a stuck current attempt. Reason
-must be nonempty, well-formed and <=1024 characters. Authenticate the owner as
-usual; serialize against dispatch/reconciliation, query current chain evidence,
-and REFUSE resolution if pending, successful or failed execution is observed.
-With unknown evidence the owner explicitly accepts responsibility for the
-attestation; this is not an automatic proof or a gas estimate. Resolution fails
-that request with zero burn, releases its hold, never creates a replacement, and
-atomically appends a failed receipt on BOTH owner and affected-agent chains.
+OwnerBrokerService.resolveAttempt(owner, requestId, reason, force=false) requires
+fresh nonce/expiry exclusion under the rules below. Reason must be nonempty,
+well-formed and <=1024 characters. Authenticate the owner as usual, serialize
+against dispatch/reconciliation, and REFUSE even force if pending, successful or
+failed execution is visible. An explicit force can retire an uncertain offered
+attempt but RETAINS its full hold; it cannot free budget for another payment.
+A forced NEVER-OFFERED attempt instead uses broker abandonment and releases its
+hold with a final fresh-snapshot recheck. Resolution never creates a replacement
+and atomically receipts BOTH owner and affected-agent chains. Zero-burn resolution
+is distinct from measured execution, and late actual execution is corrected.
 The backward-compatible optional failed.payload.resolution is
 {attemptId,basis:owner_attested|chain_proof|never_offered,evidence}; failed.reason
 records the mandatory explanation. Automatic proof/never-offered abandonment uses
@@ -659,6 +661,10 @@ All of these conditions are required:
 * Retrieve and validate the exact signed anchor block from retained history.
 * Pin FINAL head/protocol configuration; require head height >= anchor height +
   transaction_validity_period + 1,000 safety blocks.
+* Retrieve the access key pinned to that SAME head hash and require its nonce
+  STRICTLY LESS than the attempt nonce. A consumed nonce could be this transaction
+  or an external signer; return unknown even when the full expiry margin is met.
+  Missing/unpinned key data also vetoes expiry; it is not an optional optimization.
 * Signing age (immutable attempt.createdAt) >= validity period * 1,000 ms, using
   testnet's nominal one-second validity block as an additional wall-clock gate.
   Keep the separate minimum 60-second age since lastOfferedAt. Replays cannot
@@ -693,19 +699,23 @@ attempt status while retaining earlier evidence; it must never authorize another
 payment. Store.putAttempt permits only this narrow positive correction out of
 proven_not_executed. Signed identity and monotonic offer time remain immutable.
 
-resolveAttempt(owner,id,reason,force=false) now REQUIRES fresh definitive exclusion:
-retained history, minimum offer age, UNKNOWN_TRANSACTION and final consumed nonce
-or expired validity. It cannot default-resolve a still-valid transaction or an
-unreachable RPC. Explicit force=true is separately receipted and may retire an
-uncertain lane item, but RETAINS its entire principal+fee hold until fresh exclusion
-or actual final execution is observed. Thus force cannot free the same agent's
-budget for a second payment. Positive pending/final execution always vetoes even
-force. Failed resolution receipts record force and holdRetained explicitly.
+resolveAttempt(owner,id,reason,force=false) REQUIRES fresh definitive exclusion:
+the first-rejection nonce proof or unconsumed-nonce expiry proof defined above,
+including their retained-history/age/negative-lookup gates. It cannot default-resolve
+an uncertain transaction or unreachable RPC. Explicit force=true may retire an
+uncertain OFFERED lane item but retains the full principal+fee hold until fresh
+exclusion or actual execution. Exception: force on NEVER-OFFERED bytes abandons
+and releases after rechecking current intent in the final transaction. Positive
+pending/final execution vetoes both force paths. Receipts record force/holdRetained.
 
-All offered, artificially resolved attempts have durable resolutionWatch metadata.
-Drains/start/reconcile continue watching through their validity window AND beyond
-it for late historical visibility; watches never rebroadcast. A forced hold is
-released only on fresh mature exclusion. Actual late success/failure is charged
+Offered, artificially resolved attempts carry durable resolutionWatch eligibility.
+Automatic watches stop 60 hours after signing/latest offer (nominal testnet validity
+plus margin, up to the approximate GC horizon), without releasing uncertain holds.
+A signed owner-receipt tail index avoids rescanning failed requests each drain;
+restart replays the index once. Explicit reconcile(id) still works beyond the
+horizon. Watches never broadcast. Active holds require fresh exclusion before
+release; after a hold is released, watchers perform ONLY a status lookup, not new
+anchor/key/protocol proof RPCs or spacing sleeps. Actual late success/failure is charged
 exactly once, with actual principal and tokensBurnt, a signed lateResolution
 receipt on both owner/agent chains, and a global freeze requiring owner review.
 A narrow Store.correctResolvedExecution seam atomically corrects only an explicit
@@ -731,7 +741,13 @@ a new idempotency key if the owner permits a fresh payment. Already-offered work
 cannot use abandonment. Stale-only capacity failure must pause a never-offered
 attempt and preserve its hold, not abandon it. Global freeze pauses signed work.
 
+The native adapter exposes an optional prepared-broadcast capability: decode and
+both broker/adapter network attestations complete BEFORE durable intent. The
+broker then atomically rechecks authority, records the offer, and invokes the
+one-shot submission closure. A failure in the adapter's pre-send attestation leaves
+signed bytes with offerCount=0/lastOfferedAt=null, so recovery retries promptly
+without re-signing. Failures after submission invocation remain ambiguous.
+
 The mutation runner operates exclusively on an isolated temporary source/test
-copy. It never rewrites worktree src, even on interruption. Required MCP/HTTP
-placeholder suites remain owned by their downstream tasks; B06 does not skip or
-silence them.
+copy. It never rewrites worktree src, even on interruption. MCP/HTTP are included
+as integration regressions; unrelated downstream placeholders remain out of scope.

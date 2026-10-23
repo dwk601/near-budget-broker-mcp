@@ -60,6 +60,13 @@ function fromBase64(text: string): SignedNativeTransfer {
   return nativeSigned(Buffer.from(text, 'base64'));
 }
 
+/** Optional in-process capability: all fallible local/network preflight happens
+ * before the broker commits intent. The returned one-shot closure ONLY submits
+ * already validated bytes; invoking it requires a durable offer record. */
+export interface BroadcastPreparation {
+  prepareBroadcast(signedTxBase64: string): Promise<() => Promise<BroadcastResult>>;
+}
+
 export interface NativeNearChainOptions {
   rpcUrl: string;
   accountId: string;
@@ -154,9 +161,20 @@ export class NativeNearChain implements NearChain {
   }
   decodeSignedTx(bytes: Uint8Array): SignedNativeTransfer { return nativeSigned(bytes); }
   async broadcast(signedTxBase64: string): Promise<BroadcastResult> {
+    return (await this.prepareBroadcast(signedTxBase64))();
+  }
+  async prepareBroadcast(signedTxBase64: string): Promise<() => Promise<BroadcastResult>> {
     const signed = fromBase64(signedTxBase64);
     if (signed.transfer.signerId !== this.#accountId) throw new BrokerError('FORBIDDEN');
-    await this.verifyNetwork(); // A mismatch is a refusal, not a send attempt.
+    await this.verifyNetwork(); // No send or durable offer exists at this point.
+    let used = false;
+    return async () => {
+      if (used) throw new BrokerError('FORBIDDEN');
+      used = true;
+      return this.submitPrepared(signed);
+    };
+  }
+  private async submitPrepared(signed: SignedNativeTransfer): Promise<BroadcastResult> {
     const txHash = signed.txHash;
     try {
       // Async/NONE acknowledgment does not validate the transaction. Wait for
@@ -221,20 +239,18 @@ export class NativeNearChain implements NearChain {
       if (headHeight < height) return unknownOutcome();
       let evidence: string | null = null;
       let invalidNonce = false;
-      if (nonceProof) {
-        try {
-          const key = record(await this.#rpc.call('query', { request_type: 'view_access_key', account_id: signerId,
-            public_key: t.publicKey, block_id: headHash }));
-          if (key['block_hash'] === headHash) {
-            const nonce = unsigned(key['nonce'], U64_MAX);
-            if (nonce >= t.nonce) {
-              invalidNonce = true;
-              evidence = `FIRST_OFFER_REJECTED:${attempt.firstRejection}; UNKNOWN_TRANSACTION; retained anchor ${t.blockHash} height ${height}; final access key ${headHash} nonce ${nonce} >= attempt ${t.nonce}; last offer ${offered}`;
-            }
-          }
-        } catch { /* An expiry proof does not depend on access-key availability. */ }
+      const key = record(await this.#rpc.call('query', { request_type: 'view_access_key', account_id: signerId,
+        public_key: t.publicKey, block_id: headHash }));
+      if (key['block_hash'] !== headHash) return unknownOutcome();
+      const nonce = unsigned(key['nonce'], U64_MAX);
+      if (nonceProof && nonce >= t.nonce) {
+        invalidNonce = true;
+        evidence = `FIRST_OFFER_REJECTED:${attempt.firstRejection}; UNKNOWN_TRANSACTION; retained anchor ${t.blockHash} height ${height}; final access key ${headHash} nonce ${nonce} >= attempt ${t.nonce}; last offer ${offered}`;
       }
       if (evidence === null) {
+        // An executed transaction (or external signer) can consume this nonce
+        // while tx lookup history lags. Spacing and expiry do not refute it.
+        if (nonce >= t.nonce) return unknownOutcome();
         const protocol = record(await this.#rpc.call('EXPERIMENTAL_protocol_config', { block_id: headHash }));
         const validity = unsigned(protocol['transaction_validity_period'], U64_MAX);
         // Signing age, unlike last-offer time, is not reset by identical replay.
@@ -247,7 +263,7 @@ export class NativeNearChain implements NearChain {
         if (elapsed < 0) return unknownOutcome();
         if (elapsed < EXPIRY_LOOKUP_SPACING_MS) await this.#sleep(EXPIRY_LOOKUP_SPACING_MS - elapsed);
         if (this.#clock.now() - negativeAt < EXPIRY_LOOKUP_SPACING_MS) return unknownOutcome();
-        evidence = `EXPIRY_PROOF; UNKNOWN_TRANSACTION twice spaced >= ${EXPIRY_LOOKUP_SPACING_MS}ms; retained anchor ${t.blockHash} height ${height}; final head ${headHash} height ${headHeight} >= anchor + validity ${validity} + margin ${EXPIRY_SAFETY_BLOCKS}; signing age ${signingAge}ms; last offer ${offered}`;
+        evidence = `EXPIRY_PROOF; final access key ${headHash} nonce ${nonce} < attempt ${t.nonce}; UNKNOWN_TRANSACTION twice spaced >= ${EXPIRY_LOOKUP_SPACING_MS}ms; retained anchor ${t.blockHash} height ${height}; final head ${headHash} height ${headHeight} >= anchor + validity ${validity} + margin ${EXPIRY_SAFETY_BLOCKS}; signing age ${signingAge}ms; last offer ${offered}`;
       }
       // A second negative lookup AFTER the final nonce/expiry observation closes
       // the observation race. Timeout, malformed result, or any other error is

@@ -29,13 +29,15 @@ export const TxAttemptSchema = z.strictObject({
   /** Persisted BEFORE every offer; null proves no submission intent was written.
    * Missing on legacy records requires receipt recovery, never a freshness guess. */
   lastOfferedAt: TimestampSchema.nullable().optional(),
-  /** Number of durable offer intents, incremented before each invocation.
-   * Only a definitive rejection of the sole first offer proves that this broker
-   * has never offered bytes that might have been accepted. */
+  /** Monotonic durable offer intents, incremented before invocation. Sole-first
+   * definitive rejection provenance gates NONCE-based exclusion. EXPIRY may cover
+   * any count only with retained anchor, full margin/age/spaced negatives AND an
+   * access-key nonce pinned to the FINAL head strictly below this attempt. */
   offerCount: CountSchema.optional(),
   firstRejection: z.enum(['INVALID_NONCE', 'EXPIRED_BLOCK_HASH']).optional(),
-  /** Artificially resolved attempts remain watched until actual final accounting.
-   * Watching beyond expiry also catches late historical visibility. */
+  /** Eligibility for resolution watching. Automatic polling has a bounded GC
+   * horizon; explicit reconcile(id) can still account later visibility. Released
+   * holds use status-only checks, not repeated non-execution proofs. */
   resolutionWatch: z.boolean().optional(),
 }).refine((attempt) => attempt.status !== 'proven_not_executed' || attempt.nonExecutionEvidence !== null,
   'proven_not_executed requires persisted positive evidence');
