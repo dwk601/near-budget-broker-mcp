@@ -1,13 +1,16 @@
 import { expect } from 'vitest';
-import { resolve } from 'node:path';
+import { realpathSync } from 'node:fs';
 
 /** Exact allowlist of the RENDERED, unmodified deployment, including defaults.
  * New Compose keys/defaults require explicit review, never a permissive matcher. */
 export function assertComposeConfig(value: unknown, files: { master: string; config: string; volume: string; image: string }) {
-  const config = value as { services: unknown; volumes: unknown; secrets: unknown };
+  const config = structuredClone(value) as { services: { daemon: { build: { context: string } } }; volumes: unknown; secrets: unknown };
+  // Compose may preserve a logical cwd alias (/var on macOS), while Node uses
+  // its physical path. Normalize only context; retain every key for exact checks.
+  config.services.daemon.build.context = realpathSync(config.services.daemon.build.context);
   expect(config.services).toEqual({
     daemon: {
-      build: { context: resolve('.'), dockerfile: 'docker/Dockerfile' },
+      build: { context: realpathSync('.'), dockerfile: 'docker/Dockerfile' },
       image: files.image,
       command: null,
       entrypoint: null,
