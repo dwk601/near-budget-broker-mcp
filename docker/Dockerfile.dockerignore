@@ -1,0 +1,10 @@
+# Dockerfile-specific context allowlist: never send host credentials/DBs/tests.
+**
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!src/**
+!docker/
+!docker/Dockerfile
+!docker/Dockerfile.dockerignore

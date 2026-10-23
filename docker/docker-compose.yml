@@ -1,0 +1,36 @@
+# HARD TRUST BOUNDARY: agents with same-user Docker socket access can docker exec,
+# inspect secrets, or mount the named volume. Deny agents Docker access; use a
+# separate OS user/sandbox. Encryption does NOT protect an unlocked daemon.
+services:
+  daemon:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    user: "1000:1000"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 90s
+    environment:
+      BB_MASTER_SECRET_FILE: /run/secrets/bb_master
+    secrets: [bb_master, bb_config]
+    volumes:
+      - bb_data:/var/lib/budget-broker
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    ports:
+      - "127.0.0.1:3210:3210"
+      - "127.0.0.1:3211:3211"
+# Compose v2 environment-sourced secrets: no host secret-file bind mounts.
+# Supply these only in the protected owner/deployment environment, never an
+# agent shell. They are mounted as files below /run/secrets inside the container.
+# Host same-user environment inspection is another reason for OS-user isolation.
+secrets:
+  bb_master:
+    environment: BB_MASTER_MATERIAL
+  bb_config:
+    environment: BB_CONFIG_JSON
+volumes:
+  bb_data:
+    name: budget-broker-data
