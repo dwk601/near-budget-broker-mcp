@@ -1,4 +1,4 @@
-# Budget Broker MCP — frozen foundation (B00)
+# Budget Broker MCP frozen foundation (B00)
 
 This is the authoritative integration contract. `src/contracts/index.ts` is the
 public TypeScript barrel; adjacent Zod schemas validate shared data. These files,
@@ -17,7 +17,7 @@ agent-selected signer, access-key management or mainnet fallback. A long-running
 Docker daemon holds custody and audit secrets. Its SQLite database and encrypted
 custody key live in a named volume, not an agent-accessible bind mount.
 
-The npm bin is `budget-broker` -> `dist/main.js`. `budget-broker mcp` is an npx-
+The npm bin `budget-broker` points to `dist/main.js`. `budget-broker mcp` is an npx-
 installable stdio bridge, not an in-process broker. It proxies MCP stdio to the
 daemon's Streamable HTTP `/mcp` endpoint using the agent bearer token. Never log
 tokens or protocol messages on stdout. The owner CLI uses a separate admin port
@@ -61,9 +61,10 @@ exercise this boundary; never solve it by moving custody back into the bridge.
   `not implemented: <area>`; replacing the placeholder with genuine assertions
   is the owning task's responsibility. Do not skip/todo it or set passWithNoTests.
   Consequently `test` and `check:all` **must fail at B00**. `test:contracts` passes.
-- Areas map to `test/<area>` except `mcp` -> `test/mcp/local`, `http` ->
-  `test/mcp/http`, `audit` -> `test/audit/core`, `checkpoints` ->
-  `test/audit/checkpoints`, `live:native` -> `test/live/native`.
+- Areas map to `test/<area>`, with these exceptions: `mcp` maps to
+  `test/mcp/local`, `http` to `test/mcp/http`, `audit` to `test/audit/core`,
+  `checkpoints` to `test/audit/checkpoints`, and `live:native` to
+  `test/live/native`.
 - `fixtures:native`: `tsx scripts/fixtures/native/index.ts`; `demo:testnet`:
   `tsx scripts/demo/index.ts`. Both stubs print `not implemented` and exit 1.
   Live tests are opt-in, testnet-only, explicitly funded and never run by `test`.
@@ -134,9 +135,9 @@ pure helpers rather than reimplementing signing/digests in each task:
 
 | Helper | Exact result |
 | --- | --- |
-| `canonicalJson(value)` | canonical JSON string; UTF-16 code-unit key ordering, not UTF-8/codepoint order; arrays ordered; -0 -> 0 |
+| `canonicalJson(value)` | canonical JSON string; UTF-16 code-unit key ordering, not UTF-8/codepoint order; arrays ordered; -0 becomes 0 |
 | `sha256Hex(textOrBytes)` | lowercase SHA-256 hex of UTF-8 string or exact bytes; no JSON quoting/hex decoding |
-| `requestDigest(preimage)` | SHA-256 of canonical agentId/receiverId/yocto-TEXT amount/memo; missing or null memo -> null |
+| `requestDigest(preimage)` | SHA-256 of canonical agentId/receiverId/yocto-TEXT amount/memo; a missing or null memo becomes null |
 | `hashAgentToken(token)` | validate syntax then hash exact full UTF-8 token, including bb_agent_ prefix |
 | `ownerSigningBytes(payload)` | validated canonical signing payload as UTF-8 Uint8Array, NOT a hash |
 | `receiptHashInput(preimage)` | validated canonical receipt preimage bytes, excludes hash/signature |
@@ -246,7 +247,7 @@ allow_all ignores its accounts list. Hard caps are checked before approvals.
 
 `PolicyEvaluator.evaluate` is pure: agent + nullable policies + UsageSnapshot +
 PolicyRequest + standing approvals + nullable digest-bound request approval +
-now -> `allow | deny | needs_approval | allow_via_standing_approval`, reasons,
+now, and returns `allow | deny | needs_approval | allow_via_standing_approval`, reasons,
 and standingApprovalId when applicable. No SQL, RPC, clock reads or mutation.
 A valid per-request approval returns `allow` only for its exact request ID,
 agent, requestDigest, current agent policy revision and unexpired grant. A changed
@@ -303,7 +304,7 @@ null, otherwise exactly EXPLORER_BASE+txHash. Never link mainnet. The digest pre
 is canonical `{agentId,receiverId,amount,memo}` with amount yocto TEXT and absent
 memo normalized to **null** (empty string stays distinct). Scope idempotency by
 `UNIQUE(agentId,idempotencyKey)`. Same key+digest returns the original request;
-same key+different digest -> `IDEMPOTENCY_CONFLICT`. A replay never reserves,
+the same key with a different digest returns `IDEMPOTENCY_CONFLICT`. A replay never reserves,
 authorizes, broadcasts or appends another decision. ID generation is internal.
 
 States: denied, pending_approval, approved, rejected, expired, cancelled, queued,
@@ -401,8 +402,9 @@ unexpected exceptions must conservatively become outcome_unknown in the broker.
 A rejected send is NOT proof that an earlier broadcast didn't execute. Only
 positive ChainOutcome.not_executed evidence unlocks a replacement attempt.
 
-Broadcast acknowledgment -> submitted; final chain execution evidence -> succeeded
-or failed. Timeout/unclassified response -> **outcome_unknown**, keeps the hold,
+A broadcast acknowledgment moves the request to submitted. Final chain execution
+evidence moves it to succeeded or failed. A timeout or unclassified response moves
+it to **outcome_unknown**, which keeps the hold,
 nonce and signed bytes until final evidence. Actual transaction + receipt gas and
 tokens burnt (not gas-price estimates) are aggregated once and charged to the
 requesting agent's gasBudget24h **even on failure**. Principals count as spent
@@ -491,8 +493,8 @@ parallel code vocabulary. Return stable codes, not raw RPC/SQL/stack/secret data
   owner replay. Accounting has a paged read. getWalletStatus is owner/internal;
   no arbitrary asynchronous transactions or generic request-state patch.
 - PolicyEvaluator: pure decision from explicit snapshot/time.
-- Authenticator: token -> AgentPrincipal; owner actual-request verification,
-  replay consumption -> OwnerPrincipal.
+- Authenticator: turns a token into an AgentPrincipal, and turns a verified owner
+  request, after replay consumption, into an OwnerPrincipal.
 - AuditSigner (B04): sync hash signer shared by ReceiptLog and CheckpointLog.
 - ReceiptLog: sync transactional append; list/verify chain and single receipt;
   expose auditPublicKey for independently verified exports.

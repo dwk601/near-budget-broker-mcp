@@ -1,172 +1,64 @@
 # B06 broker integration and safety boundaries
 
-Construct `BrokerService` with Store, NearChain, unlocked CustodySigner,
-ReceiptLog, ApprovalService, CheckpointLog, Clock and account/fee/freshness config.
-Principals come from B03 authentication, never principal-shaped JSON. Components
-share the same database and audit trust root. Await `start()` before serving.
+Construct `BrokerService` with a Store, a NearChain, an unlocked CustodySigner, a ReceiptLog, an ApprovalService, a CheckpointLog, a Clock, and the account, fee, and freshness config. Principals come from B03 authentication, never from JSON that looks like a principal. All components share one database and one audit trust root. Await `start()` before serving.
 
-`requestTransfer`/`approve` drain by default; set `autoDispatch: false` for daemon
-scheduling. Schedule repeated `drain()` calls for reconciliation/expiry and durable
-resolution watches. `expirePending()` is also available separately. No broker-owned
-timers, servers or background promises survive a call. Stop scheduling and await
-work before locking custody/closing Store.
+`requestTransfer` and `approve` drain the queue by default. Set `autoDispatch: false` when the daemon schedules dispatch itself. Schedule repeated `drain()` calls to drive reconciliation, expiry, and durable resolution watches. `expirePending()` is also available on its own. The broker owns no timers, servers, or background promises that outlive a call. Stop scheduling and await in-flight work before you lock custody or close the Store.
 
 ## Dispatch and balance
 
-The per-key pump serializes drain/recovery/resolution. A separate per-attempt lane
-serializes owner freeze/policy/revocation/approval mutations with authorization,
-signing, durable intent and broadcast. FINAL polling is outside that lane; owner
-mutations do not wait behind the entire queue. Queue state is reread every attempt.
+A per-key pump runs drain, recovery, and resolution one at a time. A separate per-attempt lane serializes owner freeze, policy, revocation, and approval writes with authorization, signing, durable intent, and broadcast. FINAL polling happens outside that lane, so owner writes do not wait behind the whole queue. Each attempt rereads the queue state.
 
-Balance refresh is single-flight per custody key across connections, with one
-admission lane entry and a 250 ms failure cache. Preview shares an ephemeral RPC
-cache but writes no rows. Settlement invalidates that cache and in-flight older
-preview generations, so an old RPC cannot overwrite the conservative debit.
-Observation timestamps never gain freshness from caching. Stale-only capacity
-failure pauses admitted work (including never-offered work), never abandons it.
+Balance refresh runs one request at a time per custody key across connections, with one admission lane entry and a 250 ms failure cache. Preview shares a short-lived RPC cache but writes no rows. Settlement invalidates that cache and any older preview reads still in flight, so a stale RPC result cannot overwrite the conservative debit. Caching never makes an observation look fresher than it is. If capacity fails only because the balance is stale, the broker pauses admitted work, including work never offered, and never abandons it.
 
 ## Proof and replay
 
-Only persisted bytes are offered. Every offer first durably updates
-`lastOfferedAt` and increments `offerCount`; byte-identical retries reuse the first
-signed intent receipt. Both broker and real adapter pre-send attestations run
-BEFORE intent through the optional `BroadcastPreparation` capability. Its one-shot
-closure submits only already validated bytes, after the broker records intent.
-A failure at either pre-offer boundary retries the same stored bytes promptly;
-there is no offer count/timestamp or 60-second replay delay to undo.
-New attempts explicitly store null before intent, avoiding receipt-chain scans.
-Legacy rows recover intent/offer time once per changed chain head. An early send
-return leaves signed/never-offered state, not a false outcome_unknown receipt.
+The broker offers only bytes it has persisted. Before every offer it durably updates `lastOfferedAt` and increments `offerCount`. Retries of identical bytes reuse the first signed intent receipt. Both the broker's and the real adapter's pre-send checks run before the intent is recorded, through the optional `BroadcastPreparation` capability. Its one-shot closure submits only bytes already validated, after the broker records intent. If either pre-offer check fails, the broker retries the same stored bytes promptly, because no offer count, timestamp, or 60-second replay delay was recorded that would need undoing.
 
-Status is checked every drain. After an offer, identical-byte retries/exclusion
-wait at least 60,000 ms. Both proof paths bind signed identity and require a
-retrievable anchor/history; missing/GC history never proves absence.
+New attempts store null explicitly before intent, which avoids scanning the receipt chain. Legacy rows recover their intent and offer time once per change of chain head. If the send returns early, the attempt stays signed and never offered, and no false `outcome_unknown` receipt is written.
 
-* NONCE proof still requires sole-first-offer InvalidNonce/Expired rejection
-  provenance plus a pinned FINAL consumed nonce. InvalidNonce provenance requires
-  payload tx_nonce equal to this signed nonce and ak_nonce STRICTLY GREATER than
-  tx_nonce; equality can be a hidden acceptance followed by a gateway retry. The
-  adapter preserves bounded nonce details in its canonical rejection reason;
-  strict first-validation evidence is retained in nonExecutionEvidence and full
-  later proof facts in signed receipts. Bare legacy flags do not qualify.
-  Rejected replays never acquire first provenance, which cannot be erased.
-* EXPIRY proof applies to any offer count, including ambiguous 504/timeouts and
-  other definitive first-offer InvalidTxError kinds (e.g. NotEnoughBalance). Require
-  a FINAL-head-pinned access-key nonce STRICTLY LESS than the attempt nonce,
-  FINAL head >= anchor height + protocol validity + 1,000 safety blocks, signing
-  age >= validity * 1,000 ms (nominal one-second testnet block), and two definitive
-  UNKNOWN_TRANSACTION lookups spaced >=1,000 ms. Keep the 60s last-offer age too.
-  Signing age is immutable and is not reset by replay. Positive visibility,
-  missing anchor/key, unpinned key, consumed nonce, RPC failure or insufficient
-  margin/age/spacing vetoes proof. Expiry alone cannot disprove prior execution.
+The broker checks status on every drain. After an offer, it waits at least 60,000 ms before retrying identical bytes or attempting exclusion. Both proof paths bind the signed identity and need retrievable anchor history. Missing or garbage-collected history never proves absence.
 
-Expiry observations trust complete, consistent retained FINAL history from the
-configured RPC, not a cryptographic absence proof from arbitrary indexer silence.
-This bounded expiry path prevents a dropped first offer from locking funds forever.
-Known rejected bytes wait for proof rather than destroying their provenance.
+* The NONCE proof still requires that the first and only offer was rejected with `InvalidNonce` or `Expired`, and a pinned FINAL consumed nonce. `InvalidNonce` evidence requires the payload `tx_nonce` to equal this attempt's signed nonce and `ak_nonce` to be strictly greater than `tx_nonce`. Equal values could mean the transaction was accepted silently and a gateway then retried it. The adapter keeps bounded nonce details in its canonical rejection reason. The strict first-validation evidence is kept in `nonExecutionEvidence`, and the full later proof facts go in signed receipts. Bare legacy flags do not qualify. A rejected replay never gains first-offer status, and that record cannot be erased.
+* The EXPIRY proof applies to any number of offers. That includes ambiguous 504s and timeouts, and other definitive first-offer `InvalidTxError` kinds such as `NotEnoughBalance`. It requires:
+  * an access-key nonce, pinned to the FINAL head, strictly less than the attempt nonce
+  * a FINAL head at or above the anchor height plus the protocol validity period plus 1,000 safety blocks
+  * a time since signing of at least the validity period times 1,000 ms, which assumes the nominal one-second testnet block
+  * two definitive `UNKNOWN_TRANSACTION` lookups at least 1,000 ms apart
+  * the 60-second minimum age since the last offer
 
-Persisted proof is not permanent authority. Replacement signing and full spaced
-proofs run OUTSIDE the custody mutation lane while the per-key pump remains held.
-A freeze/revoke can acknowledge during the proof sleep. Only the no-sleep final
-visibility/FINAL-head/pinned-key recheck, authority check, persistence and offer
-remain inside the lane. The native adapter requires a matching full observation
-<=5s old for that capability and always re-reads mutable chain facts; it does not
-return cached absence as authority. Adapters lacking the final-recheck capability
-fail closed without replacement signing. Final RPC/broadcast latency still bounds
-acknowledgment during that final critical section. Fresh evidence is receipted
-atomically with replacement. Newly visible execution of the unreplaced
-current proof corrects its status and is charged, never re-signed/broadcast anew.
-Prior evidence and signed identity are retained. Proven work whose replacement is
-no longer authorized may fail with zero burn/release only against fresh proof.
+  The signing time never changes, and a replay does not reset it. Any of these blocks the proof: a visible transaction, a missing anchor or key, an unpinned key, a consumed nonce, an RPC failure, or too little margin, age, or spacing. Expiry alone cannot disprove an earlier execution.
 
-A NEVER-OFFERED attempt can be permanently abandoned on agent freeze/revocation
-or hard policy failure. **Unfreeze does not restore that failed request.** A fresh
-request/idempotency key is needed if later permitted. Global freeze pauses work;
-already-offered ambiguity cannot use broker abandonment.
+Expiry observations trust that the configured RPC holds complete, consistent FINAL history. Silence from an arbitrary indexer is not treated as cryptographic proof of absence. This bounded expiry path stops a dropped first offer from locking funds forever. Bytes known to be rejected wait for a proof rather than discarding the rejection record.
+
+A stored proof does not stay valid forever. Replacement signing and the full spaced proofs run outside the custody mutation lane while the per-key pump stays held, so a freeze or revocation can be acknowledged during the proof's sleep. Only the final recheck runs inside the lane. That recheck covers visibility, the FINAL head, and the pinned key, with no sleep, followed by the authority check, persistence, and the offer. For that capability the native adapter needs a matching full observation no more than 5 seconds old, and it always rereads mutable chain facts. It never returns a cached absence as authority. Adapters without the final-recheck capability fail closed and do not sign a replacement. RPC and broadcast latency in that final section still delays acknowledgment.
+
+The broker writes fresh evidence to a receipt in the same transaction as the replacement. If the current proof's transfer becomes visible as executed before a replacement, the broker corrects its status and charges it, and never signs or broadcasts it again. Earlier evidence and the signed identity are kept. If proven work is no longer authorized for replacement, it may fail with zero burn and a released hold, but only against fresh proof.
+
+An attempt that was never offered can be abandoned permanently on an agent freeze, a revocation, or a hard policy failure. **Unfreezing does not restore that failed request.** If the owner later permits the payment, it needs a new request and idempotency key. A global freeze pauses work. Ambiguous work that was already offered cannot be abandoned by the broker.
 
 ## Owner resolution and late execution
 
-`resolveAttempt(owner,id,reason,force=false)` requires fresh, aged exclusion:
-definitive UNKNOWN_TRANSACTION, retained history and either first-rejected nonce
-proof or expiry with an unconsumed pinned nonce. It cannot normally resolve an
-unreachable chain. Positive pending/final execution always vetoes resolution.
+`resolveAttempt(owner,id,reason,force=false)` requires fresh, aged exclusion evidence: a definitive `UNKNOWN_TRANSACTION`, retained history, and either the first-rejection nonce proof or the expiry proof with an unconsumed pinned nonce. It normally cannot resolve an attempt while the chain is unreachable. Evidence that the transfer is pending or executed always blocks resolution.
 
-Explicit `force=true` may retire an uncertain lane item, but **retains the entire
-principal+fee hold** until fresh exclusion or final execution. It cannot free the
-same budget for another payment. Both chains receive failed-resolution receipts
-with force/holdRetained flags, basis and required reason. Audit failure rolls back
-the operation. Force never creates a replacement. Exception: a forced NEVER-OFFERED
-attempt uses broker abandonment, releases its hold, and creates no watch. Visible
-success/failure/pending always vetoes even that force path.
+With `force=true` the owner may remove an uncertain item from the lane, but **the whole principal and fee hold stays** until fresh exclusion evidence or the final execution appears. The same budget cannot be freed for another payment. Both chains get failed-resolution receipts with the force and holdRetained flags, the basis, and the required reason. If the audit write fails, the operation rolls back. Forcing never creates a replacement. The exception is an attempt that was never offered. Forcing it goes through broker abandonment, which releases its hold and creates no watch. A visible success, failure, or pending transaction still blocks that path.
 
-Conservative consequence: if A is force-retired while ambiguous and a later B
-payment consumes a higher nonce, A's hold may remain ACTIVE PERMANENTLY. Even if
-A's first send was really dropped, current nonce >= A's nonce cannot distinguish
-that from an indexed-late execution of A. Expiry/time/horizon or negative archival
-lookups do not refund that budget. Positive final visibility can settle it; this
-API deliberately adds no owner write-off or blind release action.
+This design has a conservative consequence. Suppose A is force-retired while ambiguous, and a later payment B uses a higher nonce. A's hold may then stay active forever. Even if A's first send was really dropped, a current nonce at or above A's nonce cannot tell that apart from a late-indexed execution of A. Expiry, elapsed time, the watch limit, and negative archival lookups do not refund that budget. Only positive final visibility can settle it. The API deliberately has no owner write-off or blind release.
 
-Resolved offered attempts are automatically watched for 60 hours from signing or
-the latest offer, covering nominal testnet validity + margin up to the approximate
-five-epoch GC horizon. A receipt-tail index (replayed once on restart, then consumed
-incrementally) avoids scanning all failed requests every drain. Automatic watches
-stop at the horizon; uncertain holds are NOT released just because time elapsed.
-Explicit reconcile(id) remains available beyond the horizon, e.g. with an archival
-RPC. Once the hold is released, watches make only the cheap visibility RPC;
-they do not repeatedly fetch anchor/key/protocol or sleep to re-prove exclusion.
-Watches never broadcast. Actual late
-success/failure corrects the resolved request/attempt/hold through the narrow
-`Store.correctResolvedExecution` seam, charges actual principal/tokensBurnt once,
-appends signed lateResolution receipts to both chains, and globally freezes for
-owner review. Other terminal requests/holds remain immutable. Legacy zero gas
-charges are corrected with positive append-only `gas_correction` entries, not
-history rewrites. Old signed resolution receipts enroll legacy watches on restart.
-An exhausted standing grant cannot block recording a real late loss: principal/gas
-accounting remains authoritative; revoke the overrun grant so owner unfreeze cannot
-reuse stale remaining standing capacity. The freeze requires overrun reconciliation.
+The broker watches resolved offered attempts automatically for 60 hours from signing or the latest offer. That covers the nominal testnet validity period plus a margin, up to the approximate five-epoch garbage-collection horizon. A receipt-tail index, replayed once on restart and then consumed incrementally, avoids scanning every failed request on each drain. Automatic watches stop at the horizon, and the broker does **not** release uncertain holds just because time passed. `reconcile(id)` still works after the horizon, for example against an archival RPC. Once a hold is released, watches make only the cheap visibility RPC call and do not refetch the anchor, key, or protocol or sleep to prove exclusion again. Watches never broadcast.
 
-`reconcile` examines only existing attempts/watches, respects request IDs, returns
-only examined requests and never dispatches unrelated queued payments. Standing
-grants remain bound to the original decision; benign approval revision drift is
-`POLICY_CHANGED`. Backwards clocks skip newer pending expirations.
+When a late success or failure appears, the broker corrects the resolved request, attempt, and hold through the narrow `Store.correctResolvedExecution` method. It charges the actual principal and `tokensBurnt` once, appends signed `lateResolution` receipts to both chains, and sets a global freeze for owner review. Other finished requests and holds stay unchanged. Legacy zero gas charges get positive append-only `gas_correction` entries instead of a history rewrite. On restart, old signed resolution receipts enroll legacy watches. An exhausted standing grant cannot block recording a real late loss, because principal and gas accounting take priority. The broker revokes the overrun grant so that an owner unfreeze cannot reuse stale standing capacity. Clearing the freeze requires reconciling the overrun.
+
+`reconcile` examines only existing attempts and watches, respects the request IDs it is given, returns only the requests it examined, and never dispatches unrelated queued payments. Standing grants stay bound to the original decision, and harmless drift in the approval revision returns `POLICY_CHANGED`. If the clock moves backwards, the broker skips expiring pending requests that now look newer.
 
 ## Deployment and compatible amendments
 
-* B08 must enforce **one daemon process per custody key**, e.g. an exclusive lock.
-  Multiple broker connections in that process are supported. Active-active needs
-  durable fenced leadership; SQLite alone cannot serialize cross-process freeze
-  versus broadcast. One database/trust root backs that custody key.
-* Reads do not manufacture mutation receipts (`owner_operation` is not in the
-  schema); idempotent B12 standing revocation stays a no-op, as review accepted.
-* Receipt-array export remains compatible; B08 can list B13 checkpoints for
-  external pinning. Embedded verification keys are not independent trust roots.
-* Authorized N2 storage changes are scoped positive-proof/late-resolution
-  corrections, monotonic offer metadata and append-only gas corrections. Optional
-  attempt JSON fields require no database migration. Generic terminal transitions,
-  released-hold resurrection and immutable signed bytes are still protected.
+* B08 must enforce **one daemon process per custody key**, for example with an exclusive lock. Several broker connections inside that process are fine. Active-active would need durable fenced leader election, because SQLite alone cannot order a freeze in one process against a broadcast in another. One database and trust root backs each custody key.
+* Reads never create mutation receipts, and `owner_operation` is not in the schema. Revoking an already revoked B12 standing grant stays a no-op, as the review accepted.
+* The receipt array export stays compatible, and B08 can list B13 checkpoints for external pinning. Verification keys embedded in an export are not independent trust roots.
+* The authorized N2 storage changes are limited to positive-proof and late-resolution corrections, offer metadata that only increases, and append-only gas corrections. The new optional attempt JSON fields need no database migration. Generic terminal transitions, revival of released holds, and changes to signed bytes are still blocked.
 
 ## Regression and mutation verification
 
-F1–F12 tests remain. `safety.test.ts` covers N1–N10, stale/offline pause, coalescing,
-force budgets, restart/legacy/late accounting and all new concurrency survivors.
-Real NativeNearChain plus encrypted custody/fake RPC tests cover GC, lag and
-execution becoming visible during replacement signing, besides Expired,
-InvalidNonce, dropped 504, other InvalidTxError and transient pre-send failures.
-`followup.test.ts` covers Q11/Q02/Q36/Q19/Q39/Q43 plus watch indexing/horizon,
-pre-offer retries and forced never-offered release. `correction-guards.test.ts`
-independently pins every request/attempt immutable, fee equality, requestId and
-hold-status guard. Redundant ID lookups are fault-injected with corrupt JSON row
-identity to test fail-closed behavior independently, not counted as healthy-row
-attack paths. Storage tests use real SqliteStore; no storage/schema amendment.
+Tests F1 to F12 remain. `safety.test.ts` covers N1 to N10, pausing on stale or offline balance, request coalescing, force budgets, restart, legacy and late accounting, and every new concurrency survivor. Tests with the real NativeNearChain, encrypted custody, and a fake RPC cover garbage collection, lag, and execution becoming visible during replacement signing. They also cover `Expired`, `InvalidNonce`, a dropped 504, other `InvalidTxError` kinds, and transient pre-send failures. `followup.test.ts` covers Q11, Q02, Q36, Q19, Q39, and Q43, plus watch indexing and the horizon, pre-offer retries, and forced release of never-offered work. `correction-guards.test.ts` separately pins every request and attempt immutability guard, fee equality, requestId, and the hold status guard. Redundant ID lookups get fault injection with corrupt JSON row identity, to test that they fail closed on their own. They are not counted as attack paths on healthy rows. Storage tests use the real SqliteStore, and no storage or schema change was made.
 
-`npx tsx test/broker/mutations.ts` operates ONLY on an isolated temporary copy of
-source/tests, never worktree src (even if killed). Review IDs lack patch files,
-so mutations are explicitly semantic reconstructions. The runner verifies real
-assertion failures, cleans the temporary copy and checks worktree source bytes.
-The real fake-RPC send_tx handler checks durable offerCount/lastOfferedAt BEFORE
-accepting any bytes, with an out-of-band assertion to prevent RPC error sanitizing
-from hiding that ordering violation. Prepared-submit one-shot/account binding,
-strict nonce provenance, and freeze acknowledgment during the replacement proof
-sleep are explicitly mutation-tested.
-MCP/HTTP suites are included as integration regressions. B08 deployment/CLI paths
-remain outside B06F's ownership.
+`npx tsx test/broker/mutations.ts` works only on an isolated temporary copy of the source and tests and never touches the worktree `src`, even if killed. The review IDs have no patch files, so the mutations are semantic reconstructions. The runner checks that real assertions fail, removes the temporary copy, and checks the worktree source bytes. The fake RPC's `send_tx` handler checks the durable `offerCount` and `lastOfferedAt` before it accepts any bytes, and asserts out of band so that RPC error sanitizing cannot hide a wrong ordering. The mutation tests explicitly cover the one-shot prepared submit and its account binding, strict nonce evidence, and acknowledging a freeze during the replacement proof's sleep. The MCP and HTTP suites run as integration regression tests. B08 deployment and CLI paths are outside B06F's scope.
