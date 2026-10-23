@@ -10,7 +10,7 @@ import { AuditSigner, ReceiptLog } from '../../src/audit/core/index.js';
 import { CheckpointLog } from '../../src/audit/checkpoints/index.js';
 import { TransactionalApprovalService } from '../../src/approvals/index.js';
 import { RequestAuthenticator, generateOwnerKeypair } from '../../src/auth/index.js';
-import { parseNear } from '../../src/contracts/index.js';
+import { parseNear, canonicalJson } from '../../src/contracts/index.js';
 import type {
   AccountBalance, AgentPolicy, AgentPrincipal, BroadcastResult, ChainOutcome, Clock,
   CustodySigner, NativeTransferToSign, NearChain, OwnerPrincipal, SignedNativeTransfer,
@@ -59,7 +59,8 @@ export class FakeChain implements NearChain {
     if (this.mode === 'throw') throw new Error('network');
     if (this.mode === 'unknown') return { kind: 'outcome_unknown', txHash, reason: 'timeout' };
     if (this.mode === 'invalid' || this.mode === 'expired') return { kind: 'rejected', txHash,
-      code: this.mode === 'invalid' ? 'INVALID_NONCE' : 'EXPIRED_BLOCK_HASH', reason: 'node rejected THIS send' };
+      code: this.mode === 'invalid' ? 'INVALID_NONCE' : 'EXPIRED_BLOCK_HASH', reason: this.mode === 'invalid'
+        ? canonicalJson({ code: 'INVALID_NONCE', tx_nonce: signed.transfer.nonce.toString(), ak_nonce: (signed.transfer.nonce + 1n).toString() }) : 'EXPIRED_BLOCK_HASH' };
     if (!this.paid.has(txHash)) {
       if (signed.transfer.nonce <= this.nonce) throw new Error('nonce error');
       this.nonce = signed.transfer.nonce;
@@ -72,6 +73,7 @@ export class FakeChain implements NearChain {
     return { kind: 'accepted', txHash };
   }
   async txStatus(txHash: string): Promise<ChainOutcome> { return this.outcomes.get(txHash) ?? { kind: 'outcome_unknown', reason: 'no positive evidence' }; }
+  async recheckExclusion(attempt: import('../../src/contracts/index.js').TxAttempt): Promise<ChainOutcome> { return this.txStatus(attempt.txHash); }
   classifyOutcome(value: unknown) { return value as ChainOutcome; }
 }
 export class Fixture {

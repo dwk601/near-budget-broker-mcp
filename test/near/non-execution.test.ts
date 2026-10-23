@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest';
 import { KeyPair, baseEncode } from 'near-api-js';
 import { NativeNearChain } from '../../src/near/index.js';
+import { canonicalJson } from '../../src/contracts/index.js';
 import type { TxAttempt } from '../../src/contracts/index.js';
 const hash = (i: number) => baseEncode(new Uint8Array(32).fill(i));
 const pair = KeyPair.fromRandom('ed25519'); const publicKey = pair.getPublicKey().toString();
@@ -33,9 +34,9 @@ async function fixture(options: { nonce?: string; height?: string; validity?: st
     nonce: 5n, publicKey, blockHash: hash(1) }, { publicKey, sign: async (bytes) => pair.sign(bytes).signature });
   txHash = signed.txHash;
   const attempt: TxAttempt = { id: 't', requestId: 'r', nonce: 5n, publicKey, blockHash: hash(1), signedTxBase64: signed.signedTxBase64,
-    txHash, status: 'outcome_unknown', receiptIds: [], gasBurnt: null, tokensBurnt: null, createdAt: options.createdAt ?? 1, updatedAt: 1, nonExecutionEvidence: null, lastOfferedAt: options.lastOfferedAt ?? 1, offerCount: 1,
+    txHash, status: 'outcome_unknown', receiptIds: [], gasBurnt: null, tokensBurnt: null, createdAt: options.createdAt ?? 1, updatedAt: 1, nonExecutionEvidence: options.nonce === '5' ? 'FIRST_INVALID_NONCE:' + canonicalJson({ code: 'INVALID_NONCE', tx_nonce: '5', ak_nonce: '6' }) : null, lastOfferedAt: options.lastOfferedAt ?? 1, offerCount: 1,
     firstRejection: options.nonce === '5' ? 'INVALID_NONCE' : 'EXPIRED_BLOCK_HASH' };
-  return { chain, attempt, calls, lookupTimes };
+  return { chain, attempt, calls, lookupTimes, advance: (ms: number) => { now += ms; } };
 }
 it('Expired: retained anchor plus validity + 1000-block margin and spaced negative lookups yields proof', async () => {
   const { chain, attempt, calls, lookupTimes } = await fixture();
@@ -115,6 +116,31 @@ it.each([{ keyError: true }, { wrongHead: true }])('F1 expiry requires a retriev
 it('M1 expiry of ambiguous replayed bytes still fails closed on GC history', async () => {
   const { chain, attempt } = await fixture({ gcAnchor: true, nonce: '5' });
   expect((await chain.txStatus(attempt.txHash, 'broker.testnet', { ...attempt, offerCount: 3, firstRejection: undefined })).kind).toBe('outcome_unknown');
+});
+it('fast exclusion recheck requires a matching recent full proof and never repeats its spacing sleep', async () => {
+  const { chain, attempt, calls, lookupTimes, advance } = await fixture();
+  expect((await chain.recheckExclusion(attempt)).kind).toBe('outcome_unknown');
+  expect((await chain.txStatus(attempt.txHash, 'broker.testnet', attempt)).kind).toBe('not_executed');
+  const before = calls.length; const clock = lookupTimes.at(-1)!;
+  expect((await chain.recheckExclusion(attempt)).kind).toBe('not_executed');
+  expect(calls.slice(before)).toEqual(['tx', 'status', 'block', 'query', 'tx']);
+  expect(lookupTimes.at(-1)).toBe(clock);
+  const after = calls.length;
+  expect((await chain.recheckExclusion({ ...attempt, offerCount: 2 })).kind).toBe('outcome_unknown');
+  advance(5001); expect((await chain.recheckExclusion(attempt)).kind).toBe('outcome_unknown');
+  expect(calls).toHaveLength(after);
+});
+it('fast recheck vetoes newly consumed nonce or positive visibility instead of trusting cached exclusion', async () => {
+  const options = { nonce: '0', txError: unknown as unknown };
+  const { chain, attempt } = await fixture(options);
+  expect((await chain.txStatus(attempt.txHash, 'broker.testnet', attempt)).kind).toBe('not_executed');
+  options.nonce = '5'; expect((await chain.recheckExclusion(attempt)).kind).toBe('outcome_unknown');
+  options.txError = { result: { transaction: { hash: attempt.txHash, signer_id: 'broker.testnet' } } };
+  expect((await chain.recheckExclusion(attempt)).kind).toBe('pending');
+});
+it('old bare InvalidNonce flags cannot substitute for strict numeric rejection provenance', async () => {
+  const { chain, attempt } = await fixture({ nonce: '5' });
+  expect((await chain.txStatus(attempt.txHash, 'broker.testnet', { ...attempt, nonExecutionEvidence: null })).kind).toBe('outcome_unknown');
 });
 it('persisted bytes must bind hash, signer, nonce and block, including on a fresh adapter', async () => {
   const { chain, attempt } = await fixture();

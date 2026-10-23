@@ -12,7 +12,7 @@ import type {
   Freeze, FreezeTarget, NearChain, OwnerPrincipal, Page, PageQuery, PolicyDecision,
   PolicyEvaluationInput, ReceiptEvent, ReceiptLog, RequestFilter, StandingApprovalGrant,
   Store, StoreReader, StoreTransaction, TransferInput, TransferRequest, TransferView,
-  TxAttempt, ChainOutcome,
+  TxAttempt, ChainOutcome, SignedNativeTransfer,
 } from '../contracts/index.js';
 import { issueAgentToken, revokeAgentToken, rotateAgentToken } from '../auth/index.js';
 import {
@@ -20,7 +20,8 @@ import {
 } from '../approvals/index.js';
 import { PurePolicyEvaluator } from '../policy/index.js';
 import { custodyLane, custodyPump } from './lane.js';
-import type { BroadcastPreparation } from '../near/index.js';
+import type { BroadcastPreparation, ExclusionRecheck } from '../near/index.js';
+import { isDefinitiveFirstRejection, invalidNonceEvidence } from '../near/index.js';
 import { balanceState, fetchBalance, invalidateBalance } from './balance.js';
 
 export interface BrokerOptions {
@@ -576,7 +577,7 @@ export class BrokerService implements BrokerPort {
     // repeats this evaluation after awaits, immediately before persisting bytes.
     return request;
   }
-  private async sign(request: TransferRequest, prior?: TxAttempt): Promise<TxAttempt | null> {
+  private async buildSigned(request: TransferRequest): Promise<SignedNativeTransfer> {
     await this.attest();
     const access = await this.chainCall(() => this.o.chain.viewAccessKey(this.o.config.accountId, this.o.signer.publicKey));
     if (!access.fullAccess || access.publicKey !== this.o.signer.publicKey) throw new BrokerError('FORBIDDEN');
@@ -589,29 +590,14 @@ export class BrokerService implements BrokerPort {
       || signed.transfer.publicKey !== this.o.signer.publicKey || signed.transfer.receiverId !== request.receiverId
       || signed.transfer.amount !== request.amount || signed.transfer.blockHash !== block.hash) throw new BrokerError('FORBIDDEN');
     this.o.chain.encodeSignedTx(signed);
-    let replacementProof: Extract<ChainOutcome, { kind: 'not_executed' }> | null = null;
-    if (prior) {
-      // A persisted exclusion observation is NOT an enduring authorization to
-      // replace. Re-query AFTER all async build/sign work, immediately before
-      // the replacement transaction. Positive visibility corrects the old proof.
-      let current = await this.status(prior);
-      if (current.kind === 'not_executed' && this.o.store.read((r) => this.stale(r))) {
-        // Spaced expiry lookups can age a short-lived balance snapshot. Refresh
-        // it, then reverify exclusion again so NO async RPC follows the final
-        // proof before the atomic replacement transaction.
-        await this.refreshLocked();
-        current = await this.status(prior);
-      }
-      if (current.kind !== 'not_executed') {
-        if (current.kind === 'succeeded' || current.kind === 'failed') this.settle(prior, current);
-        else if (current.kind === 'pending') this.o.store.withImmediateTransaction((tx) => {
-          tx.putAttempt({ ...prior, status: 'submitted', updatedAt: this.o.clock.now() });
-          this.acknowledged(tx, must(tx.getRequest(prior.requestId)), prior);
-        });
-        return null;
-      }
-      replacementProof = current;
-    }
+    return signed;
+  }
+  private async sign(request: TransferRequest): Promise<TxAttempt | null> {
+    return this.persistSigned(request, await this.buildSigned(request));
+  }
+  private persistSigned(request: TransferRequest, signed: SignedNativeTransfer, prior?: TxAttempt,
+    replacementProof?: Extract<ChainOutcome, { kind: 'not_executed' }>): TxAttempt | null {
+    const { nonce, blockHash } = signed.transfer;
     return this.o.store.withImmediateTransaction((tx) => {
       const current = must(tx.getRequest(request.id));
       if (!prior && current.state !== 'queued') return null; // cancelled during custody await
@@ -631,7 +617,7 @@ export class BrokerService implements BrokerPort {
       }
       const now = this.o.clock.now();
       const attempt: TxAttempt = { id: randomUUID(), requestId: request.id, nonce, publicKey: this.o.signer.publicKey,
-        blockHash: block.hash, signedTxBase64: signed.signedTxBase64, txHash: signed.txHash, status: 'signed', receiptIds: [],
+        blockHash, signedTxBase64: signed.signedTxBase64, txHash: signed.txHash, status: 'signed', receiptIds: [],
         gasBurnt: null, tokensBurnt: null, createdAt: now, updatedAt: now, nonExecutionEvidence: null, lastOfferedAt: null, offerCount: 0, resolutionWatch: false };
       if (prior) {
         // Replacement retains the exact approval binding. Never silently switch
@@ -724,8 +710,8 @@ export class BrokerService implements BrokerPort {
     }
     // Rejection is not proof. Query status outside the lane before replacement.
     const rejected = result.kind === 'rejected' && result.txHash === attempt.txHash && ready.offerCount === 1
-      && (result.code === 'INVALID_NONCE' || result.code === 'EXPIRED_BLOCK_HASH')
-      ? { ...ready, firstRejection: result.code } : ready;
+      && isDefinitiveFirstRejection(result, ready.nonce)
+      ? { ...ready, firstRejection: result.code, nonExecutionEvidence: invalidNonceEvidence(result, ready.nonce) ?? ready.nonExecutionEvidence } : ready;
     this.unknown(rejected, 'Broadcast acknowledgment unavailable');
     return true;
   }
@@ -918,9 +904,9 @@ export class BrokerService implements BrokerPort {
         this.o.store.withImmediateTransaction((tx) => {
           const current = must(tx.getRequest(attempt.requestId));
           if (current.state !== 'outcome_unknown') tx.updateRequest({ ...current, state: 'outcome_unknown', updatedAt: this.o.clock.now() }, current.state);
-          tx.putAttempt({ ...attempt, status: 'proven_not_executed', nonExecutionEvidence: outcome.evidence, updatedAt: this.o.clock.now() });
+          tx.putAttempt({ ...attempt, status: 'proven_not_executed', nonExecutionEvidence: attempt.nonExecutionEvidence ?? outcome.evidence, updatedAt: this.o.clock.now() });
           this.event(tx, { type: 'outcome_unknown', payload: { requestId: current.id, agentId: current.agentId,
-            attemptId: attempt.id, txHash: attempt.txHash, reason: 'Positive non-execution evidence; replacement pending' } }, current.agentId);
+            attemptId: attempt.id, txHash: attempt.txHash, reason: `Positive non-execution evidence; replacement pending: ${outcome.evidence}` } }, current.agentId);
         });
         return false; // durable proof boundary; at most one replacement per drain
       }
@@ -963,12 +949,7 @@ export class BrokerService implements BrokerPort {
         return null; // already offered: a per-agent freeze cannot undo ambiguity
       }
       let send = attempt;
-      if (attempt.status === 'proven_not_executed') {
-        const replacement = await this.sign(request, attempt);
-        if (!replacement) return this.o.store.read((r) => ['succeeded', 'failed'].includes(must(r.getRequest(request.id)).state)) ? true : null;
-        send = replacement;
-        await this.o.hooks?.afterPersistSigned?.(send);
-      }
+      if (attempt.status === 'proven_not_executed') return 'replace' as const;
       // Poll final status on every drain, but leave time for negative RPC
       // visibility to converge between identical-byte offers. Otherwise frequent
       // rebroadcasts would keep resetting the proof-age clock forever.
@@ -982,9 +963,58 @@ export class BrokerService implements BrokerPort {
       if (!await this.send(send)) return null;
       return send;
     });
+    if (next === 'replace') return this.replace(request, attempt);
     if (next === true) return true;
     if (next === null) return false;
     const stored = this.o.store.read((r) => must(r.listAttempts(next.requestId).find((a) => a.id === next.id)));
+    return this.observe(stored, await this.status(stored));
+  }
+  private async finalExclusion(prior: TxAttempt): Promise<ChainOutcome> {
+    const chain: NearChain & Partial<ExclusionRecheck> = this.o.chain;
+    if (!chain.recheckExclusion) return { kind: 'outcome_unknown', reason: 'Adapter has no no-sleep final exclusion recheck' };
+    try {
+      const offered = this.o.store.read((r) => this.withOffer(r, prior));
+      const outcome = await chain.recheckExclusion(offered);
+      if (outcome.kind === 'not_executed' && (offered.lastOfferedAt === null || offered.lastOfferedAt === undefined
+        || this.o.clock.now() - offered.lastOfferedAt < NON_EXECUTION_MIN_AGE_MS)) return { kind: 'outcome_unknown', reason: 'Recent offer' };
+      return outcome;
+    } catch { return { kind: 'outcome_unknown', reason: 'Final exclusion recheck unavailable' }; }
+  }
+  private async replace(request: TransferRequest, prior: TxAttempt): Promise<boolean> {
+    const chain: NearChain & Partial<ExclusionRecheck> = this.o.chain;
+    if (typeof chain.recheckExclusion !== 'function') return false;
+    // The pump is held, but NOT the custody mutation lane. Signing and all spaced
+    // proofs can wait without delaying a freeze/revoke/policy acknowledgment.
+    const signed = await this.buildSigned(request);
+    await this.refresh();
+    let current = await this.status(prior);
+    if (current.kind === 'not_executed' && this.o.store.read((r) => this.stale(r))) {
+      await this.refresh(); current = await this.status(prior);
+    }
+    if (current.kind !== 'not_executed') {
+      return current.kind === 'outcome_unknown' ? false : this.observe(prior, current);
+    }
+    const replacement = await this.lane.run(async () => {
+      const decision = this.o.store.read((r) => this.boundDecision(r, this.evaluation(r, request, request.id)));
+      if (decision.kind !== 'allow' && decision.kind !== 'allow_via_standing_approval') return null;
+      // Only the fresh visibility/pinned-key recheck is inside this boundary.
+      // The real adapter never performs a spacing sleep in this capability.
+      const final = await this.finalExclusion(prior);
+      if (final.kind !== 'not_executed') {
+        if (final.kind === 'succeeded' || final.kind === 'failed') this.settle(prior, final);
+        else if (final.kind === 'pending') this.o.store.withImmediateTransaction((tx) => {
+          tx.putAttempt({ ...prior, status: 'submitted', updatedAt: this.o.clock.now() });
+          this.acknowledged(tx, must(tx.getRequest(prior.requestId)), prior);
+        });
+        return null;
+      }
+      const attempt = this.persistSigned(request, signed, prior, final);
+      if (!attempt) return null;
+      await this.o.hooks?.afterPersistSigned?.(attempt);
+      return await this.send(attempt) ? attempt : null;
+    });
+    if (!replacement) return this.o.store.read((r) => ['succeeded', 'failed'].includes(must(r.getRequest(request.id)).state));
+    const stored = this.o.store.read((r) => must(r.listAttempts(request.id).find((a) => a.id === replacement.id)));
     return this.observe(stored, await this.status(stored));
   }
   private settle(attempt: TxAttempt, outcome: Extract<ChainOutcome, { kind: 'succeeded' | 'failed' }>): void {

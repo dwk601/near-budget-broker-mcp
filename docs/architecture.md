@@ -648,9 +648,15 @@ RPC's retained, consistent final history, not arbitrary indexer absence.
 For the NONCE path, minimum age/retained history alone are insufficient: prolonged
 lookup lag can hide an accepted transaction. A nonce-based exclusion additionally
 requires durable offerCount=1 and definitive firstRejection (INVALID_NONCE or
-EXPIRED_BLOCK_HASH) from that sole offer. Missing legacy counters never establish
-this provenance; rejected rebroadcasts cannot become first rejections. Those
-provenance records remain immutable.
+EXPIRED_BLOCK_HASH) from that sole offer. For InvalidNonce, preserve the actual
+tx_nonce/ak_nonce payload: tx_nonce must bind this signed nonce and ak_nonce must
+be STRICTLY GREATER than tx_nonce. Equality may be this same transaction accepted
+behind a retrying gateway, not non-execution. Numeric details remain bounded u64
+canonical text, not arbitrary provider messages. Strict first-validation evidence
+is retained in nonExecutionEvidence; later full proof facts are signed in receipts.
+Bare legacy InvalidNonce flags without that evidence do not qualify. Missing
+legacy counters never establish provenance; rejected rebroadcasts never become
+first rejections. Provenance records remain immutable.
 
 The independent EXPIRY path applies to ANY offerCount and needs no first-rejection
 metadata. It covers an ambiguous first 504 whose bytes never reached the chain,
@@ -691,9 +697,16 @@ queries may run every drain, but identical-byte retries are spaced by the same
 minimum age so frequent retries cannot perpetually reset the proof-age clock.
 A send-gate early return leaves the attempt signed/never-offered, not unknown.
 
-A persisted exclusion observation must be queried again on recovery, and again
-AFTER asynchronous construction/signing immediately before replacement persistence.
-Fresh exclusion evidence is receipted atomically with the replacement. Newly
+A persisted exclusion observation is re-queried on recovery. Replacement signing
+and full spaced proofs run OUTSIDE the custody mutation lane under the serialized
+pump. Only the final no-sleep recheck and persistence/offer are inside the lane.
+The real adapter's optional recheck capability requires a matching full observation
+<=5s old and re-reads tx visibility, FINAL head and pinned key facts (including a
+second fresh negative lookup after that key). Cached immutable expiry/spacing
+facts alone never authorize replacement. Freeze/revoke can acknowledge during full
+proof sleeps; final RPC/broadcast latency still bounds their final critical-section
+wait. Adapters lacking the capability fail closed, not blind re-sign. Fresh
+exclusion evidence is receipted atomically with replacement. Newly
 visible pending/final execution of the current, unreplaced proof corrects its
 attempt status while retaining earlier evidence; it must never authorize another
 payment. Store.putAttempt permits only this narrow positive correction out of
@@ -707,6 +720,12 @@ uncertain OFFERED lane item but retains the full principal+fee hold until fresh
 exclusion or actual execution. Exception: force on NEVER-OFFERED bytes abandons
 and releases after rechecking current intent in the final transaction. Positive
 pending/final execution vetoes both force paths. Receipts record force/holdRetained.
+
+A force-retired ambiguous A can retain its hold permanently after a later payment
+B consumes a higher nonce. A may truly have been dropped, but current nonce >= A's
+nonce cannot distinguish that from A having executed before B with delayed history.
+Negative lookups, expiry or the watch horizon do NOT release that budget. Positive
+actual visibility can settle it; no owner write-off action is introduced here.
 
 Offered, artificially resolved attempts carry durable resolutionWatch eligibility.
 Automatic watches stop 60 hours after signing/latest offer (nominal testnet validity

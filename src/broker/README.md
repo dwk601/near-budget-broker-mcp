@@ -43,8 +43,13 @@ wait at least 60,000 ms. Both proof paths bind signed identity and require a
 retrievable anchor/history; missing/GC history never proves absence.
 
 * NONCE proof still requires sole-first-offer InvalidNonce/Expired rejection
-  provenance plus a pinned FINAL consumed nonce. Rejected replays do not acquire
-  first-rejection provenance, and that stored provenance cannot be erased.
+  provenance plus a pinned FINAL consumed nonce. InvalidNonce provenance requires
+  payload tx_nonce equal to this signed nonce and ak_nonce STRICTLY GREATER than
+  tx_nonce; equality can be a hidden acceptance followed by a gateway retry. The
+  adapter preserves bounded nonce details in its canonical rejection reason;
+  strict first-validation evidence is retained in nonExecutionEvidence and full
+  later proof facts in signed receipts. Bare legacy flags do not qualify.
+  Rejected replays never acquire first provenance, which cannot be erased.
 * EXPIRY proof applies to any offer count, including ambiguous 504/timeouts and
   other definitive first-offer InvalidTxError kinds (e.g. NotEnoughBalance). Require
   a FINAL-head-pinned access-key nonce STRICTLY LESS than the attempt nonce,
@@ -60,9 +65,16 @@ configured RPC, not a cryptographic absence proof from arbitrary indexer silence
 This bounded expiry path prevents a dropped first offer from locking funds forever.
 Known rejected bytes wait for proof rather than destroying their provenance.
 
-Persisted proof is not permanent authority: recheck on recovery, then again after
-async signing immediately before replacement persistence. That fresh evidence is
-receipted atomically with replacement. Newly visible execution of the unreplaced
+Persisted proof is not permanent authority. Replacement signing and full spaced
+proofs run OUTSIDE the custody mutation lane while the per-key pump remains held.
+A freeze/revoke can acknowledge during the proof sleep. Only the no-sleep final
+visibility/FINAL-head/pinned-key recheck, authority check, persistence and offer
+remain inside the lane. The native adapter requires a matching full observation
+<=5s old for that capability and always re-reads mutable chain facts; it does not
+return cached absence as authority. Adapters lacking the final-recheck capability
+fail closed without replacement signing. Final RPC/broadcast latency still bounds
+acknowledgment during that final critical section. Fresh evidence is receipted
+atomically with replacement. Newly visible execution of the unreplaced
 current proof corrects its status and is charged, never re-signed/broadcast anew.
 Prior evidence and signed identity are retained. Proven work whose replacement is
 no longer authorized may fail with zero burn/release only against fresh proof.
@@ -86,6 +98,13 @@ with force/holdRetained flags, basis and required reason. Audit failure rolls ba
 the operation. Force never creates a replacement. Exception: a forced NEVER-OFFERED
 attempt uses broker abandonment, releases its hold, and creates no watch. Visible
 success/failure/pending always vetoes even that force path.
+
+Conservative consequence: if A is force-retired while ambiguous and a later B
+payment consumes a higher nonce, A's hold may remain ACTIVE PERMANENTLY. Even if
+A's first send was really dropped, current nonce >= A's nonce cannot distinguish
+that from an indexed-late execution of A. Expiry/time/horizon or negative archival
+lookups do not refund that budget. Positive final visibility can settle it; this
+API deliberately adds no owner write-off or blind release action.
 
 Resolved offered attempts are automatically watched for 60 hours from signing or
 the latest offer, covering nominal testnet validity + margin up to the approximate
@@ -144,5 +163,10 @@ attack paths. Storage tests use real SqliteStore; no storage/schema amendment.
 source/tests, never worktree src (even if killed). Review IDs lack patch files,
 so mutations are explicitly semantic reconstructions. The runner verifies real
 assertion failures, cleans the temporary copy and checks worktree source bytes.
+The real fake-RPC send_tx handler checks durable offerCount/lastOfferedAt BEFORE
+accepting any bytes, with an out-of-band assertion to prevent RPC error sanitizing
+from hiding that ordering violation. Prepared-submit one-shot/account binding,
+strict nonce provenance, and freeze acknowledgment during the replacement proof
+sleep are explicitly mutation-tested.
 MCP/HTTP suites are included as integration regressions. B08 deployment/CLI paths
 remain outside B06F's ownership.

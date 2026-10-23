@@ -11,7 +11,7 @@ async function correction() {
   const view = await f.broker.requestTransfer(agent, { ...f.input('resolved'), memo: 'original memo' }); await f.broker.drain();
   f.store.withImmediateTransaction((tx) => {
     const old = tx.listAttempts(view.id)[0]!;
-    tx.putAttempt({ ...old, status: 'proven_not_executed', nonExecutionEvidence: 'original exclusion evidence' });
+    tx.putAttempt({ ...old, status: 'proven_not_executed', nonExecutionEvidence: old.nonExecutionEvidence ?? 'original exclusion evidence' });
   });
   await f.broker.resolveAttempt(owner, view.id, 'retain unresolved reservation', true);
   const request = f.store.read((r) => r.getRequest(view.id)!);

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { inspect } from 'node:util';
 import { describe, expect, it, vi } from 'vitest';
 import { actions, baseEncode, createTransaction, KeyPair, Signature, SignedTransaction } from 'near-api-js';
-import { NativeNearChain, allocateNonce, allocateStoreNonce } from '../../src/near/index.js';
+import { NativeNearChain, allocateNonce, allocateStoreNonce, isDefinitiveFirstRejection } from '../../src/near/index.js';
 import { BrokerError } from '../../src/contracts/index.js';
 import type { CustodySigner, NativeTransferToSign, Store, StoreTransaction } from '../../src/contracts/index.js';
 
@@ -97,6 +97,45 @@ describe('testnet startup and send attestation', () => {
     expect(sign).not.toHaveBeenCalled();
     await expect(chain.broadcast(signed.signedTxBase64)).rejects.toThrow('MAINNET_REFUSED');
     expect(rpc.requests.every((r) => r.method === 'status')).toBe(true);
+  });
+});
+
+describe('prepared submission boundaries', () => {
+  it('prepare performs no submit and the prepared closure is one-shot', async () => {
+    const rpc = fakeRpc((r) => r.method === 'send_tx' ? { final_execution_status: 'INCLUDED' } : undefined);
+    const chain = await rpc.connect(); const signed = await chain.buildAndSignNativeTransfer(transfer, signer);
+    const submit = await chain.prepareBroadcast(signed.signedTxBase64);
+    expect(rpc.requests.filter((r) => r.method === 'send_tx')).toHaveLength(0);
+    await expect(submit()).resolves.toMatchObject({ kind: 'accepted', txHash: signed.txHash });
+    await expect(submit()).rejects.toHaveProperty('code', 'FORBIDDEN');
+    expect(rpc.requests.filter((r) => r.method === 'send_tx')).toHaveLength(1);
+  });
+  it('prepare refuses valid signed bytes for a different custody account', async () => {
+    const rpc = fakeRpc(); const chain = await rpc.connect(); const signed = await chain.buildAndSignNativeTransfer(transfer, signer);
+    const other = await NativeNearChain.connect({ accountId: 'other.testnet', rpcUrl: 'http://rpc.test.invalid', fetch: rpc.fetcher });
+    await expect(other.prepareBroadcast(signed.signedTxBase64)).rejects.toHaveProperty('code', 'FORBIDDEN');
+    expect(rpc.requests.filter((r) => r.method === 'send_tx')).toHaveLength(0);
+  });
+});
+
+describe('InvalidNonce details and first-rejection provenance', () => {
+  it.each([-1n, 0n, 1n])('preserves payload details; ak_nonce offset %s is definitive only when strictly greater', async (offset) => {
+    const tx_nonce = transfer.nonce.toString(); const ak_nonce = (transfer.nonce + offset).toString();
+    const rpc = fakeRpc((r) => r.method === 'send_tx' ? rpcReject({ InvalidNonce: { tx_nonce, ak_nonce } }) : undefined);
+    const chain = await rpc.connect(); const signed = await chain.buildAndSignNativeTransfer(transfer, signer);
+    const result = await chain.broadcast(signed.signedTxBase64);
+    expect(result.kind).toBe('rejected'); if (result.kind !== 'rejected') return;
+    expect(result.reason.startsWith('{')).toBe(true);
+    expect(JSON.parse(result.reason)).toEqual({ code: 'INVALID_NONCE', tx_nonce, ak_nonce });
+    expect(isDefinitiveFirstRejection(result, transfer.nonce)).toBe(offset > 0n);
+    expect(isDefinitiveFirstRejection(result, transfer.nonce + 1n)).toBe(false);
+  });
+  it.each([{}, { tx_nonce: '01', ak_nonce: '4' }, { tx_nonce: '3' }])('malformed nonce details are never definitive %#', async (details) => {
+    const rpc = fakeRpc((r) => r.method === 'send_tx' ? rpcReject({ InvalidNonce: details }) : undefined);
+    const chain = await rpc.connect(); const signed = await chain.buildAndSignNativeTransfer(transfer, signer);
+    const result = await chain.broadcast(signed.signedTxBase64);
+    expect(result).toMatchObject({ kind: 'rejected', code: 'INVALID_NONCE' });
+    expect(isDefinitiveFirstRejection(result, transfer.nonce)).toBe(false);
   });
 });
 

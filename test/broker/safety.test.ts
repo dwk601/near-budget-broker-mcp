@@ -56,6 +56,19 @@ it('N2 rechecks AFTER asynchronous signing immediately before replacement persis
   expect((await f.broker.budgetStatus(a)).usage.agentLifetime).toBe(request.amount);
 });
 
+it('N2 final in-lane recheck vetoes execution becoming visible immediately after the outside proof', async () => {
+  const { a, request, attempt } = await proof(); let lookups = 0;
+  const status = f.chain.txStatus.bind(f.chain);
+  vi.spyOn(f.chain, 'txStatus').mockImplementation(async (hash) => {
+    const outcome = await status(hash);
+    if (hash === attempt.txHash && ++lookups === 2) f.chain.outcomes.set(hash, success);
+    return outcome;
+  });
+  await f.broker.reconcile(owner, request.id);
+  expect((await f.broker.getRequest(a, request.id)).state).toBe('succeeded');
+  expect(f.chain.broadcasts).toHaveLength(1); expect(f.store.read((r) => r.listAttempts(request.id))).toHaveLength(1);
+});
+
 it('N2 refuses replacement when the proof recheck becomes unreachable; audit and holds remain intact', async () => {
   const { request } = await proof(); const status = vi.spyOn(f.chain, 'txStatus');
   status.mockResolvedValueOnce(exclusion).mockRejectedValueOnce(new Error('lagging pool switched nodes'));

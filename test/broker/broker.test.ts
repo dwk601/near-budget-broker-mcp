@@ -189,7 +189,8 @@ describe('freeze, outbox, crash recovery and audit fail-closed', () => {
     expect((await restart.getRequest(a, request.id)).state).toBe('succeeded');
     const attempts = f.store.read((r) => r.listAttempts(request.id));
     expect(attempts).toHaveLength(2);
-    expect(attempts.find((a) => a.id === old.id)).toMatchObject({ signedTxBase64: old.signedTxBase64, status: 'proven_not_executed', nonExecutionEvidence: 'final canonical chain exclusion proof' });
+    expect(attempts.find((a) => a.id === old.id)).toMatchObject({ signedTxBase64: old.signedTxBase64, status: 'proven_not_executed', nonExecutionEvidence: old.nonExecutionEvidence });
+    expect((await restart.listReceipts(a, 0, 100)).some((r) => r.type === 'outcome_unknown' && r.payload.reason.includes('final canonical chain exclusion proof'))).toBe(true);
     expect(f.chain.built.map((b) => b.transfer.nonce)).toEqual([1n, 2n]); expect(f.chain.paid.size).toBe(1);
   });
   it('audit append failure rolls back admission and pre-broadcast intent; recovery does not leak payment', async () => {

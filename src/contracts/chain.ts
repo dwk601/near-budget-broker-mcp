@@ -24,13 +24,16 @@ export const TxAttemptSchema = z.strictObject({
   status: z.enum(['signed', 'submitted', 'succeeded', 'failed', 'outcome_unknown', 'proven_not_executed']),
   receiptIds: z.array(ChainHashSchema), gasBurnt: z.bigint().nonnegative().nullable(),
   tokensBurnt: YoctoNearSchema.nullable(), createdAt: TimestampSchema, updatedAt: TimestampSchema,
-  /** Positive chain-adapter evidence retained before any replacement is eligible. */
+  /** Immutable chain-adapter evidence. May first retain strict InvalidNonce
+   * validation details (tx_nonce bound to this nonce, ak_nonce > tx_nonce);
+   * later full exclusion observations are signed in the receipt chain. */
   nonExecutionEvidence: z.string().min(1).nullable(),
   /** Persisted BEFORE every offer; null proves no submission intent was written.
    * Missing on legacy records requires receipt recovery, never a freshness guess. */
   lastOfferedAt: TimestampSchema.nullable().optional(),
   /** Monotonic durable offer intents, incremented before invocation. Sole-first
-   * definitive rejection provenance gates NONCE-based exclusion. EXPIRY may cover
+   * definitive rejection provenance gates NONCE-based exclusion (InvalidNonce
+   * requires strict numeric payload evidence, not a bare legacy flag). EXPIRY may cover
    * any count only with retained anchor, full margin/age/spaced negatives AND an
    * access-key nonce pinned to the FINAL head strictly below this attempt. */
   offerCount: CountSchema.optional(),

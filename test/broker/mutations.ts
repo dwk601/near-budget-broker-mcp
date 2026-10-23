@@ -74,7 +74,7 @@ add('F12-reconcile', 'this.run(false, requestId)', 'this.run(true, requestId)');
 
 // New-review non-equivalent survivors and proof/force/cache safety mutations.
 mutations.push(['N08-resolution-pump', () => scope('  async resolveAttempt(', '  async drain(', (s) => replace(s, 'this.pump.run(', 'Promise.resolve().then('))]);
-mutations.push(['N20-rebroadcast-lane', () => scope('  private async recover(', '  private settle(', (s) => replace(s, 'this.lane.run(', 'Promise.resolve().then('))]);
+mutations.push(['N20-rebroadcast-lane', () => scope('  private async recover(', '  private async finalExclusion(', (s) => replace(s, 'this.lane.run(', 'Promise.resolve().then('))]);
 add('N13-stale-abandon', "decision.reasons.some((reason) => reason !== 'WALLET_CAPACITY')", 'true');
 mutations.push(['N15-stale-abandon', () => scope('  private async recover(', '  private settle(', (s) => replace(s,
   "(reasons.length === 1 && reasons.includes('WALLET_CAPACITY') && this.o.store.read((r) => this.stale(r)))", 'false'))]);
@@ -83,7 +83,7 @@ add('N29-reconcile-id', 'if (requestId !== undefined && existing.request.id !== 
 mutations.push(['N29-watch-id', () => scope('  private async watchResolved(', '  private correctLateExecution(', (s) => replace(replace(s,
   'const ids = requestId === undefined ? [...this.watchIndex.keys()] : [requestId];', 'const ids = [...this.watchIndex.keys()];'),
   '.filter((request) => requestId === undefined || request.id === requestId)', '.filter(() => true)'))]);
-add('N2-final-recheck', 'let current = await this.status(prior);', "let current: ChainOutcome = { kind: 'not_executed', evidence: 'cached proof', invalidNonce: true };");
+add('N2-final-recheck', 'const final = await this.finalExclusion(prior);', "const final: ChainOutcome = { kind: 'not_executed', evidence: 'cached proof', invalidNonce: true };");
 add('N3-explicit-force-required', "if (outcome.kind !== 'not_executed' && !force) throw new BrokerError('FORBIDDEN');", "if (outcome.kind !== 'not_executed') force = true;");
 add('N3-retain-forced-hold', "force, outcome.kind !== 'not_executed'", 'force, false');
 add('N3-watch-resolution', 'new Set<string>(await this.watchResolved(requestId))', 'new Set<string>()');
@@ -161,10 +161,25 @@ add('F5-final-snapshot', "if (basis === 'never_offered' && !this.neverOffered(tx
 add('F5-chain-proof-watch', 'else this.watchIndex.set(event.payload.requestId, event.payload.resolution.attemptId);',
   "else if (event.payload.resolution.basis === 'owner_attested') this.watchIndex.set(event.payload.requestId, event.payload.resolution.attemptId);");
 add('F6-reprove-released', 'const outcome = await this.status(attempt, activeHold);', 'const outcome = await this.status(attempt, true);');
+// Prepared-adapter and final proof concurrency follow-up.
+other('NEW1-eager-submit', 'src/near/native.ts', (s) => replace(s,
+  "let used = false;\n    return async () => {\n      if (used) throw new BrokerError('FORBIDDEN');\n      used = true;\n      return this.submitPrepared(signed);\n    };",
+  'const result = await this.submitPrepared(signed); return async () => result;'));
+other('NEW1-one-shot', 'src/near/native.ts', (s) => replace(s, "if (used) throw new BrokerError('FORBIDDEN');", '/* mutant: reused prepared closure */'));
+other('NEW1-signer-binding', 'src/near/native.ts', (s) => replace(s,
+  "if (signed.transfer.signerId !== this.#accountId) throw new BrokerError('FORBIDDEN');", '/* mutant: different signer accepted */'));
+mutations.push(['F6b-proof-under-lane', () => scope('  private async replace(', '  private settle(', (s) => replace(s,
+  'let current = await this.status(prior);', 'let current = await this.lane.run(() => this.status(prior));'))]);
+other('NEW2-strict-nonce-provenance', 'src/near/rejections.ts', (s) => replace(s, 'akNonce > txNonce', 'akNonce >= txNonce'));
+other('NEW2-payload-nonce-binding', 'src/near/rejections.ts', (s) => replace(s, 'txNonce === nonce && ', ''));
+other('NEW2-preserve-details', 'src/near/rejections.ts', (s) => replace(s,
+  "return detail.tx_nonce === undefined ? detail.code : canonicalJson(detail);", 'return detail.code;'));
+other('F6b-fresh-final-facts', 'src/near/native.ts', (s) => replace(s,
+  'const initial = await lookup(); if (initial) return initial;', 'return cached.outcome; const initial = await lookup(); if (initial) return initial;'));
 const filter = process.argv[2] ? new RegExp(process.argv[2]) : null;
 const selected = mutations.filter(([id]) => filter === null || filter.test(id));
 const run = (native = false) => spawnSync(process.execPath, [resolve('node_modules/vitest/vitest.mjs'), 'run',
-  'test/broker/review.test.ts', 'test/broker/safety.test.ts', 'test/broker/followup.test.ts', 'test/broker/correction-guards.test.ts', 'test/near/non-execution.test.ts',
+  'test/broker/review.test.ts', 'test/broker/safety.test.ts', 'test/broker/followup.test.ts', 'test/broker/correction-guards.test.ts', 'test/near/non-execution.test.ts', 'test/near/native.test.ts',
   ...(native ? ['test/broker/native-integration.test.ts'] : [])], { cwd: root, encoding: 'utf8', timeout: 30000 });
 let killed = 0;
 try {
@@ -175,7 +190,8 @@ try {
   for (const [id, mutate, side] of selected) {
     writeFileSync(file, mutate());
     if (side) writeFileSync(join(root, side.path), side.mutate(others.get(side.path)!));
-    const result = run(id === 'F1-expiry-consumed-nonce' || id === 'F2-adapter-preflight' || id === 'F6-reprove-released');
+    const result = run(id === 'F1-expiry-consumed-nonce' || id === 'F2-adapter-preflight' || id === 'F6-reprove-released'
+      || id.startsWith('NEW1-') || id.startsWith('NEW2-') || id === 'F6b-proof-under-lane');
     const output = result.stdout + result.stderr;
     writeFileSync(file, original);
     if (side) writeFileSync(join(root, side.path), others.get(side.path)!);

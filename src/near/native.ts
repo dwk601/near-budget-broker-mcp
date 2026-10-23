@@ -15,6 +15,7 @@ import type {
 import { record, RpcClient, RpcFailure, unsigned } from './rpc.js';
 import type { RpcFetch } from './rpc.js';
 import { EXPIRY_SAFETY_BLOCKS, VALIDITY_BLOCK_MS, EXPIRY_LOOKUP_SPACING_MS } from './proof-policy.js';
+import { rejectionCode, rejectionReason, hasInvalidNonceEvidence } from './rejections.js';
 
 const U64_MAX = (1n << 64n) - 1n;
 const digest = (bytes: Uint8Array): Buffer => createHash('sha256').update(bytes).digest();
@@ -67,6 +68,19 @@ export interface BroadcastPreparation {
   prepareBroadcast(signedTxBase64: string): Promise<() => Promise<BroadcastResult>>;
 }
 
+export interface ExclusionRecheck {
+  /** Requires a matching full proof obtained outside the custody lane. Rechecks
+   * current tx visibility and pinned FINAL key facts, never sleeps or re-signs. */
+  recheckExclusion(attempt: TxAttempt): Promise<ChainOutcome>;
+}
+const RECHECK_MAX_AGE_MS = 5_000;
+type Exclusion = Extract<ChainOutcome, { kind: 'not_executed' }>;
+interface ProofObservation { fingerprint: string; at: number; minHead: bigint; outcome: Exclusion }
+function proofFingerprint(attempt: TxAttempt): string {
+  return JSON.stringify([attempt.txHash, attempt.requestId, attempt.nonce.toString(), attempt.publicKey, attempt.blockHash,
+    attempt.signedTxBase64, attempt.createdAt, attempt.lastOfferedAt, attempt.offerCount, attempt.firstRejection, attempt.nonExecutionEvidence]);
+}
+
 export interface NativeNearChainOptions {
   rpcUrl: string;
   accountId: string;
@@ -84,6 +98,7 @@ export class NativeNearChain implements NearChain {
   readonly #accountId: string;
   readonly #clock: Clock;
   readonly #sleep: (ms: number) => Promise<void>;
+  readonly #proofs = new Map<string, ProofObservation>();
   private constructor(options: NativeNearChainOptions) {
     try { ConfigSchema.shape.rpcUrl.parse(options.rpcUrl); }
     catch { throw new BrokerError('MAINNET_REFUSED'); }
@@ -191,8 +206,8 @@ export class NativeNearChain implements NearChain {
     } catch (error) {
       if (error instanceof RpcFailure) {
         // Structured node validation errors only; do not guess from arbitrary messages.
-        const code = rejectionCode(error.response);
-        if (code) return { kind: 'rejected', txHash, code, reason: code };
+        const detail = rejectionCode(error.response);
+        if (detail) return { kind: 'rejected', txHash, code: detail.code, reason: rejectionReason(detail) };
       }
       return { kind: 'outcome_unknown', txHash, reason: 'Broadcast acknowledgment unavailable' };
     }
@@ -222,8 +237,8 @@ export class NativeNearChain implements NearChain {
       // A consumed nonce alone cannot disambiguate an accepted transaction.
       // Keep first-offer rejection provenance for the NONCE path. Independently,
       // an aged expiry proof may cover any offer count, including a lost 504.
-      const nonceProof = attempt.offerCount === 1 && (attempt.firstRejection === 'INVALID_NONCE'
-        || attempt.firstRejection === 'EXPIRED_BLOCK_HASH');
+      const nonceProof = attempt.offerCount === 1 && (attempt.firstRejection === 'EXPIRED_BLOCK_HASH'
+        || (attempt.firstRejection === 'INVALID_NONCE' && hasInvalidNonceEvidence(attempt.nonExecutionEvidence, t.nonce, txHash)));
       const offered = attempt.lastOfferedAt;
       const now = this.#clock.now();
       if (offered === undefined || offered === null || !Number.isSafeInteger(offered)
@@ -245,7 +260,7 @@ export class NativeNearChain implements NearChain {
       const nonce = unsigned(key['nonce'], U64_MAX);
       if (nonceProof && nonce >= t.nonce) {
         invalidNonce = true;
-        evidence = `FIRST_OFFER_REJECTED:${attempt.firstRejection}; UNKNOWN_TRANSACTION; retained anchor ${t.blockHash} height ${height}; final access key ${headHash} nonce ${nonce} >= attempt ${t.nonce}; last offer ${offered}`;
+        evidence = `FIRST_OFFER_REJECTED:${attempt.firstRejection}; provenance ${attempt.nonExecutionEvidence ?? 'first expiry rejection'}; UNKNOWN_TRANSACTION; retained anchor ${t.blockHash} height ${height}; final access key ${headHash} nonce ${nonce} >= attempt ${t.nonce}; last offer ${offered}`;
       }
       if (evidence === null) {
         // An executed transaction (or external signer) can consume this nonce
@@ -274,7 +289,39 @@ export class NativeNearChain implements NearChain {
       } catch (error) {
         if (!unknownTransaction(error)) return unknownOutcome();
       }
-      return { kind: 'not_executed', evidence, invalidNonce };
+      const outcome: Exclusion = { kind: 'not_executed', evidence, invalidNonce };
+      const at = this.#clock.now();
+      for (const [hash, entry] of this.#proofs) if (at < entry.at || at - entry.at > RECHECK_MAX_AGE_MS) this.#proofs.delete(hash);
+      if (this.#proofs.size >= 256) this.#proofs.delete(this.#proofs.keys().next().value!);
+      this.#proofs.set(txHash, { fingerprint: proofFingerprint(attempt), at, minHead: headHeight, outcome });
+      return outcome;
+    } catch { return unknownOutcome(); }
+  }
+  async recheckExclusion(attempt: TxAttempt): Promise<ChainOutcome> {
+    const cached = this.#proofs.get(attempt.txHash); const now = this.#clock.now();
+    if (!cached || now < cached.at || now - cached.at > RECHECK_MAX_AGE_MS || cached.fingerprint !== proofFingerprint(attempt)) return unknownOutcome();
+    try {
+      // The cached item only supplies immutable expiry/spacing facts. No cached
+      // negative response authorizes replacement: re-read all mutable facts and
+      // veto positive visibility on BOTH sides of the FINAL key observation.
+      const lookup = async (): Promise<ChainOutcome | null> => {
+        try { return this.observedOutcome(record(await this.#rpc.call('tx', {
+          tx_hash: attempt.txHash, sender_account_id: this.#accountId, wait_until: 'FINAL',
+        })), attempt.txHash, this.#accountId); }
+        catch (error) { return unknownTransaction(error) ? null : unknownOutcome(); }
+      };
+      const initial = await lookup(); if (initial) return initial;
+      await this.verifyNetwork();
+      const head = record(record(await this.#rpc.call('block', { finality: 'final' }))['header']);
+      const hash = ChainHashSchema.parse(head['hash']); blockHash(hash);
+      if (unsigned(head['height'], U64_MAX) < cached.minHead) return unknownOutcome();
+      const key = record(await this.#rpc.call('query', { request_type: 'view_access_key', account_id: this.#accountId,
+        public_key: attempt.publicKey, block_id: hash }));
+      if (key['block_hash'] !== hash) return unknownOutcome();
+      const nonce = unsigned(key['nonce'], U64_MAX);
+      if (cached.outcome.invalidNonce ? nonce < attempt.nonce : nonce >= attempt.nonce) return unknownOutcome();
+      const final = await lookup(); if (final) return final;
+      return { ...cached.outcome, evidence: `${cached.outcome.evidence}; fresh no-sleep recheck at FINAL ${hash} nonce ${nonce}` };
     } catch { return unknownOutcome(); }
   }
   private observedOutcome(response: Record<string, unknown>, txHash: string, signerId: string): ChainOutcome {
@@ -332,24 +379,4 @@ function unknownTransaction(error: unknown): boolean {
   try {
     return error instanceof RpcFailure && record(record(error.response)['cause'])['name'] === 'UNKNOWN_TRANSACTION';
   } catch { return false; }
-}
-
-function rejectionCode(error: unknown): 'INVALID_NONCE' | 'EXPIRED_BLOCK_HASH' | 'RPC_REJECTED' | null {
-  try {
-    const body = record(error);
-    // near-api-js 7.3.1 parseHandlerError reads data.TxExecutionError even
-    // when cause is present: real nodes commonly send cause.info = {}.
-    let invalid: unknown;
-    try { invalid = record(record(body['data'])['TxExecutionError'])['InvalidTxError']; }
-    catch { /* An alternate RPC may put the enum in cause.info instead. */ }
-    if (invalid === undefined && body['cause'] !== undefined) {
-      const cause = record(body['cause']);
-      if (cause['name'] !== 'INVALID_TRANSACTION') return null;
-      invalid = record(cause['info'])['InvalidTxError'];
-    }
-    if (invalid === 'Expired') return 'EXPIRED_BLOCK_HASH';
-    if (invalid && typeof invalid === 'object' && 'InvalidNonce' in invalid) return 'INVALID_NONCE';
-    if (invalid && typeof invalid === 'object' && 'Expired' in invalid) return 'EXPIRED_BLOCK_HASH';
-    return invalid === undefined ? null : 'RPC_REJECTED';
-  } catch { return null; }
 }

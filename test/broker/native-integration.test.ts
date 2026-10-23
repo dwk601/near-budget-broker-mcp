@@ -6,22 +6,42 @@ import { NativeNearChain } from '../../src/near/index.js';
 import { EncryptedFileCustody } from '../../src/custody/index.js';
 import { parseNear } from '../../src/contracts/index.js';
 import { Fixture, hash, owner } from './fixtures.js';
-let f: Fixture; let custody: EncryptedFileCustody;
-afterEach(async () => { await custody?.lock(); f?.close(); });
+let f: Fixture; let custody: EncryptedFileCustody; let observedOfferOrder: boolean[] = [];
+afterEach(async () => {
+  // RPC boundaries intentionally sanitize thrown errors. Keep this independent
+  // assertion so an eager submit cannot hide a handler assertion in that catch.
+  try { expect(observedOfferOrder.every(Boolean)).toBe(true); }
+  finally { await custody?.lock(); f?.close(); }
+});
 
-it.each(['Expired', 'InvalidNonce', 'NotEnoughBalance', 'dropped-504', 'transient-attestation', 'released-watch', 'GC', 'persistent-lag', 'late-visible', 'late-during-sign'] as const)(
+it.each(['Expired', 'InvalidNonce', 'InvalidNonce-equal', 'NotEnoughBalance', 'dropped-504', 'force-retired', 'transient-attestation', 'freeze-proof', 'released-watch', 'GC', 'persistent-lag', 'late-visible', 'late-during-sign'] as const)(
   'real NativeNearChain + encrypted custody signer: %s', async (mode) => {
+    observedOfferOrder = [];
     f = new Fixture({ autoDispatch: false });
     custody = new EncryptedFileCustody(); const master = Buffer.alloc(32, 42); const pair = KeyPair.fromRandom('ed25519');
     const signer = await custody.loadKey(await custody.encryptKey(pair.toString(), master), master); master.fill(0);
     let nonce = 0n; let height = 10n; let finalHash = hash('initial'); let rejected = false;
-    const lagMode = mode === 'GC' || mode === 'persistent-lag' || mode === 'late-visible' || mode === 'late-during-sign';
+    const lagMode = mode === 'GC' || mode === 'InvalidNonce-equal' || mode === 'persistent-lag' || mode === 'late-visible' || mode === 'late-during-sign';
     let hidden = lagMode; let hiddenHash = '';
     let statusCountdown = -1; const sends: string[] = []; const paid = new Map<string, unknown>();
     const requests: string[] = [];
+    let sleepCount = 0; let blockSleep = -1; let entered!: () => void; let resume!: () => void;
+    const proofEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const proofBlocked = new Promise<void>((resolve) => { resume = resolve; });
     const fetcher: typeof fetch = async (_url, init) => {
       const r = JSON.parse(String(init?.body)) as { id: string; method: string; params: Record<string, unknown> };
       requests.push(r.method);
+      if (r.method === 'send_tx') {
+        // Check synchronously on RPC entry, BEFORE even yielding fake latency.
+        // This also catches fire-and-forget submission during preparation.
+        const index = observedOfferOrder.push(false) - 1;
+        const signed = SignedTransaction.decode(Buffer.from(String(r.params['signed_tx_base64']), 'base64'));
+        const txHash = baseEncode(createHash('sha256').update(signed.transaction.encode()).digest());
+        const stored = f.store.read((view) => view.listOutbox({ limit: 1000 }).items.find((a) => a.txHash === txHash));
+        observedOfferOrder[index] = stored !== undefined && (stored.offerCount ?? 0) >= 1 && typeof stored.lastOfferedAt === 'number';
+        expect(stored?.offerCount).toBeGreaterThanOrEqual(1);
+        expect(typeof stored?.lastOfferedAt).toBe('number');
+      }
       await new Promise((r) => setTimeout(r, 1)); // genuinely asynchronous RPC latency
       let result: unknown;
       if (r.method === 'status') {
@@ -38,17 +58,18 @@ it.each(['Expired', 'InvalidNonce', 'NotEnoughBalance', 'dropped-504', 'transien
         result = { header: { hash: block ?? finalHash, height: block === hash('initial') ? '10' : height.toString() } };
       } else if (r.method === 'EXPERIMENTAL_protocol_config') result = { runtime_config: { storage_amount_per_byte: '1' }, transaction_validity_period: '100' };
       else if (r.method === 'send_tx') {
-        const bytes = String(r.params['signed_tx_base64']); sends.push(bytes);
+        const bytes = String(r.params['signed_tx_base64']);
         const signed = SignedTransaction.decode(Buffer.from(bytes, 'base64')); const tx = signed.transaction;
         const txHash = baseEncode(createHash('sha256').update(tx.encode()).digest());
+        sends.push(bytes); // the fake chain cannot see/pay bytes before intent
         expect(tx.actions).toHaveLength(1); expect(tx.actions[0]?.transfer?.deposit).toBe(parseNear('0.001'));
         expect(tx.publicKey.toString()).toBe(signer.publicKey); expect(tx.signerId).toBe('broker.testnet');
-        if ((mode === 'Expired' || mode === 'InvalidNonce' || mode === 'NotEnoughBalance' || mode === 'dropped-504' || mode === 'released-watch') && !rejected) {
+        if ((mode === 'Expired' || mode === 'InvalidNonce' || mode === 'NotEnoughBalance' || mode === 'dropped-504' || mode === 'force-retired' || mode === 'freeze-proof' || mode === 'released-watch') && !rejected) {
           rejected = true; finalHash = hash('later'); height = 1110n;
-          if (mode === 'dropped-504') return new Response('not forwarded to chain', { status: 504 });
+          if (mode === 'dropped-504' || mode === 'force-retired') return new Response('not forwarded to chain', { status: 504 });
           if (mode === 'InvalidNonce') nonce = 5n;
           return Response.json({ jsonrpc: '2.0', id: r.id, error: { data: { TxExecutionError: { InvalidTxError:
-            mode === 'Expired' || mode === 'released-watch' ? 'Expired' : mode === 'NotEnoughBalance' ? { NotEnoughBalance: { balance: '0' } }
+            mode === 'Expired' || mode === 'freeze-proof' || mode === 'released-watch' ? 'Expired' : mode === 'NotEnoughBalance' ? { NotEnoughBalance: { balance: '0' } }
               : { InvalidNonce: { tx_nonce: tx.nonce.toString(), ak_nonce: nonce.toString() } } } } } });
         }
         if (!paid.has(txHash)) {
@@ -60,6 +81,14 @@ it.each(['Expired', 'InvalidNonce', 'NotEnoughBalance', 'dropped-504', 'transien
           paid.set(txHash, { final_execution_status: 'FINAL', transaction: { hash: txHash, signer_id: 'broker.testnet' },
             transaction_outcome: outcome(txHash, '3', [receiptId]), receipts_outcome: [outcome(receiptId, '4', [])], status: { SuccessValue: '' } });
         }
+        if (mode === 'InvalidNonce-equal' && !rejected) {
+          rejected = true;
+          // A gateway may have accepted these very bytes, then exposed only a
+          // retry's equality rejection. This must NEVER establish provenance.
+          return Response.json({ jsonrpc: '2.0', id: r.id, error: { data: { TxExecutionError: { InvalidTxError: {
+            InvalidNonce: { tx_nonce: tx.nonce.toString(), ak_nonce: nonce.toString() },
+          } } } } });
+        }
         if (lagMode && hidden && txHash === hiddenHash) return new Response('ack lost after execution', { status: 503 });
         result = { final_execution_status: 'INCLUDED', transaction: { hash: txHash, signer_id: 'broker.testnet' } };
       } else if (r.method === 'tx') {
@@ -69,7 +98,7 @@ it.each(['Expired', 'InvalidNonce', 'NotEnoughBalance', 'dropped-504', 'transien
       } else throw new Error('unexpected RPC');
       return Response.json({ jsonrpc: '2.0', id: r.id, result });
     };
-    const chain = await NativeNearChain.connect({ accountId: 'broker.testnet', rpcUrl: 'http://offline.invalid', fetch: fetcher, clock: f.clock, sleep: async (ms) => { f.now += ms; } });
+    const chain = await NativeNearChain.connect({ accountId: 'broker.testnet', rpcUrl: 'http://offline.invalid', fetch: fetcher, clock: f.clock, sleep: async (ms) => { sleepCount++; if (sleepCount === blockSleep) { entered(); await proofBlocked; } f.now += ms; } });
     f.options = { ...f.options, chain, signer };
     if (mode === 'transient-attestation') f.options.hooks = { afterPersistSigned: async () => { statusCountdown = 1; } };
     f.broker = new BrokerService(f.options);
@@ -93,6 +122,18 @@ it.each(['Expired', 'InvalidNonce', 'NotEnoughBalance', 'dropped-504', 'transien
     await f.broker.drain();
     expect((await f.broker.getRequest(a, first.id)).state).toBe('outcome_unknown');
     const original = f.store.read((r) => r.listAttempts(first.id)[0]!);
+    if (mode === 'InvalidNonce-equal') expect(original.firstRejection).toBeUndefined();
+    if (mode === 'force-retired') {
+      await f.broker.resolveAttempt(owner, first.id, 'retire ambiguous dropped send', true);
+      await f.broker.requestTransfer(b, f.input('B')); await f.broker.drain();
+      expect(nonce).toBe(2n); expect(paid.size).toBe(1); expect(paid.has(original.txHash)).toBe(false);
+      f.now += 120_000; height = 1111n;
+      await f.broker.reconcile(owner, first.id);
+      expect(f.store.read((r) => r.getHold(first.id)?.status)).toBe('active');
+      expect((await f.broker.budgetStatus(a)).remaining.lifetime).toBe(0n);
+      expect((await f.broker.requestTransfer(a, f.input('no-unsafe-writeoff'))).reasons).toContain('LIFETIME_EXCEEDED');
+      return;
+    }
     f.now += 120_000; // signing age >= validity time; final head includes the 1000-block margin
     if (mode === 'released-watch') {
       await f.broker.resolveAttempt(owner, first.id, 'confirmed expiry');
@@ -116,13 +157,33 @@ it.each(['Expired', 'InvalidNonce', 'NotEnoughBalance', 'dropped-504', 'transien
       f.store.withImmediateTransaction((tx) => tx.putAttempt({ ...original, status: 'proven_not_executed', nonExecutionEvidence: 'Legacy unsafe proof' }));
     } else {
       await f.broker.reconcile(owner, first.id);
-      expect(f.store.read((r) => r.listAttempts(first.id)[0]?.status)).toBe(mode === 'GC' || mode === 'persistent-lag' ? 'outcome_unknown' : 'proven_not_executed');
+      expect(f.store.read((r) => r.listAttempts(first.id)[0]?.status)).toBe(mode === 'GC' || mode === 'persistent-lag' || mode === 'InvalidNonce-equal' ? 'outcome_unknown' : 'proven_not_executed');
+    }
+    if (mode === 'freeze-proof') {
+      // Initial proof is persisted. Block the AFTER-sign spaced proof, not the
+      // first recovery lookup (which was already outside the lane before F6b).
+      blockSleep = sleepCount + 2;
+      const replacing = f.broker.reconcile(owner, first.id); await proofEntered;
+      let acknowledged = false;
+      const freezing = f.broker.freeze(owner, { scope: 'global' }, 'freeze during spaced proof').then(() => { acknowledged = true; });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const duringSleep = acknowledged; resume();
+      await Promise.all([replacing, freezing]);
+      expect(duringSleep).toBe(true); expect(sends).toHaveLength(1); expect(paid.size).toBe(0);
+      expect(f.store.read((r) => r.listAttempts(first.id))).toHaveLength(1);
+      const recheck = chain.recheckExclusion.bind(chain); let sleptInsideRecheck = false;
+      vi.spyOn(chain, 'recheckExclusion').mockImplementation(async (attempt) => {
+        const before = sleepCount; const result = await recheck(attempt); sleptInsideRecheck ||= sleepCount !== before; return result;
+      });
+      await f.broker.unfreeze(owner, { scope: 'global' }, 'resume'); await f.broker.drain();
+      expect(sleptInsideRecheck).toBe(false); expect(paid.size).toBe(1);
+      expect((await f.broker.getRequest(a, first.id)).state).toBe('succeeded'); return;
     }
     if (mode === 'GC') {
       expect(paid.size).toBe(1); expect(f.store.read((r) => r.listAttempts(first.id))).toHaveLength(1);
       expect(new Set(sends).size).toBe(1); // GC never authorizes a new payment
     }
-    if (mode === 'persistent-lag') {
+    if (mode === 'persistent-lag' || mode === 'InvalidNonce-equal') {
       await f.broker.requestTransfer(b, f.input('B'));
       for (let i = 0; i < 3; i++) { f.now += 60_000; await f.another({ hooks: {} }).start(); }
       expect(paid.size).toBe(1); expect(new Set(sends).size).toBe(1);
@@ -130,7 +191,7 @@ it.each(['Expired', 'InvalidNonce', 'NotEnoughBalance', 'dropped-504', 'transien
       await expect(f.broker.resolveAttempt(owner, first.id, 'negative lookup is still not absence')).rejects.toHaveProperty('code', 'FORBIDDEN');
       expect((await f.broker.requestTransfer(a, f.input('cannot-pay-again'))).reasons).toContain('LIFETIME_EXCEEDED');
     }
-    if (mode === 'GC' || mode === 'persistent-lag' || mode === 'late-visible') hidden = false;
+    if (mode === 'GC' || mode === 'InvalidNonce-equal' || mode === 'persistent-lag' || mode === 'late-visible') hidden = false;
     if (mode === 'late-during-sign') {
       // Model one final stale observation from an old adapter during recovery;
       // the mandatory AFTER-sign check uses the real adapter's positive result.
