@@ -34,6 +34,12 @@ it('file secrets + read-only rootfs actually compose create/up, ready, SIGKILL/r
     await writeFile(override, `services:\n  daemon:\n    ports: !override ["127.0.0.1:${agentPort}:${agentPort}", "127.0.0.1:${adminPort}:${adminPort}"]\n    depends_on:\n      rpc:\n        condition: service_healthy\n  rpc:\n    image: ${image}\n    entrypoint: ["node", "-e", ${JSON.stringify(rpc)}]\n    read_only: true\n    healthcheck:\n      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3030').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]\n      interval: 1s\n      retries: 20\n`);
     docker([...compose, 'config', '--quiet']);
     docker([...compose, 'build', 'daemon'], 180_000);
+    // Native Linux bind mounts keep host ownership, so follow docker/README.md:
+    // the daemon uid (1000) must own both secret files. Docker Desktop remaps
+    // ownership itself, so only Linux runners with another uid need this.
+    if (process.platform === 'linux' && process.getuid?.() !== 1000) {
+      docker(['run', '--rm', '--user', '0:0', '--network', 'none', '--entrypoint', 'chown', '-v', `${dir}:/secrets`, image, '1000:1000', '/secrets/master', '/secrets/config']);
+    }
     docker([...compose, 'create', '--pull', 'never'], 30_000); // Regression: config alone did not catch F1.
     const config = JSON.parse(docker([...compose, 'config', '--format', 'json'])) as { services: { daemon: { read_only: boolean } } };
     expect(config.services.daemon.read_only).toBe(true);
