@@ -1,4 +1,7 @@
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
+import { randomUUID } from 'node:crypto';
+import { BrokerService } from '../../src/broker/index.js';
+import { BrokerError } from '../../src/contracts/index.js';
 import { getDefaultResultOrder, setDefaultResultOrder } from 'node:dns';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -33,6 +36,24 @@ it('authorization stays exit 3 for policy writes; only proven stale revisions ex
       const current = JSON.parse(await readFile(path, 'utf8')) as { revision: number }; current.revision = 2; await writeFile(path, json(current));
       const denied = await cli([group, 'set', '--file', path], { BB_ADMIN_URL: `http://localhost:${f.config.adminPort}` });
       expect(denied).toEqual({ code: 3, out: '', err: `${json({ error: { code: 'FORBIDDEN' } })}\n` });
+    }
+    // An unknown agent is a broker authorization failure with no revision
+    // conflict (both expected and persisted revision are null).
+    const unknown = randomUUID(); await writeFile(policyPath, json({ ...policy, agentId: unknown }));
+    expect(await owner.call('getPolicy', { agentId: unknown })).toBeNull();
+    expect(await cli(['policy', 'set', '--file', policyPath])).toEqual({ code: 3, out: '', err: `${json({ error: { code: 'FORBIDDEN' } })}\n` });
+    // Inject a non-CAS refusal at the broker port, AFTER real owner auth. Unlike
+    // Host/Origin denials these reach both admin dispatch catch/translation paths.
+    for (const [group, path, method, value] of [
+      ['policy', policyPath, 'setPolicy', policy],
+      ['wallet-policy', walletPath, 'setWalletPolicy', wallet],
+    ] as const) {
+      await writeFile(path, json({ ...value, revision: 2 })); // expected 1 == persisted 1
+      const refusal = vi.spyOn(BrokerService.prototype, method).mockRejectedValue(new BrokerError('FORBIDDEN'));
+      try {
+        expect(await cli([group, 'set', '--file', path])).toEqual({ code: 3, out: '', err: `${json({ error: { code: 'FORBIDDEN' } })}\n` });
+        expect(refusal).toHaveBeenCalledTimes(1);
+      } finally { refusal.mockRestore(); }
     }
     expect((await cli(['status'], { BB_ADMIN_URL: `http://localhost:${f.config.adminPort}` })).code).toBe(3);
     await expect(owner.call('setWalletPolicy', { policy: { revision: 1, rolling24hMax: '1', safetyReserve: '0' }, expectedRevision: null })).rejects.toMatchObject({ code: 'POLICY_CHANGED' });

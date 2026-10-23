@@ -10,8 +10,9 @@ import { DaemonFailure } from './diagnostics.js';
  * releases the OS locks. The file is deliberately retained, NEVER unlinked.
  * The containing directory is private (0700). Host/root control is outside
  * this boundary. Never open/close unrelated raw fds on a held lock inode. */
-export function custodyLockPath(publicKey: string, directory = join(userInfo().homedir, '.budget-broker-locks')): string {
+export function custodyLockPath(publicKey: string, directory?: string): string {
   try {
+    directory ??= join(userInfo().homedir, '.budget-broker-locks');
     // mkdir is exclusive; existing insecure directories are REFUSED, not repaired.
     // userInfo uses the OS account database, not attacker-selected HOME/TMPDIR.
     try { mkdirSync(directory, { mode: 0o700 }); }

@@ -54,6 +54,19 @@ const mutants: Mutant[] = [
   { name: 'diagnostic renderer leaks stack path env', file: cli, before: 'const reason = diagnosticReason(e);', after: "const reason = diagnosticReason(e) ? diagnosticReason(e) + '\\n/secret/path\\n' + new Error().stack + JSON.stringify({BB_DIAG_CANARY:env['BB_DIAG_CANARY']}) : undefined;", test: 'test/cli/process.test.ts' },
   { name: 'unqualified extra published port', file: compose, before: '      - "127.0.0.1:3211:3211"', after: '      - "127.0.0.1:3211:3211"\n      - "3212:3211"', test: 'test/isolation/config.test.ts', docker: true },
   { name: 'host root bind added', file: compose, before: '      - bb_data:/var/lib/budget-broker', after: '      - bb_data:/var/lib/budget-broker\n      - /:/host:ro', test: 'test/isolation/config.test.ts', docker: true },
+  { name: 'H1 passwd lookup outside try', file: 'src/daemon/lock.ts', before: "directory?: string): string {\n  try {\n    directory ??= join(userInfo().homedir, '.budget-broker-locks');", after: "directory = join(userInfo().homedir, '.budget-broker-locks')): string {\n  try {", test: 'test/cli/locks.test.ts' },
+  ...[
+    ['cap_add SYS_ADMIN', 'cap_add: [SYS_ADMIN]'],
+    ['host pid', 'pid: host'],
+    ['host ipc', 'ipc: host'],
+    ['host user namespace', 'userns_mode: host'],
+    ['device passthrough', 'devices: ["/dev/null:/dev/null"]'],
+  ].map(([name, setting]): Mutant => ({ name: `H2 ${name}`, file: compose, before: '    init: true', after: `    init: true\n    ${setting}`, test: 'test/isolation/config.test.ts', docker: true })),
+  { name: 'H2 executable tmpfs', file: compose, before: '/tmp:rw,noexec,nosuid,size=16m,mode=1777', after: '/tmp:rw,exec,nosuid,size=16m,mode=1777', test: 'test/isolation/config.test.ts', docker: true },
+  { name: 'H3 attestation transport timeout removed', file: 'src/daemon/chain.ts', before: 'AbortSignal.timeout(5000)', after: 'AbortSignal.timeout(20000)', test: 'test/cli/chain.test.ts' },
+  { name: 'H3 RPC redirects followed', file: 'src/daemon/chain.ts', before: "redirect: 'error'", after: "redirect: 'follow'", test: 'test/cli/chain.test.ts' },
+  { name: 'H3 policy FORBIDDEN translated without revision check', file: 'src/daemon/admin.ts', before: ' && ((await b.getPolicy(p, a.agentId))?.revision ?? null) !== expectedRevision', after: '', test: 'test/cli/exit-codes.test.ts' },
+  { name: 'H3 wallet FORBIDDEN translated without revision check', file: 'src/daemon/admin.ts', before: ' && ((await b.walletStatus(p)).policy?.revision ?? null) !== expectedRevision', after: '', test: 'test/cli/exit-codes.test.ts' },
 ];
 const root = resolve('.'); const scratch = mkdtempSync(join(tmpdir(), 'bb-b08-mutations-'));
 const originals = new Map(mutants.map((m) => [m.file, readFileSync(join(root, m.file), 'utf8')]));

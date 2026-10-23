@@ -133,7 +133,10 @@ Two SQLite EXCLUSIVE transactions are held for the process lifetime:
 `<OS-account-home>/.budget-broker-locks/<sha256(publicKey)>.sqlite`. The latter
 refuses a second daemon even with a different data directory/ports/database. The
 OS account database, not `HOME` or `TMPDIR`, determines this stable location;
-there is no production config/env override. Its directory must be owned by the
+there is no production config/env override. The runtime uid requires an OS passwd
+entry with a writable home (the image provides this for uid 1000). An arbitrary
+unmapped uid, e.g. `docker run --user 4242:4242`, is unsupported and fails closed
+with `LOCK_UNAVAILABLE`, not a generic broker error. Its directory must be owned by the
 current uid and mode 0700; existing bad ownership/modes or symlinks are refused,
 not repaired. Files must be regular, uid-owned, mode 0600 and never unlinked.
 The kernel releases both locks on SIGKILL/crash; restart needs no PID guessing or

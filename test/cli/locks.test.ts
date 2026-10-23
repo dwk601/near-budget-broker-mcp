@@ -6,8 +6,12 @@ import { diagnosticReason, DaemonFailure } from '../../src/daemon/diagnostics.js
 
 // Preflight tests must prove a directory/FIFO-like input never reaches SQLite,
 // not merely rely on SQLite rejecting it (or blocking forever opening a FIFO).
-const mock = vi.hoisted(() => ({ database: vi.fn() }));
+const mock = vi.hoisted(() => ({ database: vi.fn(), userInfo: vi.fn() }));
 vi.mock('node:sqlite', () => ({ DatabaseSync: mock.database }));
+vi.mock('node:os', async (importOriginal) => {
+  const os = await importOriginal<typeof import('node:os')>();
+  return { ...os, userInfo: mock.userInfo.mockImplementation(os.userInfo) };
+});
 import { exclusiveLock, custodyLockPath } from '../../src/daemon/lock.js';
 beforeEach(() => { mock.database.mockImplementation(function () { return { exec: vi.fn(), close: vi.fn() }; }); });
 
@@ -38,6 +42,14 @@ it('non-files and symlinks are refused before SQLite, even if the target has saf
     await mkdir(directory); await chmod(directory, 0o600);
     expect(await refusal(directory)).toMatchObject({ reason: 'LOCK_UNAVAILABLE' }); expect(mock.database).not.toHaveBeenCalled();
   } finally { await chmod(directory, 0o700).catch(() => {}); await rm(dir, { recursive: true, force: true }); }
+});
+it('an unmapped uid passwd lookup fails closed with the specific lock diagnostic', () => {
+  mock.userInfo.mockImplementationOnce(() => { throw Object.assign(new Error('uv_os_get_passwd failed'), { code: 'ERR_SYSTEM_ERROR' }); });
+  let failure: unknown;
+  try { custodyLockPath('ed25519:public-test-key'); } catch (e) { failure = e; }
+  expect(failure).toBeInstanceOf(DaemonFailure);
+  expect(diagnosticReason(failure)).toBe('LOCK_UNAVAILABLE');
+  expect(mock.database).not.toHaveBeenCalled();
 });
 it('stable per-user key directory is 0700, mode/owner checked, not silently repaired or followed', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'bb-key-directory-')); const keys = join(dir, 'keys');
