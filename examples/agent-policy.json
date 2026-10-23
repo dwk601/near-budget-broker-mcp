@@ -1,5 +1,5 @@
 {
-  "agentId": "REPLACE_AGENT_ID",
+  "agentId": "00000000-0000-4000-8000-000000000001",
   "revision": 1,
   "perTxMax": "0.01",
   "rolling24hMax": "0.05",

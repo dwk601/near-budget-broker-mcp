@@ -1,5 +1,5 @@
 {
-  "agentId": "REPLACE_AGENT_ID",
+  "agentId": "00000000-0000-4000-8000-000000000001",
   "recipients": ["replace-receiver.testnet"],
   "perTxMax": "0.01",
   "totalMax": "0.03",

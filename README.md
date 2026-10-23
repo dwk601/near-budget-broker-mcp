@@ -8,25 +8,25 @@ The operator, daemon, configured testnet RPC and host are trusted. Agent bearer 
 
 ## Quickstart (protected operator environment)
 
-Requires Node **24+**, npm, Docker Compose v2, and a source checkout for fixture provisioning and building the Docker image. The private npm package is installed from a local tarball, not the public registry.
+Requires Node **24+**, npm, Docker Compose v2, and a source checkout for fixtures and Docker image builds. The private npm package installs from a local tarball, not the public registry. `node dist/main.js --help` (after building) or installed `budget-broker help` exits 0; MCP help (`budget-broker mcp --help`) goes to stderr, never protocol stdout.
 
 1. **Fixtures:** `npm ci && npm run build`, then `npm run fixtures:native -- --apply` and `npm run fixtures:native -- --check`. These are live testnet operations (faucet/RPC required). They persist encrypted custody, recovery and receiver material **outside the repository**, by default `~/.budget-broker/testnet-fixtures`. Never run them in an agent shell or give that directory to agents.
 2. **Owner key:** `node dist/main.js owner init-owner-key --out /protected/owner.json`. Choose a long passphrase at the non-echoing prompt; retain the returned **public** key for config. The daemon never receives this private key.
 3. **Custody initialization:** fixtures already performed encryption: their `broker-key.json` is an encrypted envelope, **not** input for `init-custody`. Reuse it as volume `custody.json` with its exact binary `master.secret`. For a separately provisioned raw testnet key instead, run `node dist/main.js init-custody --key-file /protected/native-key --master-file /protected/master --out /protected/custody.json`. The raw file contains only the `ed25519:…` secret, mode 0600. Do not use the recovery key. See [provisioning](docs/operator-guide.md#provisioning) for the fixture/Compose bridge.
-4. **Start daemon:** fill `examples/daemon-config.json` with the fixture custody account and owner public key. Provision the named volume and secrets as described in the operator guide, then `docker compose -f docker/docker-compose.yml -f examples/compose.fixture.yaml up -d --build`. Both published ports stay on **127.0.0.1**. Never mount owner/raw keys or the Docker socket into the daemon/agent.
+4. **Start daemon:** copy/edit `examples/daemon-config.json` **outside the repo**, using the fixture custody account and owner public key. Put config/master in protected 0600 files (0700 parent directories), readable by the mapped container uid 1000, never agents. Set `BB_CONFIG_FILE` to the absolute host config path and `BB_MASTER_FILE` to the exact fixture binary `master.secret` path; these are **paths**, not secret values. Base Compose now uses file-backed secrets compatible with read-only rootfs. Set `BB_IMAGE=budget-broker:local` and `BB_DATA_VOLUME=budget-broker-data` consistently. Follow [provisioning](docs/operator-guide.md#provisioning): Compose build → **create** (initializes volume ownership) → stdin-copy encrypted envelope as uid 1000 at **/var/lib/budget-broker** → `docker compose -f docker/docker-compose.yml up -d --no-build`. Do not mount a fresh volume first at `/data`. Both published ports stay **127.0.0.1**. Never mount owner/raw keys or Docker socket. Direct `BB_MASTER_SECRET` is refused; the daemon uses container `BB_MASTER_SECRET_FILE`.
 5. **Create agent/policies/token:** in the operator shell:
 
    ```sh
    export BB_OWNER_KEY_FILE=/protected/owner.json
    export BB_ADMIN_URL=http://127.0.0.1:3211
    node dist/main.js owner agent create demo
-   # Put the returned ID and fixture receiver A into agent-policy.json.
+   # Put the returned broker-issued UUID and fixture receiver A into agent-policy.json.
    node dist/main.js owner wallet-policy set --file examples/wallet-policy.json
    node dist/main.js owner policy set --file /protected/agent-policy.json
    node dist/main.js owner token issue AGENT_ID --out /protected/new-agent.token
    ```
 
-   Start from `examples/agent-policy.json`. CLI policy/grant amounts are **human NEAR strings**; daemon config and MCP amounts are **integer yoctoNEAR strings**. `1 NEAR = 10^24 yoctoNEAR`. Missing policies deny; zero never means unlimited. Deliver only the token to the isolated agent, owned by its uid, mode 0600 (no symlinks).
+   Start from `examples/agent-policy.json`; its sample UUID must be replaced. CLI policy/grant amounts are **human NEAR strings**; daemon config/MCP amounts are **integer yoctoNEAR strings**. `1 NEAR = 10^24 yoctoNEAR`. Missing policies deny; zero never means unlimited. Token issue/rotate prints **path + public credential ID**, never token plaintext (`--json`: `{path,credentialId}`). Keep that ID for rotation/revocation; deliver only the token file to the isolated agent uid, mode 0600, no symlinks.
 6. **Pack and configure MCP:** `npm pack --pack-destination /protected/packages` after building. Replace paths/version in [Claude Desktop](examples/claude-desktop.json), [Claude Code](examples/claude-code.mcp.json), or [Cursor](examples/cursor.mcp.json). All launch the same path:
 
    ```sh
@@ -51,8 +51,8 @@ Each agent has its own signed receipt chain; owner events have a separate chain.
 - [Operator guide / verified CLI reference](docs/operator-guide.md)
 - [Agent tools, outputs and error codes](docs/agent-tools.md)
 - [Security model](docs/security-model.md) · [Troubleshooting](docs/troubleshooting.md)
-- [Packaging checks and known amendment requests](docs/package-validation.md)
+- [Packaging checks and verified compatibility](docs/package-validation.md)
 
-`npm run test:package` builds, packs, installs outside the checkout, validates shipped artifacts/examples/skill, exercises installed commands, and measures 30 help startups (p95 ≤1000 ms). `npm run typecheck` checks source, scripts and tests. No live payment or faucet is used by these checks.
+`npm run test:package` builds dist itself, packs, installs outside the checkout, validates shipped artifacts/examples/skill and captured help, exercises installed commands/exits, and measures 30 successful help startups (p95 ≤1000 ms). `npm run typecheck` checks source/scripts/tests. No live payment/faucet is used by these checks. CLI exits: 0 success/help; 1 operation/dependency/receipt verification failure; 2 local usage/file validation or stale policy revision; 3 authentication/authorization. See troubleshooting for separate redacted daemon diagnostic reasons. Locks release through the kernel after crashes: **retain SQLite lock files**, never delete them to restart.
 
 MIT — see [LICENSE](LICENSE).

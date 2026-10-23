@@ -1,6 +1,0 @@
-# Compose >=2.24.4; merge AFTER docker/docker-compose.yml, from a source checkout.
-# Only the protected operator may read this file's referenced secret.
-# Fixture master.secret is binary: NEVER put it in an environment variable.
-secrets:
-  bb_master: !override
-    file: ${BB_FIXTURES_DIR:?set absolute external fixture directory}/master.secret

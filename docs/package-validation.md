@@ -1,36 +1,37 @@
-# Package validation and integration amendments
+# Package validation and verified compatibility
 
-## What is tested
+## Run
 
-Run `npm run test:package` on Node 24+. The existing package script invokes `vitest run test/package`; no package/config changes are needed. `test/package/package.test.ts` replaces the placeholder with real checks:
+```sh
+npm ci
+npm run test:package && npm run typecheck
+```
 
-1. Build TypeScript, `npm pack --json` into an OS temp directory, and install that tarball in a newly created consumer project **outside the repository**. Supports npm's array (≤11) and package-keyed (12) pack manifests. Dependencies may require registry access; broker/payment checks do not contact public NEAR RPCs.
-2. Inspect the actual tar archive, compare it with the pack manifest, require dist/bin/README/LICENSE/skill/examples/Docker files, and reject non-allowlisted paths, tests, .env, secrets/state/credential material, databases, private keys, tokens and node_modules. Assert installed executable resolution is inside the isolated consumer and no postinstall daemon launch hook exists.
-3. Parse every shipped example JSON; validate MCP launch commands/version and CLI policy/grant shapes after exact NEAR conversion. Validate the skill's simple YAML name/description frontmatter and broker-only fallback.
-4. Launch the **installed bin**, not tsx or the repository dist path. Missing or nonexistent token input must exit nonzero, stderr-only, without stacks/token leakage. Exercise local owner key/custody initialization and offline signed receipt/checkpoint verification with ephemeral test-only keys. Exercise the daemon config flag's missing-file error without unlocking or contacting RPC.
-5. Run 32 owner admin command/flag forms against a local recording stub using real encrypted owner-key unlock and signed HTTP requests. The stub validates actual operation bodies against strict admin schemas; it is deliberately not a live broker or an owner-auth security test. It checks exact monetary conversion, force behavior, token files and paginated exports. All reference commands/flags are checked by execution rather than assumed from a different CLI version. Local commands and optional positional variants are exercised too.
-6. Time 30 separate installed `budget-broker --help` invocations, compute nearest-rank p95, print it and require ≤1000 ms. Separately require exit 0, meaningful help on stdout and no stderr. A fast usage error is **not** accepted as valid help.
-7. Remove the consumer, tarball and ephemeral secrets in suite cleanup, including assertion/setup failure. Build output is the ordinary git-ignored dist directory; no fixture/state or tarball is left in the checkout.
+The package suite **builds dist itself** before packing; no prepack hook is needed or assumed. Operator tarball creation likewise uses `npm run build` followed by `npm pack`. Node 24+ is required. npm dependencies may need registry access; no live faucet, payment or public NEAR RPC is used by packaging tests. Package metadata, lockfile, source/configs and Docker implementation are unchanged by B09.
 
-Run `npm run typecheck` too. Source-only operator docs are not in the frozen package allowlist: the tarball ships README, examples (with their README), skills and docker alongside dist. Use the checkout for full docs, fixtures and Docker image builds. The package is private; tarball npx installation does not imply registry publication.
+## What the package suite checks
 
-## Base 32bf601 results
+`test/package/package.test.ts` creates one OS temp directory and a fresh consumer project **outside the checkout**, then:
 
-On Node 24.16.0 / npm 12.0.2: archive/install, JSON/skill validation, missing-token clean error and installed command matrix pass. Latest help timing p95 was **164.2 ms** over 30 processes, under 1000 ms, but **all help processes returned usage status 2**, so the suite correctly reports **4 passed, 1 failed**. These timings measure the current failing help path, not a claim that functional help passed. Typecheck passes separately; `test:package && typecheck` stops at the help failure, so typecheck was also invoked independently. Base, fixture-secret and prebuilt-image Compose configurations validate with `docker compose … config --quiet`; no live daemon/faucet/payment was started for documentation validation.
+1. Runs build, `npm pack --json --pack-destination TEMP`, and installs that tarball in the fresh project with scripts disabled. Supports npm's array (≤11) and package-keyed (12) pack manifests. The installed bin resolves inside that consumer, not the worktree.
+2. Inspects the actual archive and compares manifest entries. Requires dist/bin/README/LICENSE/skill/examples/Docker files; rejects paths outside the frozen allowlist, tests, node_modules, .env, state/databases, private-key/token material and credential artifacts. No postinstall launch hook.
+3. Parses every shipped example JSON, validates MCP npx argv and version, checks policy/grant shape with exact NEAR conversion, and validates the skill's simple YAML name/description frontmatter.
+4. Launches the **installed bin** for missing/nonexistent token errors: nonzero, clean stderr only, no stdout/stacks/token leakage. Exercises real local encrypted owner/custody initialization, config flag/env fallback, valid offline signed receipt/checkpoint verification and corrupt JSON/schema/signature failures.
+5. Executes 32 owner admin forms/optional positional variants/flags against a local recording stub using encrypted owner unlock and real signed HTTP requests. The stub validates strict admin schemas; it is not a live broker/owner-auth security test. Inputs use UUIDs, not generic labels. Tests check monetary conversion, force behavior, sequence exports, protected token files and **both plain and JSON path + credentialId output**. Refusal cases validate documented exits 0/1/2/3, including stale policy-write revision exit 2 and authorization exit 3.
+6. Verifies help variants without credentials/network. `docs/cli-help.txt` is captured from current real CLI help and compared byte-for-byte with the installed help; root/owner help uses stdout, **mcp --help / help mcp use stderr with empty stdout**, all exit 0.
+7. Times 30 separate installed `--help` processes, prints nearest-rank p95 and requires **≤1000 ms**, meaningful help, exit 0 and no stderr. Fast usage errors do not count. Direct stdout reporting keeps the timing visible even when Vitest hides passing console logs.
+8. Cleans consumer/tarball/ephemeral secrets in suite cleanup, including assertion/setup failure. Only normal git-ignored dist build output remains. It does not write fixture/state/tarball artifacts into the checkout.
 
-## Amendment requests (not edited by B09)
+`npm run test:cli` additionally executes current CLI/main behavior against fake chain/RPC dependencies: local validation/stale policy revisions, verification corruption, authentication/Host/Origin exits, every daemon diagnostic, per-key locks across data directories and crash recovery. `npm run test:isolation` exercises real Docker build/create/provision/up with file secrets/read-only rootfs and SIGKILL/restart using isolated fake RPC; no Docker skip was requested. Base plus both example overrides (individually and combined) are rendered with real `docker compose config --quiet` / JSON assertions to check file-secret paths, BB_IMAGE/BB_DATA_VOLUME, loopback ports, sole named-volume mount and preserved hardening.
 
-### Required: B08 CLI help
+## Current reviewed candidate
 
-`src/cli/index.ts` does not implement `--help`: the parser treats it as an unsupported flag and returns `Budget Broker: USAGE (see docker/README.md for commands)` on stderr, status 2. Add a cheap side-effect-free top-level `budget-broker --help` path before credential loading/daemon startup; return 0 with real command/flag help on stdout and no stderr. Include mcp, daemon/config, custody initialization and all owner forms/flags from the operator guide. Optional command-specific help is welcome but is not currently documented as supported. Keep the installed help p95 ≤1000 ms. **Do not weaken or skip the packaging assertion.** Re-run packaging/typecheck after the B08 fix; help-derived reference generation cannot truthfully claim success on this base, so the current reference is based on the actual command forms plus executed installed-bin matrix.
+B09 is rebased on B08 **ea21b74** (previous B09 commit became c2a59b7). On Node 24.16.0 / npm 12.0.2: **package 6/6, CLI 21/21, Docker isolation 6/6 and typecheck pass**. Final validation started with dist removed: the suite rebuilt it and successful installed help p95 was **82.7 ms** over 30 runs, comfortably below 1000 ms; each run prints its own measurement. The prior help failure is fixed, not skipped or relaxed. [Operator reference](operator-guide.md) now links captured help and documents the actual UUID validation, exit statuses, token output, file secrets and kernel locks.
 
-### Optional: B00 pack freshness
+## Compatibility assumptions; no outstanding amendment requests
 
-There is no prepack build hook. The documented operator flow and test explicitly build before packing, but bare `npm pack` in an unbuilt checkout can omit dist or package stale dist. Consider adding `prepack: npm run build` (package owner only); B09 intentionally does not edit package.json/lock/configs. The test must still inspect the tarball, not just the worktree.
-
-### Deployment compatibility observations (documented, no source amendment required)
-
-- `init-custody` takes a protected **raw** ed25519 string; fixtures output an **encrypted** broker-key.json. Reuse that envelope and exact master bytes rather than re-encrypting the JSON or switching to the recovery key.
-- Fixture master.secret is random binary, while base Compose BB_MASTER_MATERIAL is environment text. `examples/compose.fixture.yaml` uses a file-backed secret override. Never place binary bytes in an environment variable.
-- The shipped Dockerfile builds from src/lock/tsconfig, which are intentionally absent from the tarball. Build from a source checkout or provide a separately trusted prebuilt image using the override; no false claim that the tarball alone can build that Dockerfile.
-- README relative docs links target the source checkout's docs; full docs distribution would require an owner-approved package allowlist amendment if desired.
+- Package is private and npx uses a **local tarball**, not a claim of registry publication. Explicit build-before-pack is documented and performed by the suite; no package-script amendment is requested.
+- Tarball allowlist intentionally includes README/examples/skill/Docker/dist, not full docs, src, fixture scripts, lockfile or compiler config. README's full-guide links target the source checkout. Build the daemon image and run live fixtures from source, or supply a separately trusted **BB_IMAGE** via the prebuilt override.
+- Fixture broker-key.json is already encrypted; reuse it with exact binary master.secret. Base Compose file secrets already support that binary file through **BB_MASTER_FILE**. No environment/content-secret override remains.
+- Absolute **BB_MASTER_FILE/BB_CONFIG_FILE** paths are protected operator exceptions (outside repo, 0600/0700, mapped uid 1000-readable). Daemon receives **BB_MASTER_SECRET_FILE**; direct BB_MASTER_SECRET is refused. Keep image/volume variables consistent, Compose **create before provisioning**, and mount stdin-only encrypted provisioning at **/var/lib/budget-broker** as uid 1000.
+- SQLite data/per-custody-key lock files are retained; kernel lock release handles crashes. No stale PID/tmp-lock deletion procedure applies to current locks. Independent users/hosts/volumes are not distributed fencing. One daemon/trust root per custody key remains mandatory.

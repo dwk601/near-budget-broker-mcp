@@ -1,0 +1,22 @@
+Usage: budget-broker <daemon|mcp|init-custody|owner> [options]
+       budget-broker help [subcommand]
+       budget-broker <subcommand> --help
+
+  daemon --config FILE                  Run the testnet daemon
+  mcp                                   Agent stdio bridge (BB_URL + BB_TOKEN_FILE)
+  init-custody --key-file FILE --master-file FILE --out FILE
+  owner init-owner-key --out FILE        Create an encrypted owner key
+  owner agent create|list|revoke
+  owner token issue|rotate|revoke        --out FILE for issue/rotation
+  owner policy set|get                  --file FILE for set (human NEAR amounts)
+  owner wallet-policy set --file FILE
+  owner approvals list|approve|reject
+  owner standing grant|revoke|list
+  owner freeze|unfreeze global|agent
+  owner status|audit-key|reconcile|resolve-attempt
+  owner requests list|get
+  owner receipts export|verify
+  owner checkpoints list
+
+Owner options: --key FILE --url URL --json; list paging: --limit N --after ID.
+See docker/README.md for command arguments, secret provisioning and isolation.

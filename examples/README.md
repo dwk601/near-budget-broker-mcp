@@ -1,17 +1,24 @@
 # Examples
 
-Replace every placeholder; these files contain no credentials.
+Replace every placeholder and sample UUID; these files contain no credentials.
 
 - Claude Desktop: merge `claude-desktop.json` into its MCP settings.
-- Claude Code: use `claude-code.mcp.json` as project `.mcp.json` (or merge into existing settings).
+- Claude Code: use `claude-code.mcp.json` as project `.mcp.json` (or merge).
 - Cursor: use `cursor.mcp.json` as `.cursor/mcp.json` (or merge).
 
-All three run `npx --yes --package /abs/path/near-budget-broker-mcp-0.1.0.tgz budget-broker mcp`. Build and pack first; update the absolute tarball path and agent-owned 0600 token path. Node 24+ and npx must be on the app's PATH. Restart/reconnect the MCP client after edits. Tokens belong in files, not JSON, args or source control. A project config's trust/enable prompt still needs operator review.
+All run `npx --yes --package /abs/path/near-budget-broker-mcp-0.1.0.tgz budget-broker mcp`. Build and pack first; update absolute tarball path and agent-owned 0600 token path. Node 24+/npx must be on the app's PATH. Restart/reconnect after edits. Tokens belong in files, not JSON/args/source control. Review project trust prompts. `budget-broker mcp --help` exits 0 with help on stderr, leaving MCP stdout empty.
 
-`agent-policy.json`, `wallet-policy.json` and `standing-approval.json` are **owner CLI** inputs: amounts are human decimal NEAR strings. Replace IDs/recipients, review caps, and set a short future epoch-ms expiry for the standing grant (the sample timestamp is illustrative, not an appropriate approval lifetime).
+`agent-policy.json`, `wallet-policy.json` and `standing-approval.json` are **owner CLI** inputs: amounts are human decimal NEAR strings. The sample `00000000-0000-4000-8000-000000000001` is a syntactically valid UUID, **not an existing agent**. Replace it with the actual broker-issued agent UUID, replace recipients, review caps and set a short future epoch-ms standing expiry. The illustrative timestamp is not a recommended approval lifetime. CLI UUID/file/money/expired-grant validation errors exit 2; no request is authorized by an example.
 
-`daemon-config.json` uses **yoctoNEAR text**, not human NEAR; replace the custody account and public owner key. No private keys/master secret belong in it.
+`daemon-config.json` uses **integer yoctoNEAR text**, not human NEAR. Replace custody account/public owner key; save edited config outside the repository, mode 0600 in a 0700 directory. No private key/master value belongs in config. Base Compose requires absolute `BB_MASTER_FILE`/`BB_CONFIG_FILE` host paths, file-backed secrets readable by mapped uid 1000, never agents. For fixtures, `BB_MASTER_FILE` can point directly to the protected binary master.secret; keep its exact bytes. No secret-value environment variables or secret override are needed. Daemon `BB_MASTER_SECRET` is refused; Compose sets only container `BB_MASTER_SECRET_FILE`.
 
-Compose overrides require Compose >=2.24.4 (`!override` / `!reset`). The base file is `docker/docker-compose.yml`. Use `compose.fixture.yaml` for the fixtures' binary master file instead of the base environment-text secret. `compose.prebuilt.yaml` disables the source build and requires `BB_DAEMON_IMAGE` to name a separately trusted image. Both preserve the base isolation/loopback ports. Compose file paths resolve against the first/base file; environment paths here must be absolute. See the source checkout's operator guide for volume provisioning. Never run Docker from the agent environment.
+Set `BB_IMAGE` (default budget-broker:local) and `BB_DATA_VOLUME` (default budget-broker-data) consistently across Compose and provisioning. Build from a source checkout; then **compose create before provisioning**, so the fresh volume inherits image uid/gid 1000. Copy only the encrypted custody envelope on stdin as uid 1000, mounting at **/var/lib/budget-broker**, never /data. Follow `docker/README.md` for the full sequence. Never expose Docker to agents.
 
-The tarball ships these examples, skill, Docker files and built CLI, but not fixture scripts or full docs/src. Use the source checkout for live provisioning and image builds; use the tarball for keyless bridges.
+Optional overrides (merge after `docker/docker-compose.yml`):
+
+- `compose.prebuilt.yaml`: removes source build using `!reset` (Compose >=2.24.4); set **BB_IMAGE** to an independently trusted image. Omit build, but still create before provisioning. The base image/volume/secret variables remain authoritative.
+- `compose.resources.yaml`: adds 1 GiB memory / 128-process limits without changing ports, secrets or isolation; tune deliberately for workload.
+
+Validate the exact merged files with `docker compose … config --quiet` before create/up. Relative paths resolve against the first/base file; secret paths must be absolute. Both overrides preserve 127.0.0.1 publications and the named volume; no Docker socket, host credentials or state bind mounts. Lock files are SQLite kernel locks retained across restarts, not stale PID files to delete.
+
+The tarball ships built CLI, README, examples, skill and Docker files, not full docs/src/fixture scripts. Use the source checkout for full guides, live provisioning and image builds, or supply a separately trusted image. Use tarball npx for keyless agent bridges.

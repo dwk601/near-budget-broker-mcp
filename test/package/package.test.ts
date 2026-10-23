@@ -7,7 +7,7 @@ import { isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { createServer } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { KeyPair } from 'near-api-js';
 import { AuditSigner } from '../../src/audit/core/index.js';
 import { adminSchemas } from '../../src/daemon/admin.js';
@@ -153,7 +153,9 @@ test('installed owner command/flag matrix matches documented forms and real admi
   // Real daemon flag/config-file path, deliberately missing file: never unlock/network.
   const daemon = await installed(['daemon', '--config', join(temporary, 'missing-config'), '--json']);
   expect(daemon.status).toBe(1);
-  expect(JSON.parse(daemon.stderr)).toEqual({ error: { code: 'BROKER_UNAVAILABLE' } });
+  expect(JSON.parse(daemon.stderr)).toEqual({ error: { code: 'BROKER_UNAVAILABLE', reason: 'BAD_CONFIG' } });
+  const daemonEnv = await installed(['daemon', '--json'], { BB_CONFIG_FILE: join(temporary, 'missing-config') });
+  expect(daemonEnv).toEqual(daemon);
 
   const audit = AuditSigner.generate();
   const receiptPreimage = { chainId: 'owner', seq: 1, prevHash: '0'.repeat(64), type: 'freeze' as const, at: 1,
@@ -165,12 +167,26 @@ test('installed owner command/flag matrix matches documented forms and real admi
   const checkpoint = { ...checkpointPreimage, hash: checkpointHash, signature: Buffer.from(audit.signHash(Buffer.from(checkpointHash, 'hex'))).toString('base64') };
   const receiptsFile = join(temporary, 'receipts.json'); const checkpointFile = join(temporary, 'checkpoint.json');
   await writeFile(receiptsFile, canonicalJson([receipt])); await writeFile(checkpointFile, canonicalJson(checkpoint));
-  const verify = await installed(['owner', 'receipts', 'verify', '--file', receiptsFile, '--checkpoint', checkpointFile, '--audit-key', audit.publicKey]);
+  const verifyArgs = ['owner', 'receipts', 'verify', '--file', receiptsFile, '--checkpoint', checkpointFile, '--audit-key', audit.publicKey];
+  const verify = await installed(verifyArgs);
   expect(verify.status, verify.stderr).toBe(0); expect(JSON.parse(verify.stdout)).toHaveProperty('valid', true);
+  const corruptFile = join(temporary, 'corrupt-receipts.json');
+  for (const corrupt of ['{', '{}', canonicalJson([{ ...receipt, signature: Buffer.alloc(64).toString('base64') }])]) {
+    await writeFile(corruptFile, corrupt);
+    const invalid = await installed(verifyArgs.map((arg) => arg === receiptsFile ? corruptFile : arg));
+    expect(invalid.status, invalid.stderr).toBe(1);
+  }
+  for (const args of [[], ['owner', 'receipts', 'verify'], ['owner', 'requests', 'get', 'not-a-uuid'], ['owner', 'agent', 'list', '--limit', '0']]) {
+    const invalid = await installed([...args, '--json']);
+    expect(invalid.status, args.join(' ')).toBe(2);
+    expect(invalid.stdout).toBe(''); expect(JSON.parse(invalid.stderr)).toEqual({ error: { code: 'USAGE' } });
+  }
 
   const calls: { op: string; body: Record<string, unknown> }[] = [];
   const failures: string[] = [];
   const token = `bb_agent_${randomBytes(32).toString('base64url')}`;
+  const agentId = randomUUID(); const credentialId = randomUUID(); const requestId = randomUUID(); const approvalId = randomUUID();
+  let refused: 'FORBIDDEN' | 'UNAUTHENTICATED' | 'POLICY_CHANGED' | undefined;
   const server = createServer(async (req, res) => {
     try {
       const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(Buffer.from(chunk as Uint8Array));
@@ -180,7 +196,10 @@ test('installed owner command/flag matrix matches documented forms and real admi
       if (!Object.hasOwn(adminSchemas, op)) throw new Error(`Unknown operation ${op}`);
       adminSchemas[op as keyof typeof adminSchemas].parse(body);
       calls.push({ op, body });
-      const result = op === 'issueToken' || op === 'rotateToken' ? { token }
+      if (refused) {
+        res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: { code: refused } })); return;
+      }
+      const result = op === 'issueToken' || op === 'rotateToken' ? { token, credential: { id: credentialId } }
         : op === 'exportReceipts' ? (body['afterSeq'] === 0 ? [receipt] : [])
         : op === 'listCheckpoints' ? (body['afterSeq'] === 0 ? [checkpoint] : []) : { ok: true };
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ result }));
@@ -189,27 +208,32 @@ test('installed owner command/flag matrix matches documented forms and real admi
   await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('Missing admin stub port');
   const url = `http://127.0.0.1:${address.port}`;
-  const agentPolicy = join(repo, 'examples/agent-policy.json'); const walletPolicy = join(repo, 'examples/wallet-policy.json');
-  const grant = join(repo, 'examples/standing-approval.json');
+  const shipped = join(project, 'node_modules/near-budget-broker-mcp/examples');
+  const agentPolicy = join(temporary, 'agent-policy.json'); const walletPolicy = join(shipped, 'wallet-policy.json');
+  const grant = join(temporary, 'standing-approval.json');
+  const policyValue = JSON.parse(await readFile(join(shipped, 'agent-policy.json'), 'utf8')) as Record<string, unknown>;
+  await writeFile(agentPolicy, JSON.stringify({ ...policyValue, agentId }));
+  const grantValue = JSON.parse(await readFile(join(shipped, 'standing-approval.json'), 'utf8')) as Record<string, unknown>;
+  await writeFile(grant, JSON.stringify({ ...grantValue, agentId, expiresAt: Date.now() + 60_000 }));
   const cases: [string[], string][] = [
     [['agent', 'create', 'demo'], 'createAgent'], [['agent', 'list', '--after', 'cursor', '--limit', '2'], 'listAgents'],
-    [['agent', 'revoke', 'agent', 'review complete'], 'revokeAgent'],
-    [['token', 'issue', 'agent', '--out', join(temporary, 'token-issued')], 'issueToken'],
-    [['token', 'rotate', 'credential', '--out', join(temporary, 'token-rotated')], 'rotateToken'],
-    [['token', 'revoke', 'credential'], 'revokeToken'],
-    [['policy', 'set', '--file', agentPolicy], 'setPolicy'], [['policy', 'get', 'agent'], 'getPolicy'],
+    [['agent', 'revoke', agentId, 'review complete'], 'revokeAgent'],
+    [['token', 'issue', agentId, '--out', join(temporary, 'token-issued')], 'issueToken'],
+    [['token', 'rotate', credentialId, '--out', join(temporary, 'token-rotated')], 'rotateToken'],
+    [['token', 'revoke', credentialId], 'revokeToken'],
+    [['policy', 'set', '--file', agentPolicy], 'setPolicy'], [['policy', 'get', agentId], 'getPolicy'],
     [['wallet-policy', 'set', '--file', walletPolicy], 'setWalletPolicy'],
     [['approvals', 'list', '--limit', '2', '--after', 'cursor'], 'listRequests'],
-    [['approvals', 'approve', 'request', '2000000000000'], 'approve'], [['approvals', 'reject', 'request', 'reviewed'], 'reject'],
-    [['standing', 'grant', '--file', grant], 'grantStandingApproval'], [['standing', 'revoke', 'approval'], 'revokeStandingApproval'],
-    [['standing', 'list', 'agent', '--after', 'cursor', '--limit', '2'], 'listStandingApprovals'],
-    [['freeze', 'global', 'stop'], 'freeze'], [['freeze', 'agent', 'agent', 'stop'], 'freeze'],
-    [['unfreeze', 'global', 'reviewed'], 'unfreeze'], [['unfreeze', 'agent', 'agent', 'reviewed'], 'unfreeze'],
+    [['approvals', 'approve', requestId, String(Date.now() + 60_000)], 'approve'], [['approvals', 'reject', requestId, 'reviewed'], 'reject'],
+    [['standing', 'grant', '--file', grant], 'grantStandingApproval'], [['standing', 'revoke', approvalId], 'revokeStandingApproval'],
+    [['standing', 'list', agentId, '--after', 'cursor', '--limit', '2'], 'listStandingApprovals'],
+    [['freeze', 'global', 'stop'], 'freeze'], [['freeze', 'agent', agentId, 'stop'], 'freeze'],
+    [['unfreeze', 'global', 'reviewed'], 'unfreeze'], [['unfreeze', 'agent', agentId, 'reviewed'], 'unfreeze'],
     [['status'], 'walletStatus'], [['audit-key'], 'auditPublicKey'],
     [['requests', 'list', '--after', 'cursor', '--limit', '2'], 'listRequests'],
-    [['requests', 'list', 'agent'], 'listRequests'], [['requests', 'get', 'request'], 'getRequest'],
-    [['reconcile'], 'reconcile'], [['reconcile', 'request'], 'reconcile'],
-    [['resolve-attempt', 'request', 'reviewed'], 'resolveAttempt'], [['resolve-attempt', 'request', 'reviewed', '--force'], 'resolveAttempt'],
+    [['requests', 'list', agentId], 'listRequests'], [['requests', 'get', requestId], 'getRequest'],
+    [['reconcile'], 'reconcile'], [['reconcile', requestId], 'reconcile'],
+    [['resolve-attempt', requestId, 'reviewed'], 'resolveAttempt'], [['resolve-attempt', requestId, 'reviewed', '--force'], 'resolveAttempt'],
     [['receipts', 'export', 'owner'], 'exportReceipts'],
     [['receipts', 'export', 'owner', '--out', join(temporary, 'export.json')], 'exportReceipts'],
     [['checkpoints', 'list', 'owner'], 'listCheckpoints'],
@@ -222,6 +246,9 @@ test('installed owner command/flag matrix matches documented forms and real admi
       expect(result.status, `${args.join(' ')}: ${result.stderr}; ${failures.join('; ')}`).toBe(0);
       expect(calls.slice(start).map((call) => call.op)).toContain(operation);
       expect(result.stdout).not.toContain(token);
+      if (['issueToken', 'rotateToken'].includes(operation)) {
+        expect(JSON.parse(result.stdout)).toEqual({ path: args[args.indexOf('--out') + 1], credentialId });
+      }
     }
     const byEnvironment = await installed(['owner', 'status'], { ...credentials, BB_ADMIN_URL: url });
     expect(byEnvironment.status, byEnvironment.stderr).toBe(0);
@@ -232,9 +259,32 @@ test('installed owner command/flag matrix matches documented forms and real admi
       expect((await readFile(join(temporary, file), 'utf8')).trim()).toBe(token);
       expect((await stat(join(temporary, file))).mode & 0o777).toBe(0o600);
     }
-    console.log(`Installed CLI: ${cases.length} admin forms + init-owner-key/init-custody/daemon config/offline verify exercised`);
+    const plainTokenFile = join(temporary, 'plain-token');
+    const plain = await installed(['owner', 'token', 'issue', agentId, '--out', plainTokenFile], { ...credentials, BB_ADMIN_URL: url });
+    expect(plain.status, plain.stderr).toBe(0);
+    expect(plain.stdout).toBe(`${plainTokenFile}\ncredentialId: ${credentialId}\n`);
+    for (const code of ['UNAUTHENTICATED', 'FORBIDDEN', 'POLICY_CHANGED'] as const) {
+      refused = code;
+      const args = code === 'POLICY_CHANGED' ? ['wallet-policy', 'set', '--file', walletPolicy] : ['status'];
+      const result = await installed(['owner', ...args, '--json'], { ...credentials, BB_ADMIN_URL: url });
+      expect(result.status, result.stderr).toBe(code === 'POLICY_CHANGED' ? 2 : 3);
+      expect(JSON.parse(result.stderr)).toEqual({ error: { code: code === 'POLICY_CHANGED' ? 'USAGE' : code } });
+      expect(result.stdout).toBe('');
+    }
+    console.log(`Installed CLI: ${cases.length} admin forms + local commands, verification and exits 0/1/2/3 exercised`);
   } finally { await new Promise<void>((done, reject) => server.close((error) => error ? reject(error) : done())); }
 }, 120_000);
+
+test('documented help variants exit zero without credentials and keep MCP stdout clean', async () => {
+  const reference = await readFile(join(repo, 'docs/cli-help.txt'), 'utf8');
+  for (const args of [['help'], ['help', 'owner'], ['owner', '--help'], ['daemon', '--help'], ['init-custody', '--help'], ['owner', 'token', 'issue', '--help'], ['mcp', '--help'], ['help', 'mcp']]) {
+    const result = await installed(args);
+    expect(result.status, args.join(' ')).toBe(0);
+    const mcp = args.includes('mcp');
+    expect(result.stdout).toBe(mcp ? '' : reference);
+    expect(result.stderr).toBe(mcp ? reference : '');
+  }
+});
 
 test('installed --help is successful, meaningful and starts within p95 1000 ms over 30 runs', async () => {
   const durations: number[] = [];
@@ -244,10 +294,13 @@ test('installed --help is successful, meaningful and starts within p95 1000 ms o
   }
   durations.sort((a, b) => a - b);
   const p95 = durations[Math.ceil(0.95 * durations.length) - 1]!;
-  console.log(`Installed budget-broker --help startup: n=30 p95=${p95.toFixed(1)} ms (limit 1000 ms)`);
+  // Direct output remains visible when Vitest hides passing-test console logs.
+  process.stdout.write(`Installed budget-broker --help startup: n=30 p95=${p95.toFixed(1)} ms (limit 1000 ms)\n`);
   expect(p95).toBeLessThanOrEqual(1000);
+  const reference = await readFile(join(repo, 'docs/cli-help.txt'), 'utf8');
   for (const result of results) {
-    expect(result.status, `--help must succeed, not return USAGE: ${result.stderr}`).toBe(0);
+    expect(result.status, `--help must succeed: ${result.stderr}`).toBe(0);
+    expect(result.stdout).toBe(reference);
     expect(result.stdout).toMatch(/budget-broker/i);
     expect(result.stdout).toMatch(/mcp/);
     expect(result.stdout).toMatch(/owner/);

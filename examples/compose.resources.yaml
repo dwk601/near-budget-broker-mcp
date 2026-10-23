@@ -1,0 +1,6 @@
+# Optional merge AFTER docker/docker-compose.yml; does not alter secrets/ports.
+# Review bounds against operator workload; no availability guarantee is implied.
+services:
+  daemon:
+    mem_limit: 1g
+    pids_limit: 128
