@@ -41,7 +41,7 @@ async function listen(server: Server, port: number, host: string) {
     server.once('error', rej); server.listen(port, host, () => { server.off('error', rej); res(); });
   });
 }
-export async function startDaemon(options: DaemonOptions) {
+export async function startDaemon(options: DaemonOptions, shutdownSignal?: AbortSignal) {
   let config: Config;
   try { config = parseConfig(options.config); }
   catch (e) { if (e instanceof BrokerError && e.code === 'MAINNET_REFUSED') throw e; throw new DaemonFailure('BAD_CONFIG'); }
@@ -64,11 +64,15 @@ export async function startDaemon(options: DaemonOptions) {
   let admin: ReturnType<typeof createAdminHttpServer> | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let scheduled: Promise<void> | undefined;
+  let broker: BrokerService | undefined;
   const calls = new Set<Promise<unknown>>();
   let closing = false;
   let closePromise: Promise<void> | undefined;
+  const stopDispatch = () => broker?.stopDispatch();
+  shutdownSignal?.addEventListener('abort', stopDispatch, { once: true });
   async function cleanup() {
     closing = true; if (timer) clearInterval(timer);
+    stopDispatch(); shutdownSignal?.removeEventListener('abort', stopDispatch);
     // Close listeners/sessions, then wait for already invoked broker operations.
     const errors: unknown[] = [];
     const attempt = async (work: () => unknown) => { try { await work(); } catch (e) { errors.push(e); } };
@@ -110,11 +114,13 @@ export async function startDaemon(options: DaemonOptions) {
     const receipts = new ReceiptLog(store, audit);
     const checkpoints = new CheckpointLog(store, audit);
     const auth = new RequestAuthenticator({ store, clock, ownerPublicKey: config.ownerPublicKey });
-    const broker = new BrokerService({ store, chain, signer, receipts, checkpoints,
+    const service = new BrokerService({ store, chain, signer, receipts, checkpoints,
       approvals: new TransactionalApprovalService({ kind: 'owner' }, receipts), clock, config, autoDispatch: false });
-    await broker.start();
+    broker = service;
+    if (shutdownSignal?.aborted) stopDispatch();
+    await service.start();
     // Track even operations whose HTTP client disconnects before completion.
-    const tracked = new Proxy(broker, { get(target, key) {
+    const tracked = new Proxy(service, { get(target, key) {
       const item: unknown = Reflect.get(target, key);
       if (typeof item !== 'function') return item;
       return (...args: unknown[]) => {
@@ -131,7 +137,7 @@ export async function startDaemon(options: DaemonOptions) {
     } catch { throw new DaemonFailure('LISTEN_FAILED'); }
     timer = setInterval(() => {
       if (closing || scheduled) return;
-      scheduled = (async () => { await broker.expirePending(); await broker.drain(); })()
+      scheduled = (async () => { await service.expirePending(); await service.drain(); })()
         .catch((e: unknown) => log(e instanceof BrokerError ? e.code : 'BROKER_UNAVAILABLE'))
         .finally(() => { scheduled = undefined; });
     }, intervalMs);
@@ -142,11 +148,14 @@ export async function startDaemon(options: DaemonOptions) {
 
 /** Signal handlers belong to the executable, not to the reusable composition seam. */
 export async function runDaemon(options: DaemonOptions): Promise<void> {
+  const shutdown = new AbortController();
   let stop!: () => void;
-  const stopped = new Promise<void>((done) => { stop = done; });
+  const stopped = new Promise<void>((done) => { stop = () => { shutdown.abort(); done(); }; });
   process.on('SIGTERM', stop); process.on('SIGINT', stop);
   try {
-    const daemon = await startDaemon(options);
+    // Signal the broker synchronously, including during startup recovery, rather
+    // than waiting for startDaemon's initial drain to return the close handle.
+    const daemon = await startDaemon(options, shutdown.signal);
     await stopped; await daemon.close();
   } finally { process.off('SIGTERM', stop); process.off('SIGINT', stop); }
 }

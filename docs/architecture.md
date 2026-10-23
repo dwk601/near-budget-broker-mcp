@@ -585,6 +585,11 @@ existing attempts (and returns only examined requests), never queued payments.
 Preview may fetch an ephemeral balance but writes no balance/request/hold/receipt.
 A backwards clock step skips pending expirations newer than the clock.
 
+Daemon shutdown sets an irreversible in-memory broker stop signal before awaiting
+invoked work. The pump checks it before selecting each next item and at the send
+intent gate: only an already-invoked broadcast/status attempt may finish, not the
+remaining queue. Holds and queued work remain durable for a fresh broker on restart.
+
 NearChain.txStatus accepts an optional persisted TxAttempt (the two-argument
 form remains compatible). The native adapter validates its signed bytes and binds
 hash/signer/key/nonce/block before proving exclusion. A nonce proof requires
@@ -608,8 +613,11 @@ abandon such an attempt, mark it failed with zero burn, release its hold and let
 other agents proceed with strictly higher nonces. It can never be revived or
 rebroadcast. Global freeze still pauses the lane. Already-offered ambiguous work
 cannot use this exception. A standing grant remains bound to the exact grant in
-the decision receipt; signing must re-reserve that same grant. A benign revision
-mismatch at owner approval returns the stable POLICY_CHANGED code.
+the decision receipt; signing must re-reserve that same grant. A standing-approval
+decision not bound by the request's approvalRef is treated as needs_approval, not
+permission to switch grants. Recovery abandons never-offered/proven-unexecuted
+work in that case, while offered ambiguous work retains its hold and pauses.
+A benign revision mismatch at owner approval returns the stable POLICY_CHANGED code.
 
 OwnerBrokerService.resolveAttempt(owner, requestId, reason, force=false) requires
 fresh nonce/expiry exclusion under the rules below. Reason must be nonempty,
@@ -741,9 +749,12 @@ A narrow Store.correctResolvedExecution seam atomically corrects only an explici
 watched failed request/attempt/hold, not generic terminal states. Old zero-burn
 resolution accounting is never rewritten: positive gas_correction entries charge
 any legacy zero-charge difference and participate in gas usage. If a released
-standing grant is now exhausted, actual principal/gas accounting still wins over
-the grant's limits; revoke that grant so owner unfreeze cannot re-spend stale
-remaining standing capacity. The freeze requires reconciliation of the late overrun.
+standing grant has insufficient capacity after subtracting OTHER active standing
+reservations (excluding this request), record actual principal/gas without debiting
+usedTotal, and revoke that grant so owner unfreeze cannot re-spend stale remaining
+capacity. Ordinary executed settlement uses the same overrun rule and globally
+freezes instead of rejecting the accounting transaction. The freeze requires
+reconciliation of the overrun.
 Legacy signed resolution receipts enroll old resolved rows into the watch after
 restart. No SQLite migration is needed for these optional JSON metadata fields.
 

@@ -85,6 +85,7 @@ export class BrokerService implements BrokerPort {
   private readonly balance: ReturnType<typeof balanceState>;
   private readonly offerCache = new Map<string, { seq: number; at: number | null }>();
   private readonly legacyWatchCache = new Map<string, { seq: number; watch: boolean }>();
+  private dispatchStopped = false;
   private watchCursor = 0;
   private readonly watchIndex = new Map<string, string>();
   private readonly receipts: ReceiptLog;
@@ -148,6 +149,10 @@ export class BrokerService implements BrokerPort {
     const decision = this.evaluator.evaluate(e);
     if (decision.kind === 'deny' || decision.kind === 'needs_approval' || e.requestId === null) return decision;
     const ref = r.getRequest(e.requestId)?.approvalRef;
+    if (decision.kind === 'allow_via_standing_approval'
+      && (ref?.kind !== 'standing' || ref.id !== decision.standingApprovalId)) {
+      return { kind: 'needs_approval', reasons: ['APPROVAL_REQUIRED'] };
+    }
     if (ref?.kind === 'standing') {
       const grant = e.standingApprovals.find((a) => a.id === ref.id);
       const reservedTotal = Object.hasOwn(e.usage.standingReserved, ref.id) ? e.usage.standingReserved[ref.id]! : 0n;
@@ -498,7 +503,11 @@ export class BrokerService implements BrokerPort {
       });
     });
   }
+  /** Irreversible for this instance; restart constructs a fresh broker. Does not
+   * cancel an invoked RPC or release any durable reservation. */
+  stopDispatch(): void { this.dispatchStopped = true; }
   async drain(): Promise<void> {
+    if (this.dispatchStopped) return;
     await this.o.hooks?.beforeDispatch?.();
     await this.run(true);
   }
@@ -509,9 +518,11 @@ export class BrokerService implements BrokerPort {
   }
   private async run(dispatchQueued: boolean, requestId?: string): Promise<TransferRequest[]> {
     return this.pump.run(async () => {
+      if (dispatchQueued && this.dispatchStopped) return [];
       await this.expirePending();
       const touched = new Set<string>(await this.watchResolved(requestId)); const skipped = new Set<string>();
       for (;;) {
+        if (dispatchQueued && this.dispatchStopped) break;
         // Re-read after EVERY attempt. Owner mutations queued behind the current
         // broadcast acquire the lane before the next item. FINAL polling is never
         // inside that lane, so even a hung status call cannot delay a freeze.
@@ -529,7 +540,9 @@ export class BrokerService implements BrokerPort {
         if (!next) break;
         skipped.add(next.id);
         const attempt = await this.lane.run(async () => {
+          if (this.dispatchStopped) return null;
           await this.refreshLocked();
+          if (this.dispatchStopped) return null;
           const current = this.o.store.withImmediateTransaction((tx) => this.authorizeQueued(tx, next.id));
           if (!current) return null;
           const attempt = await this.sign(current);
@@ -671,6 +684,7 @@ export class BrokerService implements BrokerPort {
   }
   /** Caller holds the per-attempt lane, never the whole queue or FINAL polling. */
   private async send(attempt: TxAttempt): Promise<boolean> {
+    if (this.dispatchStopped) return false;
     // A transient failure here provably precedes intent/offer recording. Recovery
     // can retry these identical bytes immediately rather than invent ambiguity.
     await this.attest();
@@ -679,6 +693,7 @@ export class BrokerService implements BrokerPort {
       ? await chain.prepareBroadcast(attempt.signedTxBase64)
       : () => chain.broadcast(attempt.signedTxBase64);
     const ready = this.o.store.withImmediateTransaction((tx) => {
+      if (this.dispatchStopped) return false;
       const request = must(tx.getRequest(attempt.requestId));
       const decision = this.boundDecision(tx, this.evaluation(tx, request, request.id));
       if (decision.kind !== 'allow' && decision.kind !== 'allow_via_standing_approval') return false;
@@ -852,24 +867,7 @@ export class BrokerService implements BrokerPort {
       tx.correctResolvedExecution(finalRequest, finalAttempt);
       if (outcome.kind === 'succeeded') {
         this.accounting(tx, finalRequest, 'principal_committed', hold.principal);
-        if (request.approvalRef?.kind === 'standing') {
-          const approval = must(tx.getStandingApproval(request.approvalRef.id));
-          // Never let an exhausted grant prevent recording an ACTUAL chain loss.
-          // Principal accounting + mandatory freeze remain authoritative on an
-          // overrun; the correction receipt exposes the late use for review.
-          if (hold.principal <= approval.totalMax - approval.usedTotal) {
-            tx.putStandingApproval(this.o.approvals.consumeStandingApproval({ approval, amount: hold.principal, reservedAmount: hold.principal }));
-          } else if (approval.revokedAt === undefined) {
-            // A late overrun cannot fit the bounded usedTotal schema. Revoke it
-            // so an owner unfreeze cannot accidentally re-spend stale remaining
-            // standing capacity; actual spending is still in the ledger/receipt.
-            tx.putStandingApproval({ ...approval, revokedAt: now });
-            this.event(tx, { type: 'standing_approval_revoked', payload: { agentId: request.agentId,
-              approvalId: approval.id, revokedAt: now } }, request.agentId, true);
-          }
-          this.event(tx, { type: 'standing_approval_used', payload: { requestId: request.id, agentId: request.agentId,
-            approvalId: approval.id, amount: toDecimalText(hold.principal) } }, request.agentId, true);
-        }
+        this.consumeExecutedStanding(tx, request, hold.principal);
       } else if (hold.status === 'active') this.accounting(tx, finalRequest, 'principal_released', hold.principal);
       const charged = pages((q) => tx.listAccounting({ requestId: request.id }, q))
         .filter((e) => e.kind === 'gas_charged' || e.kind === 'gas_correction');
@@ -1017,6 +1015,29 @@ export class BrokerService implements BrokerPort {
     const stored = this.o.store.read((r) => must(r.listAttempts(request.id).find((a) => a.id === replacement.id)));
     return this.observe(stored, await this.status(stored));
   }
+  /** Executed spending wins over grant limits, but must not steal capacity from
+   * other active holds. An overrun is ledgered/receipted, not forced into the
+   * bounded usedTotal field; revoke and freeze atomically for owner review. */
+  private consumeExecutedStanding(tx: StoreTransaction, request: TransferRequest, principal: bigint): void {
+    if (request.approvalRef?.kind !== 'standing') return;
+    const approval = must(tx.getStandingApproval(request.approvalRef.id));
+    const reserved = tx.getUsageSnapshot(request.agentId, this.o.clock.now(), request.id).standingReserved;
+    const other = Object.hasOwn(reserved, approval.id) ? reserved[approval.id]! : 0n;
+    const available = approval.totalMax - approval.usedTotal;
+    if (other <= available && principal <= available - other) {
+      tx.putStandingApproval(this.o.approvals.consumeStandingApproval({ approval, amount: principal, reservedAmount: principal }));
+    } else {
+      if (approval.revokedAt === undefined) {
+        const now = this.o.clock.now();
+        tx.putStandingApproval({ ...approval, revokedAt: now });
+        this.event(tx, { type: 'standing_approval_revoked', payload: { agentId: request.agentId,
+          approvalId: approval.id, revokedAt: now } }, request.agentId, true);
+      }
+      this.writeFreeze(tx, { scope: 'global' }, true, 'Executed payment exceeds unreserved standing capacity; owner review required');
+    }
+    this.event(tx, { type: 'standing_approval_used', payload: { requestId: request.id, agentId: request.agentId,
+      approvalId: approval.id, amount: toDecimalText(principal) } }, request.agentId, true);
+  }
   private settle(attempt: TxAttempt, outcome: Extract<ChainOutcome, { kind: 'succeeded' | 'failed' }>): void {
     invalidateBalance(this.balance);
     this.o.store.withImmediateTransaction((tx) => {
@@ -1034,12 +1055,7 @@ export class BrokerService implements BrokerPort {
       if (hold.status !== 'active') throw new BrokerError('FORBIDDEN');
       if (outcome.kind === 'succeeded') {
         this.accounting(tx, next, 'principal_committed', hold.principal);
-        if (request.approvalRef?.kind === 'standing') {
-          const approval = must(tx.getStandingApproval(request.approvalRef.id));
-          tx.putStandingApproval(this.o.approvals.consumeStandingApproval({ approval, amount: hold.principal, reservedAmount: hold.principal }));
-          this.event(tx, { type: 'standing_approval_used', payload: { requestId: request.id, agentId: request.agentId,
-            approvalId: approval.id, amount: toDecimalText(hold.principal) } }, request.agentId, true);
-        }
+        this.consumeExecutedStanding(tx, request, hold.principal);
       } else this.accounting(tx, next, 'principal_released', hold.principal);
       this.accounting(tx, next, 'gas_charged', outcome.tokensBurnt);
       this.accounting(tx, next, 'fee_released', hold.feeReserve > outcome.tokensBurnt ? hold.feeReserve - outcome.tokensBurnt : 0n);
