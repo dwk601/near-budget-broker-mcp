@@ -53,12 +53,25 @@ async function dispatch(op: AdminOperation, value: unknown, b: OwnerBrokerServic
     case 'revokeToken': return b.revokeToken(p, adminSchemas[op].parse(value).credentialId);
     case 'setPolicy': {
       const { policy: a, expectedRevision } = adminSchemas[op].parse(value);
-      return b.setPolicy(p, { ...a, perTxMax: fromDecimalText(a.perTxMax), rolling24hMax: fromDecimalText(a.rolling24hMax),
-        lifetimeMax: fromDecimalText(a.lifetimeMax), gasBudget24h: fromDecimalText(a.gasBudget24h),
-        approvalThreshold: a.approvalThreshold === null ? null : fromDecimalText(a.approvalThreshold) }, expectedRevision);
+      try {
+        return await b.setPolicy(p, { ...a, perTxMax: fromDecimalText(a.perTxMax), rolling24hMax: fromDecimalText(a.rolling24hMax),
+          lifetimeMax: fromDecimalText(a.lifetimeMax), gasBudget24h: fromDecimalText(a.gasBudget24h),
+          approvalThreshold: a.approvalThreshold === null ? null : fromDecimalText(a.approvalThreshold) }, expectedRevision);
+      } catch (e) {
+        // Authentication/Host/Origin failures occur BEFORE this dispatch. Only
+        // translate a broker CAS refusal when the authenticated read proves it.
+        if (e instanceof BrokerError && e.code === 'FORBIDDEN' && ((await b.getPolicy(p, a.agentId))?.revision ?? null) !== expectedRevision) throw new BrokerError('POLICY_CHANGED');
+        throw e;
+      }
     }
     case 'setWalletPolicy': { const { policy: a, expectedRevision } = adminSchemas[op].parse(value);
-      return b.setWalletPolicy(p, { ...a, rolling24hMax: fromDecimalText(a.rolling24hMax), safetyReserve: fromDecimalText(a.safetyReserve) }, expectedRevision); }
+      try {
+        return await b.setWalletPolicy(p, { ...a, rolling24hMax: fromDecimalText(a.rolling24hMax), safetyReserve: fromDecimalText(a.safetyReserve) }, expectedRevision);
+      } catch (e) {
+        if (e instanceof BrokerError && e.code === 'FORBIDDEN' && ((await b.walletStatus(p)).policy?.revision ?? null) !== expectedRevision) throw new BrokerError('POLICY_CHANGED');
+        throw e;
+      }
+    }
     case 'approve': { const a = adminSchemas[op].parse(value); return b.approve(p, a.requestId, a.expiresAt); }
     case 'reject': { const a = adminSchemas[op].parse(value); return b.reject(p, a.requestId, a.reason); }
     case 'grantStandingApproval': { const { grant: a } = adminSchemas[op].parse(value); return b.grantStandingApproval(p, { ...a, perTxMax: fromDecimalText(a.perTxMax), totalMax: fromDecimalText(a.totalMax) }); }

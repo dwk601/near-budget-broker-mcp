@@ -84,11 +84,41 @@ the named volume, never host bind mounts. The daemon accepts ONLY
 `BB_MASTER_SECRET_FILE`; direct `BB_MASTER_SECRET` is rejected, even if a file
 is also supplied. No secret value belongs in config, the DB, argv or logs.
 
-```
+`BB_IMAGE` selects the built daemon image tag (default `budget-broker:local`).
+`BB_DATA_VOLUME` selects the named data volume (default `budget-broker-data`).
+Set both consistently for **all** provisioning and compose commands; never choose
+another volume for a second daemon with the same custody key.
+
+Create/initialize the volume through Compose **before** provisioning it. Docker
+copies the image directory's uid/gid 1000 ownership only when a fresh named volume
+is first mounted at the correct target. Mounting it first at `/data` (or another
+empty path) leaves it root-owned and causes `DATA_DIR_UNAVAILABLE`.
+
+```sh
+export BB_MASTER_FILE=/protected/budget-broker/master
+export BB_CONFIG_FILE=/protected/budget-broker/config.json
+export BB_IMAGE=budget-broker:local
+export BB_DATA_VOLUME=budget-broker-data
 docker compose -f docker/docker-compose.yml config
 docker compose -f docker/docker-compose.yml build
-docker compose -f docker/docker-compose.yml up -d
+docker compose -f docker/docker-compose.yml create
+# Only the ENCRYPTED envelope crosses stdin. No owner/raw custody key is mounted.
+docker run --rm -i --read-only --network none --user 1000:1000 \
+  --mount "type=volume,src=$BB_DATA_VOLUME,dst=/var/lib/budget-broker" \
+  --entrypoint node "$BB_IMAGE" -e \
+  'require("node:fs").writeFileSync("/var/lib/budget-broker/custody.json",require("node:fs").readFileSync(0),{flag:"wx",mode:0o600})' \
+  < /protected/custody.json
+docker compose -f docker/docker-compose.yml up -d --no-build
 ```
+
+The provisioning mount MUST be `/var/lib/budget-broker`, matching Compose and the
+image. The sample is exclusive (`wx`): it will not overwrite an existing envelope.
+For an accidentally root-owned existing volume: stop **every** daemon using the
+key, confirm the volume name, and use a protected one-shot root container mounted
+at `/var/lib/budget-broker` to repair uid/gid 1000 ownership (directory mode 0700,
+envelope/audit/lock files 0600). Never delete live lock files to resolve this.
+For a host daemon, create its data directory and stable OS-account lock directory
+under the intended daemon OS user, not root.
 
 The image runs uid 1000, rootfs read-only, capabilities dropped, no Docker socket;
 only a named data volume and bounded /tmp tmpfs are writable. Both host ports
@@ -98,20 +128,36 @@ Plain Compose secrets are not protection against the Docker-controlling host
 user. No claim of protection from a privileged host user is made here.
 
 Use **one named volume/trust root per custody key**, reused across deployments.
-Never deploy the same key with different named volumes/data directories/hosts.
-`daemon.lock` is a separate SQLite database held in an EXCLUSIVE transaction for
-the whole process lifetime. It lives inside the private data directory, not in
-shared /tmp. The kernel releases the lock on SIGKILL/crash: restart automatically
-recovers, without PID guessing or deleting files. Retain this lock file forever;
-never unlink or replace a live lock or its data directory (host-volume control is
-outside the threat boundary). Active-active and independent volumes for one key
-are unsupported. Upgrading from the old O_EXCL format: stop the OLD daemon first,
-then remove its old text `daemon.lock` once before starting the new version.
+Two SQLite EXCLUSIVE transactions are held for the process lifetime:
+`dataDir/daemon.lock` and an independent, **per-custody-public-key** lock at
+`<OS-account-home>/.budget-broker-locks/<sha256(publicKey)>.sqlite`. The latter
+refuses a second daemon even with a different data directory/ports/database. The
+OS account database, not `HOME` or `TMPDIR`, determines this stable location;
+there is no production config/env override. Its directory must be owned by the
+current uid and mode 0700; existing bad ownership/modes or symlinks are refused,
+not repaired. Files must be regular, uid-owned, mode 0600 and never unlinked.
+The kernel releases both locks on SIGKILL/crash; restart needs no PID guessing or
+manual deletion. Retain lock files even after shutdown. Never unlink or replace a
+live lock or its directory (host-volume control is outside the threat boundary).
+
+The image sets the node OS-account home to `/var/lib/budget-broker`, so the stable
+key-lock directory is on the same private named volume, writable with a read-only
+rootfs. File locks are NOT distributed leadership: different OS users, hosts, or
+independent container filesystem namespaces/volumes cannot fence each other.
+All containers with one custody key MUST share this named volume/trust root;
+never deploy that key independently across hosts/volumes. Active-active is not
+supported. Upgrading from the old O_EXCL format: stop the OLD daemon first, then
+remove its old text `daemon.lock` once before starting the new version.
 
 Distinct redacted stderr diagnostics are `LOCK_HELD`, `LOCK_UNAVAILABLE`,
-`BAD_CONFIG`, `BAD_MASTER_SECRET`, `MASTER_SECRET_ENV_REFUSED`, `LISTEN_FAILED`;
-network refusal remains `MAINNET_REFUSED`. No diagnostic includes secret values
-or paths. SIGTERM/SIGINT stops scheduling, closes listeners, waits for invoked
+`BAD_CONFIG`, `BAD_MASTER_SECRET`, `MASTER_SECRET_ENV_REFUSED`, `LISTEN_FAILED`,
+`DATA_DIR_UNAVAILABLE` (mkdir/chmod/ownership/provisioning failure), and
+`RPC_UNAVAILABLE` (startup transport/HTTP failure). A reachable RPC with a wrong or
+unprovable chain identity still fails closed as `MAINNET_REFUSED`; a static
+mainnet config/URL is also refused. Neither operational unavailability nor
+identity refusal permits custody unlock. No diagnostic includes values, paths,
+stacks or environment dumps; text and JSON outputs accept only exact allowlisted
+tokens. SIGTERM/SIGINT stops scheduling, closes listeners, waits for invoked
 broker work, locks custody and closes SQLite, then exits 0. A 90s compose grace
 period must exceed the deployment RPC/in-flight workload duration.
 
@@ -197,8 +243,11 @@ JSON body fields matching the operation, excluding principal (e.g.
 invocation, raw signer, SQL or secret endpoint exists.
 
 Exit codes: 0 success/clean shutdown, 1 operation/dependency/verification failure,
-2 usage/local argument or file validation/stale policy revision conflict,
-3 authentication/authorization failure. CLI IDs must be broker-issued UUIDs.
+2 usage/local argument or policy/grant file validation/stale policy revision
+conflict (`POLICY_CHANGED`), 3 authentication/authorization failure (including
+Host/Origin rejection on policy writes). Malformed JSON, schema errors, tampering,
+signature or checkpoint failures in `receipts verify` are verification failures
+and exit **1**, not usage/authentication failures. Missing verify flags exit 2. CLI IDs must be broker-issued UUIDs.
 Errors expose only stable codes and daemon diagnostic reasons (never raw
 RPC/SQL/key details).
 

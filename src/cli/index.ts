@@ -9,7 +9,7 @@ import { OwnerClient } from './client.js';
 import { adminSchemas } from '../daemon/admin.js';
 import type { AdminOperation } from '../daemon/admin.js';
 import { z } from 'zod';
-import { DaemonFailure } from '../daemon/diagnostics.js';
+import { diagnosticReason } from '../daemon/diagnostics.js';
 
 class UsageError extends Error {}
 function usage(): never { throw new UsageError(); }
@@ -120,10 +120,13 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
     }
     if (group === 'receipts' && action === 'verify') {
       const { verifyExportedChain } = await import('../audit/checkpoints/index.js');
-      const receipts = (parseJson(await readFile(required('file'), 'utf8')) as unknown[]).map((r) => ReceiptEventSchema.parse(r));
-      const checkpoint = CheckpointSchema.parse(parseJson(await readFile(required('checkpoint'), 'utf8')));
-      const verified = verifyExportedChain(receipts, checkpoint, required('audit-key'));
-      print(verified); return verified.valid ? 0 : 1;
+      const file = required('file'); const checkpointFile = required('checkpoint'); const trustedKey = required('audit-key');
+      try {
+        const receipts = z.array(ReceiptEventSchema).parse(parseJson(await readFile(file, 'utf8')));
+        const checkpoint = CheckpointSchema.parse(parseJson(await readFile(checkpointFile, 'utf8')));
+        const verified = verifyExportedChain(receipts, checkpoint, trustedKey);
+        print(verified); return verified.valid ? 0 : 1;
+      } catch { throw new BrokerError('AUDIT_UNAVAILABLE'); }
     }
     let client: OwnerClient | undefined;
     async function call(operation: AdminOperation, body: unknown = {}): Promise<unknown> {
@@ -155,9 +158,9 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
       }
       try { return await client.call(operation, body); }
       catch (e) {
-        // The transport's stable FORBIDDEN vocabulary also represents a stale
-        // policy CAS. This is an owner input conflict, not failed authentication.
-        if (e instanceof BrokerError && e.code === 'FORBIDDEN' && ['setPolicy', 'setWalletPolicy'].includes(operation)) usage();
+        // Only an explicit revision conflict is usage; transport authorization
+        // failures (Host/Origin/signature) must retain authentication exit 3.
+        if (e instanceof BrokerError && e.code === 'POLICY_CHANGED' && ['setPolicy', 'setWalletPolicy'].includes(operation)) usage();
         throw e;
       }
     }
@@ -225,7 +228,7 @@ export async function runCli(argv: string[], options: CliOptions = {}): Promise<
     print(result ?? null); return 0;
   } catch (e) {
     const code = e instanceof UsageError || (args[0] === 'owner' && e instanceof z.ZodError) ? 'USAGE' : e instanceof BrokerError ? e.code : 'BROKER_UNAVAILABLE';
-    const reason = e instanceof DaemonFailure ? e.reason : undefined;
+    const reason = diagnosticReason(e);
     const text = asJson ? json({ error: { code, ...(reason ? { reason } : {}) } }) : `Budget Broker: ${reason ?? code}${code === 'USAGE' ? ' (see docker/README.md for commands)' : ''}`;
     err(`${text}\n`);
     if (code === 'USAGE') return 2;

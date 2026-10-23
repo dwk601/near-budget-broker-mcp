@@ -18,5 +18,5 @@ export async function fixture() {
   const config = parseConfig({ network: 'testnet', rpcUrl: 'http://127.0.0.1:12345', accountId: 'broker.testnet',
     dataDir: join(dir, 'data'), auditKeyPath: join(dir, 'data', 'audit.pem'), ownerPublicKey: owner.publicKey,
     safetyReserve: 0n, feeReservePerTx: 10n, agentPort: await port(), adminPort: await port() });
-  return { dir, owner, chain, config, dependencies: { chain, signer: { ...chain.signer, publicKey: generateOwnerKeypair().publicKey }, clock }, cleanup: () => rm(dir, { recursive: true, force: true }) };
+  return { dir, owner, chain, config, dependencies: { chain, signer: { ...chain.signer, publicKey: generateOwnerKeypair().publicKey }, clock, keyLockDirectory: join(dir, 'key-locks') }, cleanup: () => rm(dir, { recursive: true, force: true }) };
 }

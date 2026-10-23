@@ -1,12 +1,27 @@
 import { DatabaseSync } from 'node:sqlite';
-import { constants, openSync, closeSync, fchmodSync, lstatSync } from 'node:fs';
+import { constants, openSync, closeSync, fchmodSync, lstatSync, mkdirSync } from 'node:fs';
+import { userInfo } from 'node:os';
+import { join } from 'node:path';
+import { sha256Hex } from '../contracts/index.js';
 import { DaemonFailure } from './diagnostics.js';
 
 /** A separate rollback-journal SQLite database holds an EXCLUSIVE kernel lock.
  * The connection/transaction lives for the daemon lifetime; SIGKILL automatically
  * releases the OS locks. The file is deliberately retained, NEVER unlinked.
- * The containing data directory is private (0700) and must be shared by every
- * deployment of this custody key. Host/root control is outside this boundary. */
+ * The containing directory is private (0700). Host/root control is outside
+ * this boundary. Never open/close unrelated raw fds on a held lock inode. */
+export function custodyLockPath(publicKey: string, directory = join(userInfo().homedir, '.budget-broker-locks')): string {
+  try {
+    // mkdir is exclusive; existing insecure directories are REFUSED, not repaired.
+    // userInfo uses the OS account database, not attacker-selected HOME/TMPDIR.
+    try { mkdirSync(directory, { mode: 0o700 }); }
+    catch (e) { if (!e || typeof e !== 'object' || !('code' in e) || e.code !== 'EEXIST') throw e; }
+    const stat = lstatSync(directory);
+    if (!stat.isDirectory() || (stat.mode & 0o777) !== 0o700 || (process.getuid && stat.uid !== process.getuid())) throw new Error();
+    return join(directory, `${sha256Hex(publicKey)}.sqlite`);
+  } catch { throw new DaemonFailure('LOCK_UNAVAILABLE'); }
+}
+
 export async function exclusiveLock(path: string): Promise<() => Promise<void>> {
   let db: DatabaseSync | undefined;
   try {
@@ -19,7 +34,7 @@ export async function exclusiveLock(path: string): Promise<() => Promise<void>> 
     // Never open/close an extra raw fd on an already locked inode: POSIX would
     // release this process's advisory locks when that unrelated fd closes.
     const stat = lstatSync(path);
-    if (!stat.isFile() || (stat.mode & 0o077) !== 0 || (process.getuid && stat.uid !== process.getuid())) throw new Error();
+    if (!stat.isFile() || (stat.mode & 0o777) !== 0o600 || (process.getuid && stat.uid !== process.getuid())) throw new Error();
     db = new DatabaseSync(path);
     db.exec('PRAGMA busy_timeout=0; PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;');
     let released = false;

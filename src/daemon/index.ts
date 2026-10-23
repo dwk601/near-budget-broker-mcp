@@ -4,7 +4,6 @@ import type { Server } from 'node:http';
 import { BrokerError, fromDecimalText, parseConfig } from '../contracts/index.js';
 import type { Clock, Config, CustodySigner, NearChain, Store } from '../contracts/index.js';
 import { SqliteStore } from '../storage/index.js';
-import { NativeNearChain } from '../near/index.js';
 import { EncryptedFileCustody, readMasterSecret } from '../custody/index.js';
 import { AuditSigner, ReceiptLog } from '../audit/core/index.js';
 import { CheckpointLog } from '../audit/checkpoints/index.js';
@@ -13,7 +12,8 @@ import { RequestAuthenticator } from '../auth/index.js';
 import { BrokerService } from '../broker/index.js';
 import { createAgentHttpServer } from '../mcp/http/index.js';
 import { createAdminHttpServer } from './admin.js';
-import { exclusiveLock } from './lock.js';
+import { exclusiveLock, custodyLockPath } from './lock.js';
+import { connectTestnetChain } from './chain.js';
 import { DaemonFailure } from './diagnostics.js';
 import { parseJson } from './wire.js';
 
@@ -34,7 +34,7 @@ export interface DaemonOptions {
   intervalMs?: number;
   log?: (code: string) => void;
   /** Trusted in-process composition seam ONLY. No env/config dynamic module loading. */
-  dependencies?: { chain: NearChain; signer: CustodySigner; clock?: Clock };
+  dependencies?: { chain: NearChain; signer: CustodySigner; clock?: Clock; keyLockDirectory?: string };
 }
 async function listen(server: Server, port: number, host: string) {
   await new Promise<void>((res, rej) => {
@@ -50,10 +50,14 @@ export async function startDaemon(options: DaemonOptions) {
   const intervalMs = options.intervalMs ?? 1000;
   if (!Number.isSafeInteger(intervalMs) || intervalMs < 10) throw new BrokerError('FORBIDDEN');
   // Private volume: custody envelope and database never enter the host bridge.
-  await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
-  await chmod(config.dataDir, 0o700);
-  const dataDir = await realpath(config.dataDir);
+  let dataDir: string;
+  try {
+    await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
+    await chmod(config.dataDir, 0o700);
+    dataDir = await realpath(config.dataDir);
+  } catch { throw new DaemonFailure('DATA_DIR_UNAVAILABLE'); }
   const releaseData = await exclusiveLock(join(dataDir, 'daemon.lock'));
+  let releaseKey: (() => Promise<void>) | undefined;
   let store: Store | undefined;
   const custody = new EncryptedFileCustody();
   let agent: ReturnType<typeof createAgentHttpServer> | undefined;
@@ -73,13 +77,14 @@ export async function startDaemon(options: DaemonOptions) {
     while (calls.size) await Promise.allSettled([...calls]);
     await attempt(() => custody.lock());
     await attempt(() => store?.close());
+    await attempt(() => releaseKey?.());
     await attempt(() => releaseData());
     if (errors.length) throw new BrokerError('BROKER_UNAVAILABLE');
   }
   try {
     store = new SqliteStore(join(dataDir, 'broker.sqlite'), { accountId: config.accountId });
-    const chain = options.dependencies?.chain ?? await NativeNearChain.connect({ rpcUrl: config.rpcUrl, accountId: config.accountId, clock });
-    if (await chain.verifyNetwork() !== 'testnet') throw new BrokerError('MAINNET_REFUSED');
+    const chain = options.dependencies?.chain ?? await connectTestnetChain(config, clock);
+    if (options.dependencies && await chain.verifyNetwork() !== 'testnet') throw new BrokerError('MAINNET_REFUSED');
     let signer = options.dependencies?.signer;
     if (!signer) {
       const env = options.env ?? process.env;
@@ -91,6 +96,9 @@ export async function startDaemon(options: DaemonOptions) {
       } catch { throw new DaemonFailure('BAD_MASTER_SECRET'); }
       finally { master?.fill(0); }
     }
+    // Global within this OS user/namespace, independent of config.dataDir.
+    // The directory override is ONLY the trusted fake-chain composition seam.
+    releaseKey = await exclusiveLock(custodyLockPath(signer.publicKey, options.dependencies?.keyLockDirectory));
     // Resolve the volume root once (e.g. macOS /var -> /private/var).
     const auditRelative = relative(resolve(config.dataDir), resolve(config.auditKeyPath));
     if (!auditRelative || auditRelative.startsWith('..') || isAbsolute(auditRelative)) throw new DaemonFailure('BAD_CONFIG');

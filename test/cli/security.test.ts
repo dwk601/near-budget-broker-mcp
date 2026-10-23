@@ -12,7 +12,7 @@ import { SqliteStore } from '../../src/storage/index.js';
 import { json } from '../../src/daemon/wire.js';
 import { runCli } from '../../src/cli/index.js';
 import { EncryptedFileCustody } from '../../src/custody/index.js';
-import { fixture } from './helpers.js';
+import { fixture, port } from './helpers.js';
 
 it('admin verifies exact bytes/path/method, duplicate JSON/headers, Host and Origin', async () => {
   const f = await fixture(); const daemon = await startDaemon({ config: f.config, dependencies: f.dependencies, log: () => {} });
@@ -62,6 +62,20 @@ it('singleton refuses a second SQLite connection without disturbing the held loc
     const probe = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `import {exclusiveLock} from './src/daemon/lock.ts'; try { const release = await exclusiveLock(${JSON.stringify(path)}); await release(); process.exit(0); } catch (e) { process.stderr.write(e.reason ?? 'unknown'); process.exit(1); }`], { encoding: 'utf8', timeout: 10_000 });
     expect(probe.status).toBe(1); expect(probe.stderr).toContain('LOCK_HELD');
   } finally { await daemon.close(); await f.cleanup(); }
+});
+
+it('custody-key singleton fences different data directories and releases after shutdown', async () => {
+  const f = await fixture(); let first: Awaited<ReturnType<typeof startDaemon>> | undefined; let contender: Awaited<ReturnType<typeof startDaemon>> | undefined;
+  const dataDir = join(f.dir, 'other-data');
+  const config = { ...f.config, dataDir, auditKeyPath: join(dataDir, 'audit.pem'), agentPort: await port(), adminPort: await port() };
+  try {
+    first = await startDaemon({ config: f.config, dependencies: f.dependencies, log: () => {} });
+    let failure: unknown;
+    try { contender = await startDaemon({ config, dependencies: f.dependencies, log: () => {} }); } catch (e) { failure = e; }
+    expect(failure).toMatchObject({ reason: 'LOCK_HELD' });
+    await first.close(); first = undefined;
+    contender = await startDaemon({ config, dependencies: f.dependencies, log: () => {} });
+  } finally { await contender?.close(); await first?.close(); await f.cleanup(); }
 });
 
 it('scheduler expires pending work; close awaits an in-flight owner call before closing store', async () => {
