@@ -1,0 +1,37 @@
+name: Offline CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Typecheck source and tests
+        run: npm run typecheck
+      - name: Build distributable
+        run: npm run build
+      - name: Require Docker isolation (no skip)
+        run: |
+          docker info
+          docker compose version
+      # Separate step/worker: do not benchmark alongside crypto, builds or Docker.
+      - name: Offline performance budgets
+        run: npm run test:perf
+      # This is npm test's complete offline set, including package and Docker
+      # isolation tests, minus perf already run above. Never opt into live spend;
+      # no wallet credentials, repository secrets or BB_LIVE are supplied.
+      - name: All remaining offline suites (including package and isolation)
+        run: npm test -- --exclude 'test/perf/**' --exclude 'test/near/live.spike.test.ts' --maxWorkers=1
